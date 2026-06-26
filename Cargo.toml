@@ -1,0 +1,29 @@
+[package]
+name    = "musicplayer-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# UI
+gtk4 = { version = "0.11.4", features = ["v4_14"] }
+glib = "0.22.8"
+
+# Audio playback — uses symphonia as the decoder backend
+rodio = { version = "0.22.2", features = ["symphonia-all", "symphonia-simd"] }
+
+# Audio decoding / codec inspection (duration, bitrate, format detection)
+# Pinned to 0.5 to match rodio's requirement — avoids building two copies.
+symphonia = { version = "0.5", features = ["all"] }
+
+# Audio metadata (ID3v2, ID3v1, Vorbis Comments, MP4 atoms, cover art)
+lofty = "0.24.0"
+
+# Local database — bundled so no system SQLite dep needed
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
+# Error handling
+thiserror = "2.0.18"
+
+# Logging
+tracing            = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
