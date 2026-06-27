@@ -37,11 +37,14 @@
               "rust-analyzer"
             ];
           };
+          # Nightly rustfmt for unstable formatting options (imports_granularity, group_imports).
+          nightlyRustfmt = pkgs.rust-bin.nightly.latest.rustfmt;
         in
         {
           devShells.default = pkgs.mkShell {
             packages = [
               rustToolchain
+              nightlyRustfmt
               pkgs.nixd
               pkgs.nixfmt
 
@@ -63,6 +66,8 @@
             ];
 
             shellHook = ''
+              # Use nightly rustfmt so unstable options (imports_granularity, group_imports) apply.
+              export RUSTFMT="${nightlyRustfmt}/bin/rustfmt"
               echo "Rust development environment — musicplayer-rs"
               echo "Rust version: $(rustc --version)"
               echo "Cargo version: $(cargo --version)"

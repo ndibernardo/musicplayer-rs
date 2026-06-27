@@ -1,3 +1,10 @@
+use std::borrow::Cow;
+
+use lofty::file::TaggedFileExt;
+use lofty::prelude::AudioFile;
+use lofty::tag::Accessor;
+use lofty::tag::Tag;
+
 use crate::domain::track::AlbumArtData;
 use crate::domain::track::AlbumTitle;
 use crate::domain::track::Artist;
@@ -10,11 +17,6 @@ use crate::domain::track::TrackId;
 use crate::domain::track::TrackNumber;
 use crate::domain::track::TrackPath;
 use crate::domain::track::Year;
-use lofty::file::TaggedFileExt;
-use lofty::prelude::AudioFile;
-use lofty::tag::Accessor;
-use lofty::tag::Tag;
-use std::borrow::Cow;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetadataError {

@@ -1,13 +1,23 @@
-use crate::adapters::db::sqlite::Db;
-use crate::domain::library::LibraryFolder;
-use glib;
-use gtk4::prelude::*;
-use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, FileDialog, HeaderBar, Label, ListBox,
-    ListBoxRow, Orientation, Paned, ScrolledWindow,
-};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+use glib;
+use gtk4::Application;
+use gtk4::ApplicationWindow;
+use gtk4::Box as GtkBox;
+use gtk4::Button;
+use gtk4::FileDialog;
+use gtk4::HeaderBar;
+use gtk4::Label;
+use gtk4::ListBox;
+use gtk4::ListBoxRow;
+use gtk4::Orientation;
+use gtk4::Paned;
+use gtk4::ScrolledWindow;
+use gtk4::prelude::*;
+
+use crate::adapters::db::sqlite::Db;
+use crate::domain::library::LibraryFolder;
 
 pub fn build(app: &Application, db: Rc<RefCell<Db>>) -> ApplicationWindow {
     let header = HeaderBar::new();

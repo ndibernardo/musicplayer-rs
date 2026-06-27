@@ -1,8 +1,10 @@
+use std::path::Path;
+
+use rusqlite::Connection;
+
 use crate::domain::library::LibraryFolder;
 use crate::domain::track::Track;
 use crate::domain::track::TrackId;
-use rusqlite::Connection;
-use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
