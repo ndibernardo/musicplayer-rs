@@ -3,8 +3,8 @@ use crate::domain::library::LibraryFolder;
 use glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, Button, FileDialog, HeaderBar, Label,
-    ListBox, ListBoxRow, Orientation, Paned, ScrolledWindow,
+    Application, ApplicationWindow, Box as GtkBox, Button, FileDialog, HeaderBar, Label, ListBox,
+    ListBoxRow, Orientation, Paned, ScrolledWindow,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -75,7 +75,9 @@ pub fn build(app: &Application, db: Rc<RefCell<Db>>) -> ApplicationWindow {
                 return; // user cancelled
             };
             let Some(path) = file.path() else { return };
-            let Ok(folder) = LibraryFolder::new(path) else { return };
+            let Ok(folder) = LibraryFolder::new(path) else {
+                return;
+            };
 
             if let Err(e) = db.borrow().add_folder(&folder) {
                 eprintln!("Failed to add folder: {e}");

@@ -1,16 +1,6 @@
 use crate::domain::library::LibraryFolder;
-use crate::domain::track::AlbumArtData;
-use crate::domain::track::AlbumTitle;
-use crate::domain::track::Artist;
-use crate::domain::track::DiscNumber;
-use crate::domain::track::Genre;
-use crate::domain::track::Title;
 use crate::domain::track::Track;
-use crate::domain::track::TrackDuration;
 use crate::domain::track::TrackId;
-use crate::domain::track::TrackNumber;
-use crate::domain::track::TrackPath;
-use crate::domain::track::Year;
 use rusqlite::Connection;
 use std::path::Path;
 
@@ -93,10 +83,10 @@ impl Db {
         let album = (!track.album.as_str().is_empty()).then(|| track.album.as_str().to_owned());
         let genre = (!track.genre.as_str().is_empty()).then(|| track.genre.as_str().to_owned());
         let duration_ms = track.duration.as_duration().as_millis() as i64;
-        let track_number = (!track.track_number.is_unknown())
-            .then(|| track.track_number.value() as i64);
-        let disc_number = (!track.disc_number.is_unknown())
-            .then(|| track.disc_number.value() as i64);
+        let track_number =
+            (!track.track_number.is_unknown()).then(|| track.track_number.value() as i64);
+        let disc_number =
+            (!track.disc_number.is_unknown()).then(|| track.disc_number.value() as i64);
         let year = (!track.year.is_unknown()).then(|| track.year.value() as i64);
         let art = track.art.as_ref().map(|a| a.as_bytes().to_vec());
 
@@ -145,7 +135,9 @@ impl Db {
     pub fn track_count(&self) -> Result<u64, DbError> {
         let n = self
             .conn
-            .query_row("SELECT COUNT(*) FROM tracks", [], |row| row.get::<_, i64>(0))?;
+            .query_row("SELECT COUNT(*) FROM tracks", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
         Ok(n as u64)
     }
 
@@ -168,6 +160,16 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::track::AlbumTitle;
+    use crate::domain::track::Artist;
+    use crate::domain::track::DiscNumber;
+    use crate::domain::track::Genre;
+    use crate::domain::track::Title;
+    use crate::domain::track::TrackDuration;
+    use crate::domain::track::TrackId;
+    use crate::domain::track::TrackNumber;
+    use crate::domain::track::TrackPath;
+    use crate::domain::track::Year;
 
     fn table_exists(db: &Db, name: &str) -> bool {
         db.conn
@@ -230,33 +232,33 @@ mod tests {
 
     fn minimal_track(path: &str) -> Track {
         Track {
-            id:           TrackId::new(0),
-            path:         TrackPath::new(path).unwrap(),
-            title:        Title::new(""),
-            artist:       Artist::new(""),
-            album:        AlbumTitle::new(""),
-            genre:        Genre::new(""),
-            duration:     TrackDuration::from_secs(0),
+            id: TrackId::new(0),
+            path: TrackPath::new(path).unwrap(),
+            title: Title::new(""),
+            artist: Artist::new(""),
+            album: AlbumTitle::new(""),
+            genre: Genre::new(""),
+            duration: TrackDuration::from_secs(0),
             track_number: TrackNumber::new(0),
-            disc_number:  DiscNumber::new(0),
-            year:         Year::new(0),
-            art:          None,
+            disc_number: DiscNumber::new(0),
+            year: Year::new(0),
+            art: None,
         }
     }
 
     fn full_track(path: &str) -> Track {
         Track {
-            id:           TrackId::new(0),
-            path:         TrackPath::new(path).unwrap(),
-            title:        Title::new("Roygbiv"),
-            artist:       Artist::new("Boards of Canada"),
-            album:        AlbumTitle::new("Music Has the Right to Children"),
-            genre:        Genre::new("Electronic"),
-            duration:     TrackDuration::from_secs(193),
+            id: TrackId::new(0),
+            path: TrackPath::new(path).unwrap(),
+            title: Title::new("Roygbiv"),
+            artist: Artist::new("Boards of Canada"),
+            album: AlbumTitle::new("Music Has the Right to Children"),
+            genre: Genre::new("Electronic"),
+            duration: TrackDuration::from_secs(193),
             track_number: TrackNumber::new(7),
-            disc_number:  DiscNumber::new(1),
-            year:         Year::new(1998),
-            art:          None,
+            disc_number: DiscNumber::new(1),
+            year: Year::new(1998),
+            art: None,
         }
     }
 
@@ -284,13 +286,17 @@ mod tests {
         db.upsert_track(&minimal_track(path)).unwrap();
 
         let updated = Track {
-            title:  Title::new("Roygbiv"),
+            title: Title::new("Roygbiv"),
             artist: Artist::new("Boards of Canada"),
             ..minimal_track(path)
         };
         db.upsert_track(&updated).unwrap();
 
-        assert_eq!(db.track_count().unwrap(), 1, "path is unique key — no duplicate row");
+        assert_eq!(
+            db.track_count().unwrap(),
+            1,
+            "path is unique key — no duplicate row"
+        );
     }
 
     #[test]
@@ -305,7 +311,8 @@ mod tests {
     #[test]
     fn upsert_track_stores_null_for_absent_tags() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&minimal_track("/music/unknown.mp3")).unwrap();
+        db.upsert_track(&minimal_track("/music/unknown.mp3"))
+            .unwrap();
         let title: Option<String> = db
             .conn
             .query_row("SELECT title FROM tracks", [], |r| r.get(0))
@@ -322,8 +329,10 @@ mod tests {
     #[test]
     fn list_folders_returns_all_configured_paths() {
         let db = Db::open_in_memory().unwrap();
-        db.add_folder(&LibraryFolder::new("/home/user/Music").unwrap()).unwrap();
-        db.add_folder(&LibraryFolder::new("/home/user/Downloads").unwrap()).unwrap();
+        db.add_folder(&LibraryFolder::new("/home/user/Music").unwrap())
+            .unwrap();
+        db.add_folder(&LibraryFolder::new("/home/user/Downloads").unwrap())
+            .unwrap();
         assert_eq!(db.list_folders().unwrap().len(), 2);
     }
 }

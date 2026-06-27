@@ -62,8 +62,14 @@ impl SeekPosition {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlaybackState {
     Stopped,
-    Playing { track: TrackId, position: SeekPosition },
-    Paused  { track: TrackId, position: SeekPosition },
+    Playing {
+        track: TrackId,
+        position: SeekPosition,
+    },
+    Paused {
+        track: TrackId,
+        position: SeekPosition,
+    },
 }
 
 impl PlaybackState {
@@ -77,9 +83,9 @@ impl PlaybackState {
 
     pub fn current_track(&self) -> Option<TrackId> {
         match self {
-            Self::Stopped                  => None,
-            Self::Playing { track, .. }    => Some(*track),
-            Self::Paused  { track, .. }    => Some(*track),
+            Self::Stopped => None,
+            Self::Playing { track, .. } => Some(*track),
+            Self::Paused { track, .. } => Some(*track),
         }
     }
 }
@@ -119,12 +125,18 @@ mod tests {
 
     #[test]
     fn volume_new_rejects_value_above_one() {
-        assert!(matches!(Volume::new(1.1), Err(PlayerError::VolumeOutOfRange(_))));
+        assert!(matches!(
+            Volume::new(1.1),
+            Err(PlayerError::VolumeOutOfRange(_))
+        ));
     }
 
     #[test]
     fn volume_new_rejects_negative_value() {
-        assert!(matches!(Volume::new(-0.1), Err(PlayerError::VolumeOutOfRange(_))));
+        assert!(matches!(
+            Volume::new(-0.1),
+            Err(PlayerError::VolumeOutOfRange(_))
+        ));
     }
 
     #[test]
@@ -155,7 +167,7 @@ mod tests {
     #[test]
     fn playback_state_playing_is_not_stopped() {
         let state = PlaybackState::Playing {
-            track:    TrackId::new(1),
+            track: TrackId::new(1),
             position: SeekPosition::zero(),
         };
         assert!(!state.is_stopped());
@@ -170,14 +182,20 @@ mod tests {
     #[test]
     fn playback_state_playing_exposes_current_track() {
         let id = TrackId::new(7);
-        let state = PlaybackState::Playing { track: id, position: SeekPosition::zero() };
+        let state = PlaybackState::Playing {
+            track: id,
+            position: SeekPosition::zero(),
+        };
         assert_eq!(state.current_track(), Some(id));
     }
 
     #[test]
     fn playback_state_paused_exposes_current_track() {
         let id = TrackId::new(3);
-        let state = PlaybackState::Paused { track: id, position: SeekPosition::from_secs(42) };
+        let state = PlaybackState::Paused {
+            track: id,
+            position: SeekPosition::from_secs(42),
+        };
         assert_eq!(state.current_track(), Some(id));
     }
 }

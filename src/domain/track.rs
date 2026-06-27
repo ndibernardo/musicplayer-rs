@@ -202,17 +202,17 @@ impl AlbumArtData {
 /// A single audio track with all its metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
-    pub id:           TrackId,
-    pub path:         TrackPath,
-    pub title:        Title,
-    pub artist:       Artist,
-    pub album:        AlbumTitle,
-    pub genre:        Genre,
-    pub duration:     TrackDuration,
+    pub id: TrackId,
+    pub path: TrackPath,
+    pub title: Title,
+    pub artist: Artist,
+    pub album: AlbumTitle,
+    pub genre: Genre,
+    pub duration: TrackDuration,
     pub track_number: TrackNumber,
-    pub disc_number:  DiscNumber,
-    pub year:         Year,
-    pub art:          Option<AlbumArtData>,
+    pub disc_number: DiscNumber,
+    pub year: Year,
+    pub art: Option<AlbumArtData>,
 }
 
 #[cfg(test)]
@@ -236,7 +236,10 @@ mod tests {
 
     #[test]
     fn artist_new_trims_surrounding_whitespace() {
-        assert_eq!(Artist::new("  Boards of Canada  ").as_str(), "Boards of Canada");
+        assert_eq!(
+            Artist::new("  Boards of Canada  ").as_str(),
+            "Boards of Canada"
+        );
     }
 
     #[test]
@@ -252,7 +255,10 @@ mod tests {
     #[test]
     fn track_path_new_accepts_absolute_path() {
         let path = TrackPath::new("/music/geogaddi/track01.flac").unwrap();
-        assert_eq!(path.as_path().to_str().unwrap(), "/music/geogaddi/track01.flac");
+        assert_eq!(
+            path.as_path().to_str().unwrap(),
+            "/music/geogaddi/track01.flac"
+        );
     }
 
     #[test]

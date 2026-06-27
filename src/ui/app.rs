@@ -1,6 +1,6 @@
 use crate::adapters::db::sqlite::Db;
-use gtk4::prelude::*;
 use gtk4::Application;
+use gtk4::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -28,8 +28,7 @@ fn data_dir() -> std::path::PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".local/share")
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share")
         });
     let dir = base.join("musicplayer-rs");
     let _ = std::fs::create_dir_all(&dir);
