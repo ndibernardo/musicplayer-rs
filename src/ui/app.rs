@@ -1,8 +1,8 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::Mutex;
 
-use gtk4::Application;
 use gtk4::prelude::*;
+use gtk4::Application;
 
 use crate::adapters::db::sqlite::Db;
 
@@ -14,7 +14,7 @@ pub fn run() {
     app.connect_activate(|app| {
         let db_path = data_dir().join("library.db");
         let db = match Db::open(&db_path) {
-            Ok(db) => Rc::new(RefCell::new(db)),
+            Ok(db) => Arc::new(Mutex::new(db)),
             Err(e) => {
                 eprintln!("Failed to open database: {e}");
                 return;
@@ -30,7 +30,8 @@ fn data_dir() -> std::path::PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share")
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(".local/share")
         });
     let dir = base.join("musicplayer-rs");
     let _ = std::fs::create_dir_all(&dir);
