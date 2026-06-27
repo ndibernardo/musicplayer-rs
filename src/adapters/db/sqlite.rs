@@ -44,6 +44,8 @@ pub struct Db {
 impl Db {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
+        // WAL allows a background writer and the UI reader to proceed without blocking each other.
+        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)

@@ -1,4 +1,5 @@
 mod adapters;
+mod application;
 mod domain;
 #[cfg(feature = "ui")]
 mod ui;

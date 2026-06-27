@@ -1,5 +1,6 @@
-use std::sync::Arc;
-use std::sync::Mutex;
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
 
 use gtk4::prelude::*;
 use gtk4::Application;
@@ -14,24 +15,23 @@ pub fn run() {
     app.connect_activate(|app| {
         let db_path = data_dir().join("library.db");
         let db = match Db::open(&db_path) {
-            Ok(db) => Arc::new(Mutex::new(db)),
+            Ok(db) => Rc::new(RefCell::new(db)),
             Err(e) => {
                 eprintln!("Failed to open database: {e}");
                 return;
             }
         };
-        crate::ui::main_window::build(app, db).present();
+        crate::ui::main_window::build(app, db, db_path).present();
     });
 
     app.run();
 }
 
-fn data_dir() -> std::path::PathBuf {
+fn data_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
+        .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".local/share")
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share")
         });
     let dir = base.join("musicplayer-rs");
     let _ = std::fs::create_dir_all(&dir);
