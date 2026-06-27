@@ -1,3 +1,4 @@
+use crate::domain::library::LibraryFolder;
 use rusqlite::Connection;
 use std::path::Path;
 
@@ -55,6 +56,37 @@ impl Db {
         self.conn.execute_batch(SCHEMA)?;
         Ok(())
     }
+
+    pub fn add_folder(&self, folder: &LibraryFolder) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO folders (path) VALUES (?1)",
+            [folder.as_path().to_string_lossy().as_ref()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_folder(&self, folder: &LibraryFolder) -> Result<(), DbError> {
+        self.conn.execute(
+            "DELETE FROM folders WHERE path = ?1",
+            [folder.as_path().to_string_lossy().as_ref()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_folders(&self) -> Result<Vec<LibraryFolder>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM folders ORDER BY path")?;
+
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .map(|res| res.map_err(DbError::from))
+            .map(|res| {
+                res.and_then(|path| {
+                    LibraryFolder::new(path).map_err(|e| DbError::InvalidData(e.to_string()))
+                })
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -92,5 +124,39 @@ mod tests {
     fn migrate_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
         assert!(db.migrate().is_ok(), "second migration must not fail");
+    }
+
+    #[test]
+    fn add_folder_persists_to_db() {
+        let db = Db::open_in_memory().unwrap();
+        let folder = LibraryFolder::new("/home/user/Music").unwrap();
+        db.add_folder(&folder).unwrap();
+        assert_eq!(db.list_folders().unwrap(), vec![folder]);
+    }
+
+    #[test]
+    fn add_folder_is_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let folder = LibraryFolder::new("/home/user/Music").unwrap();
+        db.add_folder(&folder).unwrap();
+        db.add_folder(&folder).unwrap();
+        assert_eq!(db.list_folders().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remove_folder_deletes_from_db() {
+        let db = Db::open_in_memory().unwrap();
+        let folder = LibraryFolder::new("/home/user/Music").unwrap();
+        db.add_folder(&folder).unwrap();
+        db.remove_folder(&folder).unwrap();
+        assert!(db.list_folders().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_folders_returns_all_configured_paths() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_folder(&LibraryFolder::new("/home/user/Music").unwrap()).unwrap();
+        db.add_folder(&LibraryFolder::new("/home/user/Downloads").unwrap()).unwrap();
+        assert_eq!(db.list_folders().unwrap().len(), 2);
     }
 }
