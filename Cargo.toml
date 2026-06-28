@@ -20,3 +20,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 gtk4  = { version = "0.11.4", features = ["v4_14"], optional = true }
 glib  = { version = "0.22.8", optional = true }
 rodio = { version = "0.22.2", features = ["symphonia-all", "symphonia-simd"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
