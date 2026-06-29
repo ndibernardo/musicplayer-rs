@@ -1,11 +1,12 @@
+use std::ffi::OsStr;
+use std::path::Path;
+use std::path::PathBuf;
+
 use crate::adapters::db::sqlite::Db;
 use crate::adapters::db::sqlite::DbError;
 use crate::domain::library::LibraryFolder;
 use crate::domain::track::Track;
 use crate::domain::track::TrackPath;
-use std::ffi::OsStr;
-use std::path::Path;
-use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
@@ -83,17 +84,17 @@ mod tests {
 
     fn fake_track(path: &TrackPath) -> Track {
         Track {
-            id:           TrackId::new(0),
-            path:         path.clone(),
-            title:        Title::new("Roygbiv"),
-            artist:       Artist::new("Boards of Canada"),
-            album:        AlbumTitle::new("Music Has the Right to Children"),
-            genre:        Genre::new("Electronic"),
-            duration:     TrackDuration::from_secs(193),
+            id: TrackId::new(0),
+            path: path.clone(),
+            title: Title::new("Roygbiv"),
+            artist: Artist::new("Boards of Canada"),
+            album: AlbumTitle::new("Music Has the Right to Children"),
+            genre: Genre::new("Electronic"),
+            duration: TrackDuration::from_secs(193),
             track_number: TrackNumber::new(7),
-            disc_number:  DiscNumber::new(1),
-            year:         Year::new(1998),
-            art:          None,
+            disc_number: DiscNumber::new(1),
+            year: Year::new(1998),
+            art: None,
         }
     }
 
@@ -184,6 +185,10 @@ mod tests {
         scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
         scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
 
-        assert_eq!(db.track_count().unwrap(), 1, "re-scan must not duplicate rows");
+        assert_eq!(
+            db.track_count().unwrap(),
+            1,
+            "re-scan must not duplicate rows"
+        );
     }
 }

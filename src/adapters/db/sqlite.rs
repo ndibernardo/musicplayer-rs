@@ -3,8 +3,18 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use crate::domain::library::LibraryFolder;
+use crate::domain::track::AlbumArtData;
+use crate::domain::track::AlbumTitle;
+use crate::domain::track::Artist;
+use crate::domain::track::DiscNumber;
+use crate::domain::track::Genre;
+use crate::domain::track::Title;
 use crate::domain::track::Track;
+use crate::domain::track::TrackDuration;
 use crate::domain::track::TrackId;
+use crate::domain::track::TrackNumber;
+use crate::domain::track::TrackPath;
+use crate::domain::track::Year;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -36,6 +46,14 @@ const SCHEMA: &str = "
         art          BLOB
     );
 ";
+
+fn or_empty(v: Option<String>) -> String {
+    v.unwrap_or_else(String::new)
+}
+
+fn or_zero(v: Option<i64>) -> i64 {
+    v.unwrap_or(0)
+}
 
 pub struct Db {
     pub(crate) conn: Connection,
@@ -134,6 +152,63 @@ impl Db {
         };
 
         Ok(TrackId::new(id))
+    }
+
+    /// Returns all tracks ordered by artist → album → track number.
+    pub fn list_tracks(&self) -> Result<Vec<Track>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_id, path, title, artist, album, genre,
+                    duration_ms, track_number, disc_number, year, art
+             FROM tracks
+             ORDER BY artist, album, track_number",
+        )?;
+
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+                row.get::<_, Option<Vec<u8>>>(10)?,
+            ))
+        })?
+        .map(|r| r.map_err(DbError::from))
+        .map(|r| {
+            let (
+                id,
+                path,
+                title,
+                artist,
+                album,
+                genre,
+                duration_ms,
+                track_num,
+                disc_num,
+                year,
+                art,
+            ) = r?;
+            let path = TrackPath::new(path).map_err(|e| DbError::InvalidData(e.to_string()))?;
+            Ok(Track {
+                id: TrackId::new(id),
+                path,
+                title: Title::new(or_empty(title)),
+                artist: Artist::new(or_empty(artist)),
+                album: AlbumTitle::new(or_empty(album)),
+                genre: Genre::new(or_empty(genre)),
+                duration: TrackDuration::from_millis(or_zero(duration_ms) as u64),
+                track_number: TrackNumber::new(or_zero(track_num) as u32),
+                disc_number: DiscNumber::new(or_zero(disc_num) as u32),
+                year: Year::new(or_zero(year) as u16),
+                art: art.map(AlbumArtData::new),
+            })
+        })
+        .collect()
     }
 
     pub fn track_count(&self) -> Result<u64, DbError> {
@@ -328,6 +403,60 @@ mod tests {
     fn track_count_returns_zero_for_fresh_db() {
         let db = Db::open_in_memory().unwrap();
         assert_eq!(db.track_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn list_tracks_returns_empty_for_fresh_db() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.list_tracks().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_tracks_returns_inserted_track_with_correct_fields() {
+        let db = Db::open_in_memory().unwrap();
+        let track = full_track("/music/boc/roygbiv.flac");
+        db.upsert_track(&track).unwrap();
+
+        let tracks = db.list_tracks().unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title.as_str(), "Roygbiv");
+        assert_eq!(tracks[0].artist.as_str(), "Boards of Canada");
+        assert_eq!(tracks[0].album.as_str(), "Music Has the Right to Children");
+        assert_eq!(tracks[0].track_number.value(), 7);
+        assert_eq!(tracks[0].year.value(), 1998);
+    }
+
+    #[test]
+    fn list_tracks_maps_null_fields_to_domain_defaults() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&minimal_track("/music/unknown.mp3"))
+            .unwrap();
+
+        let tracks = db.list_tracks().unwrap();
+        assert!(tracks[0].title.is_unknown());
+        assert!(tracks[0].artist.is_unknown());
+        assert!(tracks[0].track_number.is_unknown());
+        assert!(tracks[0].year.is_unknown());
+    }
+
+    #[test]
+    fn list_tracks_orders_by_artist_album_track_number() {
+        let db = Db::open_in_memory().unwrap();
+        let mut t3 = full_track("/music/boc/track03.flac");
+        t3.track_number = TrackNumber::new(3);
+        let mut t1 = full_track("/music/boc/track01.flac");
+        t1.track_number = TrackNumber::new(1);
+        let mut t2 = full_track("/music/boc/track02.flac");
+        t2.track_number = TrackNumber::new(2);
+
+        db.upsert_track(&t3).unwrap();
+        db.upsert_track(&t1).unwrap();
+        db.upsert_track(&t2).unwrap();
+
+        let tracks = db.list_tracks().unwrap();
+        assert_eq!(tracks[0].track_number.value(), 1);
+        assert_eq!(tracks[1].track_number.value(), 2);
+        assert_eq!(tracks[2].track_number.value(), 3);
     }
 
     #[test]

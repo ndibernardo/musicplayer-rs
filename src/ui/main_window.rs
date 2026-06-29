@@ -4,7 +4,6 @@ use std::rc::Rc;
 use std::sync::mpsc;
 
 use glib;
-use gtk4::prelude::*;
 use gtk4::Application;
 use gtk4::ApplicationWindow;
 use gtk4::Box as GtkBox;
@@ -17,12 +16,15 @@ use gtk4::ListBoxRow;
 use gtk4::Orientation;
 use gtk4::Paned;
 use gtk4::ScrolledWindow;
+use gtk4::prelude::*;
 
 use crate::adapters::db::sqlite::Db;
 use crate::adapters::metadata::lofty as lofty_adapter;
 use crate::application::folders;
 use crate::application::scanner;
+use crate::application::tracks;
 use crate::domain::library::LibraryFolder;
+use crate::ui::library_view::LibraryView;
 
 pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> ApplicationWindow {
     let header = HeaderBar::new();
@@ -54,9 +56,12 @@ pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> Applic
     sidebar.append(&scrolled);
     sidebar.append(&status_label);
 
+    let library_view = LibraryView::new();
+
     let content = GtkBox::new(Orientation::Vertical, 0);
     content.set_hexpand(true);
     content.set_vexpand(true);
+    content.append(&library_view.widget);
 
     let paned = Paned::new(Orientation::Horizontal);
     paned.set_start_child(Some(&sidebar));
@@ -83,6 +88,10 @@ pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> Applic
 
     refresh_folder_list(&folder_list, &db);
 
+    if let Ok(tracks) = tracks::all_tracks(&db.borrow()) {
+        library_view.set_tracks(tracks);
+    }
+
     // Add Folder — window captured directly, no btn.root() needed
     {
         let db = Rc::clone(&db);
@@ -99,7 +108,9 @@ pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> Applic
                     return;
                 };
                 let Some(path) = file.path() else { return };
-                let Ok(folder) = LibraryFolder::new(path) else { return };
+                let Ok(folder) = LibraryFolder::new(path) else {
+                    return;
+                };
                 if let Err(e) = folders::add_folder(&db.borrow(), &folder) {
                     eprintln!("Failed to add folder: {e}");
                     return;
@@ -112,6 +123,7 @@ pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> Applic
     // Scan — background thread opens its own DB connection (WAL allows concurrent access)
     {
         let db = Rc::clone(&db);
+        let library_view = library_view.clone();
         let status_label = status_label.clone();
         scan_btn.connect_clicked(move |_| {
             let configured = match folders::list_folders(&db.borrow()) {
@@ -142,8 +154,7 @@ pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> Applic
                 };
                 let mut total = 0u32;
                 for folder in &configured {
-                    match scanner::scan_folder(folder, &scan_db, |p| lofty_adapter::read(p).ok())
-                    {
+                    match scanner::scan_folder(folder, &scan_db, |p| lofty_adapter::read(p).ok()) {
                         Ok(n) => total += n,
                         Err(e) => {
                             let _ = tx.send(Err(e.to_string()));
@@ -154,10 +165,15 @@ pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> Applic
                 let _ = tx.send(Ok(total));
             });
 
+            let db = Rc::clone(&db);
+            let library_view = library_view.clone();
             let status_label = status_label.clone();
             glib::idle_add_local(move || match rx.try_recv() {
                 Ok(Ok(n)) => {
                     status_label.set_text(&format!("Indexed {n} tracks"));
+                    if let Ok(tracks) = tracks::all_tracks(&db.borrow()) {
+                        library_view.set_tracks(tracks);
+                    }
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {

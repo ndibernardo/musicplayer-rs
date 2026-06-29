@@ -2,8 +2,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use gtk4::prelude::*;
 use gtk4::Application;
+use gtk4::prelude::*;
 
 use crate::adapters::db::sqlite::Db;
 
