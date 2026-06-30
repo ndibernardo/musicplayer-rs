@@ -2,6 +2,7 @@ use glib::BoxedAnyObject;
 use gtk4::ColumnView;
 use gtk4::ColumnViewColumn;
 use gtk4::Label;
+use gtk4::ListItem;
 use gtk4::NoSelection;
 use gtk4::ScrolledWindow;
 use gtk4::SignalListItemFactory;
@@ -72,21 +73,19 @@ where
     F: Fn(&Track) -> String + 'static,
 {
     let factory = SignalListItemFactory::new();
-    factory.connect_setup(|_, item| {
+    factory.connect_setup(|_, obj| {
+        let Some(item) = obj.downcast_ref::<ListItem>() else { return };
         let label = Label::new(None);
         label.set_xalign(0.0);
         label.set_margin_start(6);
         label.set_margin_end(6);
         item.set_child(Some(&label));
     });
-    factory.connect_bind(move |_, item| {
-        let Some(obj) = item.item().and_downcast::<BoxedAnyObject>() else {
-            return;
-        };
-        let track = obj.borrow::<Track>();
-        let Some(label) = item.child().and_downcast::<Label>() else {
-            return;
-        };
+    factory.connect_bind(move |_, obj| {
+        let Some(item) = obj.downcast_ref::<ListItem>() else { return };
+        let Some(data) = item.item().and_downcast::<BoxedAnyObject>() else { return };
+        let track = data.borrow::<Track>();
+        let Some(label) = item.child().and_downcast::<Label>() else { return };
         label.set_text(&extract(&*track));
     });
     ColumnViewColumn::new(Some(title), Some(factory))
