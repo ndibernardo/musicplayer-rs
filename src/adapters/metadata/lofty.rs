@@ -53,7 +53,7 @@ pub fn read(path: &TrackPath) -> Result<Track, MetadataError> {
         // `year()` was removed in lofty 0.22+; extract the year from the Timestamp returned by `date()`.
         year: Year::new(
             tag.and_then(|t| t.date())
-                .map(|ts| ts.year as u16)
+                .map(|ts| ts.year)
                 .unwrap_or(0),
         ),
         art: tag
@@ -67,7 +67,7 @@ fn str_field<F>(tag: Option<&Tag>, f: F) -> String
 where
     F: Fn(&Tag) -> Option<Cow<str>>,
 {
-    tag.and_then(|t| f(t))
+    tag.and_then(f)
         .map_or_else(String::new, |s| s.into_owned())
 }
 
@@ -75,5 +75,5 @@ fn num_field<F>(tag: Option<&Tag>, f: F) -> u32
 where
     F: Fn(&Tag) -> Option<u32>,
 {
-    tag.and_then(|t| f(t)).unwrap_or(0)
+    tag.and_then(f).unwrap_or(0)
 }

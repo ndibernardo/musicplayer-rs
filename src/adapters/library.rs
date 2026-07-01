@@ -126,11 +126,9 @@ impl Scanner for SqliteLibrary {
             let db_lib = DbLibrary(&scan_db);
             let mut total = 0u32;
             for folder in &folders {
-                match crate::application::scanner::scan_folder(
-                    folder,
-                    &db_lib,
-                    |p| crate::adapters::metadata::lofty::read(p).ok(),
-                ) {
+                match crate::application::scanner::scan_folder(folder, &db_lib, |p| {
+                    crate::adapters::metadata::lofty::read(p).ok()
+                }) {
                     Ok(n) => total += n,
                     Err(e) => {
                         let _ = tx.send(Err(e.to_string()));

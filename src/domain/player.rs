@@ -1,3 +1,4 @@
+use crate::domain::track::Track;
 use crate::domain::track::TrackId;
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -93,7 +94,7 @@ impl PlaybackState {
 /// Commands sent to the audio engine thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerCommand {
-    Play(TrackId),
+    Play(Track),
     Pause,
     Resume,
     Stop,

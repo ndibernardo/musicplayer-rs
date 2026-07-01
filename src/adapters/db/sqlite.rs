@@ -48,7 +48,7 @@ const SCHEMA: &str = "
 ";
 
 fn or_empty(v: Option<String>) -> String {
-    v.unwrap_or_else(String::new)
+    v.unwrap_or_default()
 }
 
 fn or_zero(v: Option<i64>) -> i64 {
