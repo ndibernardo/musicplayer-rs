@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
 
@@ -18,15 +16,16 @@ use gtk4::Paned;
 use gtk4::ScrolledWindow;
 use gtk4::prelude::*;
 
-use crate::adapters::db::sqlite::Db;
-use crate::adapters::metadata::lofty as lofty_adapter;
-use crate::application::folders;
-use crate::application::scanner;
-use crate::application::tracks;
+use crate::application::ports::library::Library;
+use crate::application::ports::scanner::Scanner;
 use crate::domain::library::LibraryFolder;
 use crate::ui::library_view::LibraryView;
 
-pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> ApplicationWindow {
+pub fn build(
+    app: &Application,
+    library: Rc<dyn Library>,
+    scanner: Rc<dyn Scanner>,
+) -> ApplicationWindow {
     let header = HeaderBar::new();
 
     let add_btn = Button::from_icon_name("folder-new-symbolic");
@@ -86,19 +85,19 @@ pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> Applic
 
     window.set_titlebar(Some(&header));
 
-    refresh_folder_list(&folder_list, &db);
+    refresh_folder_list(&folder_list, &library);
 
-    if let Ok(tracks) = tracks::all_tracks(&db.borrow()) {
+    if let Ok(tracks) = library.all_tracks() {
         library_view.set_tracks(tracks);
     }
 
-    // Add Folder — window captured directly, no btn.root() needed
+    // Add Folder
     {
-        let db = Rc::clone(&db);
+        let library = Rc::clone(&library);
         let folder_list = folder_list.clone();
         let window = window.clone();
         add_btn.connect_clicked(move |_| {
-            let db = Rc::clone(&db);
+            let library = Rc::clone(&library);
             let folder_list = folder_list.clone();
             let window = window.clone();
             glib::spawn_future_local(async move {
@@ -111,67 +110,33 @@ pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> Applic
                 let Ok(folder) = LibraryFolder::new(path) else {
                     return;
                 };
-                if let Err(e) = folders::add_folder(&db.borrow(), &folder) {
+                if let Err(e) = library.add_folder(&folder) {
                     eprintln!("Failed to add folder: {e}");
                     return;
                 }
-                refresh_folder_list(&folder_list, &db);
+                refresh_folder_list(&folder_list, &library);
             });
         });
     }
 
-    // Scan — background thread opens its own DB connection (WAL allows concurrent access)
+    // Scan — Scanner::scan() opens its own DB connection in a background thread (WAL)
     {
-        let db = Rc::clone(&db);
+        let library = Rc::clone(&library);
+        let scanner = Rc::clone(&scanner);
         let library_view = library_view.clone();
         let status_label = status_label.clone();
         scan_btn.connect_clicked(move |_| {
-            let configured = match folders::list_folders(&db.borrow()) {
-                Ok(f) => f,
-                Err(e) => {
-                    status_label.set_text(&format!("Error: {e}"));
-                    return;
-                }
-            };
-
-            if configured.is_empty() {
-                status_label.set_text("No folders configured");
-                return;
-            }
-
             status_label.set_text("Scanning…");
 
-            let (tx, rx) = mpsc::channel::<Result<u32, String>>();
-            let path = db_path.clone();
+            let rx = scanner.scan();
 
-            std::thread::spawn(move || {
-                let scan_db = match Db::open(&path) {
-                    Ok(db) => db,
-                    Err(e) => {
-                        let _ = tx.send(Err(e.to_string()));
-                        return;
-                    }
-                };
-                let mut total = 0u32;
-                for folder in &configured {
-                    match scanner::scan_folder(folder, &scan_db, |p| lofty_adapter::read(p).ok()) {
-                        Ok(n) => total += n,
-                        Err(e) => {
-                            let _ = tx.send(Err(e.to_string()));
-                            return;
-                        }
-                    }
-                }
-                let _ = tx.send(Ok(total));
-            });
-
-            let db = Rc::clone(&db);
+            let library = Rc::clone(&library);
             let library_view = library_view.clone();
             let status_label = status_label.clone();
             glib::idle_add_local(move || match rx.try_recv() {
                 Ok(Ok(n)) => {
                     status_label.set_text(&format!("Indexed {n} tracks"));
-                    if let Ok(tracks) = tracks::all_tracks(&db.borrow()) {
+                    if let Ok(tracks) = library.all_tracks() {
                         library_view.set_tracks(tracks);
                     }
                     glib::ControlFlow::Break
@@ -189,17 +154,21 @@ pub fn build(app: &Application, db: Rc<RefCell<Db>>, db_path: PathBuf) -> Applic
     window
 }
 
-fn refresh_folder_list(list: &ListBox, db: &Rc<RefCell<Db>>) {
+fn refresh_folder_list(list: &ListBox, library: &Rc<dyn Library>) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
-    let configured = folders::list_folders(&db.borrow()).unwrap_or_default();
+    let configured = library.list_folders().unwrap_or_default();
     for folder in configured {
-        list.append(&folder_row(folder, list, db));
+        list.append(&folder_row(folder, list, library));
     }
 }
 
-fn folder_row(folder: LibraryFolder, list: &ListBox, db: &Rc<RefCell<Db>>) -> ListBoxRow {
+fn folder_row(
+    folder: LibraryFolder,
+    list: &ListBox,
+    library: &Rc<dyn Library>,
+) -> ListBoxRow {
     let path_label = Label::new(folder.as_path().to_str());
     path_label.set_hexpand(true);
     path_label.set_xalign(0.0);
@@ -216,14 +185,14 @@ fn folder_row(folder: LibraryFolder, list: &ListBox, db: &Rc<RefCell<Db>>) -> Li
     row_box.append(&path_label);
     row_box.append(&remove_btn);
 
-    let db = Rc::clone(db);
+    let library = Rc::clone(library);
     let list = list.clone();
     remove_btn.connect_clicked(move |_| {
-        if let Err(e) = folders::remove_folder(&db.borrow(), &folder) {
+        if let Err(e) = library.remove_folder(&folder) {
             eprintln!("Failed to remove folder: {e}");
             return;
         }
-        refresh_folder_list(&list, &db);
+        refresh_folder_list(&list, &library);
     });
 
     let row = ListBoxRow::new();

@@ -2,8 +2,8 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::adapters::db::sqlite::Db;
-use crate::adapters::db::sqlite::DbError;
+use crate::application::ports::RepositoryError;
+use crate::application::ports::library::Library;
 use crate::domain::library::LibraryFolder;
 use crate::domain::track::Track;
 use crate::domain::track::TrackPath;
@@ -15,17 +15,17 @@ pub enum ScanError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("database error: {0}")]
-    Db(#[from] DbError),
+    #[error("repository error: {0}")]
+    Repository(#[from] RepositoryError),
 }
 
-/// Walks `folder` recursively, reads each audio file with `read_track`, and upserts to `db`.
+/// Walks `folder` recursively, reads each audio file with `read_track`, and upserts to `library`.
 ///
 /// `read_track` returns `None` to skip a file (e.g. format error). Returns the count of
 /// successfully indexed tracks.
 pub fn scan_folder(
     folder: &LibraryFolder,
-    db: &Db,
+    library: &dyn Library,
     read_track: impl Fn(&TrackPath) -> Option<Track>,
 ) -> Result<u32, ScanError> {
     let files = collect_audio_files(folder.as_path())?;
@@ -36,7 +36,7 @@ pub fn scan_folder(
             continue;
         };
         if let Some(track) = read_track(&track_path) {
-            db.upsert_track(&track)?;
+            library.upsert_track(&track)?;
             count += 1;
         }
     }
@@ -71,7 +71,15 @@ fn is_audio_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
     use super::*;
+    use crate::application::ports::RepositoryError;
+    use crate::application::ports::library::Library;
+    use crate::domain::library::LibraryFolder;
     use crate::domain::track::AlbumTitle;
     use crate::domain::track::Artist;
     use crate::domain::track::DiscNumber;
@@ -81,6 +89,47 @@ mod tests {
     use crate::domain::track::TrackId;
     use crate::domain::track::TrackNumber;
     use crate::domain::track::Year;
+
+    struct InMemoryLibrary {
+        tracks: RefCell<HashMap<TrackPath, Track>>,
+    }
+
+    impl InMemoryLibrary {
+        fn new() -> Self {
+            Self {
+                tracks: RefCell::new(HashMap::new()),
+            }
+        }
+
+        fn count(&self) -> usize {
+            self.tracks.borrow().len()
+        }
+    }
+
+    impl Library for InMemoryLibrary {
+        fn add_folder(&self, _folder: &LibraryFolder) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
+        fn remove_folder(&self, _folder: &LibraryFolder) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
+        fn list_folders(&self) -> Result<Vec<LibraryFolder>, RepositoryError> {
+            Ok(vec![])
+        }
+
+        fn upsert_track(&self, track: &Track) -> Result<TrackId, RepositoryError> {
+            self.tracks
+                .borrow_mut()
+                .insert(track.path.clone(), track.clone());
+            Ok(TrackId::new(0))
+        }
+
+        fn all_tracks(&self) -> Result<Vec<Track>, RepositoryError> {
+            Ok(self.tracks.borrow().values().cloned().collect())
+        }
+    }
 
     fn fake_track(path: &TrackPath) -> Track {
         Track {
@@ -108,12 +157,12 @@ mod tests {
         touch(&dir.path().join("track01.flac"));
         touch(&dir.path().join("track02.mp3"));
 
-        let db = Db::open_in_memory().unwrap();
+        let lib = InMemoryLibrary::new();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
+        let count = scan_folder(&folder, &lib, |p| Some(fake_track(p))).unwrap();
 
         assert_eq!(count, 2);
-        assert_eq!(db.track_count().unwrap(), 2);
+        assert_eq!(lib.count(), 2);
     }
 
     #[test]
@@ -123,9 +172,9 @@ mod tests {
         touch(&dir.path().join("cover.jpg"));
         touch(&dir.path().join("info.txt"));
 
-        let db = Db::open_in_memory().unwrap();
+        let lib = InMemoryLibrary::new();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
+        let count = scan_folder(&folder, &lib, |p| Some(fake_track(p))).unwrap();
 
         assert_eq!(count, 1);
     }
@@ -138,9 +187,9 @@ mod tests {
         touch(&dir.path().join("root.flac"));
         touch(&sub.join("sub.flac"));
 
-        let db = Db::open_in_memory().unwrap();
+        let lib = InMemoryLibrary::new();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
+        let count = scan_folder(&folder, &lib, |p| Some(fake_track(p))).unwrap();
 
         assert_eq!(count, 2);
     }
@@ -151,10 +200,10 @@ mod tests {
         touch(&dir.path().join("corrupt.flac"));
         touch(&dir.path().join("valid.flac"));
 
-        let db = Db::open_in_memory().unwrap();
+        let lib = InMemoryLibrary::new();
         let folder = LibraryFolder::new(dir.path()).unwrap();
 
-        let count = scan_folder(&folder, &db, |p| {
+        let count = scan_folder(&folder, &lib, |p| {
             if p.as_path().file_name() == Some(OsStr::new("corrupt.flac")) {
                 None
             } else {
@@ -164,14 +213,14 @@ mod tests {
         .unwrap();
 
         assert_eq!(count, 1);
-        assert_eq!(db.track_count().unwrap(), 1);
+        assert_eq!(lib.count(), 1);
     }
 
     #[test]
     fn scan_folder_returns_error_for_nonexistent_directory() {
-        let db = Db::open_in_memory().unwrap();
+        let lib = InMemoryLibrary::new();
         let folder = LibraryFolder::new("/nonexistent/path/that/does/not/exist").unwrap();
-        let result = scan_folder(&folder, &db, |p| Some(fake_track(p)));
+        let result = scan_folder(&folder, &lib, |p| Some(fake_track(p)));
         assert!(matches!(result, Err(ScanError::ReadDir { .. })));
     }
 
@@ -180,15 +229,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("track.flac"));
 
-        let db = Db::open_in_memory().unwrap();
+        let lib = InMemoryLibrary::new();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
-        scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
+        scan_folder(&folder, &lib, |p| Some(fake_track(p))).unwrap();
+        scan_folder(&folder, &lib, |p| Some(fake_track(p))).unwrap();
 
-        assert_eq!(
-            db.track_count().unwrap(),
-            1,
-            "re-scan must not duplicate rows"
-        );
+        assert_eq!(lib.count(), 1, "re-scan must not duplicate rows");
     }
 }

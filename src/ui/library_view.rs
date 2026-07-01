@@ -74,7 +74,9 @@ where
 {
     let factory = SignalListItemFactory::new();
     factory.connect_setup(|_, obj| {
-        let Some(item) = obj.downcast_ref::<ListItem>() else { return };
+        let Some(item) = obj.downcast_ref::<ListItem>() else {
+            return;
+        };
         let label = Label::new(None);
         label.set_xalign(0.0);
         label.set_margin_start(6);
@@ -82,10 +84,16 @@ where
         item.set_child(Some(&label));
     });
     factory.connect_bind(move |_, obj| {
-        let Some(item) = obj.downcast_ref::<ListItem>() else { return };
-        let Some(data) = item.item().and_downcast::<BoxedAnyObject>() else { return };
+        let Some(item) = obj.downcast_ref::<ListItem>() else {
+            return;
+        };
+        let Some(data) = item.item().and_downcast::<BoxedAnyObject>() else {
+            return;
+        };
         let track = data.borrow::<Track>();
-        let Some(label) = item.child().and_downcast::<Label>() else { return };
+        let Some(label) = item.child().and_downcast::<Label>() else {
+            return;
+        };
         label.set_text(&extract(&*track));
     });
     ColumnViewColumn::new(Some(title), Some(factory))
