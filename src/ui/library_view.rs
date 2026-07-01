@@ -15,6 +15,7 @@ use crate::domain::track::TrackDuration;
 #[derive(Clone)]
 pub struct LibraryView {
     pub widget: ScrolledWindow,
+    column_view: ColumnView,
     store: ListStore,
 }
 
@@ -56,6 +57,7 @@ impl LibraryView {
 
         Self {
             widget: scrolled,
+            column_view,
             store,
         }
     }
@@ -65,6 +67,18 @@ impl LibraryView {
         for track in tracks {
             self.store.append(&BoxedAnyObject::new(track));
         }
+    }
+
+    /// Calls `f` with the activated `Track` whenever the user double-clicks a row.
+    pub fn connect_track_activated<F: Fn(Track) + 'static>(&self, f: F) {
+        let store = self.store.clone();
+        self.column_view.connect_activate(move |_, position| {
+            let Some(obj) = store.item(position).and_downcast::<BoxedAnyObject>() else {
+                return;
+            };
+            let track = obj.borrow::<Track>().clone();
+            f(track);
+        });
     }
 }
 
@@ -94,7 +108,7 @@ where
         let Some(label) = item.child().and_downcast::<Label>() else {
             return;
         };
-        label.set_text(&extract(&*track));
+        label.set_text(&extract(&track));
     });
     ColumnViewColumn::new(Some(title), Some(factory))
 }

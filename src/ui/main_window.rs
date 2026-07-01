@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::time::Duration;
 
-use glib;
 use gtk4::Application;
 use gtk4::ApplicationWindow;
 use gtk4::Box as GtkBox;
@@ -16,15 +16,21 @@ use gtk4::Paned;
 use gtk4::ScrolledWindow;
 use gtk4::prelude::*;
 
+use crate::application::player::PlayerHandle;
 use crate::application::ports::library::Library;
 use crate::application::ports::scanner::Scanner;
 use crate::domain::library::LibraryFolder;
+use crate::domain::player::PlaybackState;
+use crate::domain::player::PlayerCommand;
 use crate::ui::library_view::LibraryView;
+use crate::ui::player_bar::PlayerBar;
 
 pub fn build(
     app: &Application,
     library: Rc<dyn Library>,
     scanner: Rc<dyn Scanner>,
+    player: PlayerHandle,
+    state_rx: mpsc::Receiver<PlaybackState>,
 ) -> ApplicationWindow {
     let header = HeaderBar::new();
 
@@ -68,12 +74,11 @@ pub fn build(
     paned.set_position(220);
     paned.set_vexpand(true);
 
-    let player_bar = GtkBox::new(Orientation::Horizontal, 0);
-    player_bar.set_height_request(80);
+    let player_bar = PlayerBar::new(player.clone());
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.append(&paned);
-    root.append(&player_bar);
+    root.append(&player_bar.widget);
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -89,6 +94,16 @@ pub fn build(
 
     if let Ok(tracks) = library.all_tracks() {
         library_view.set_tracks(tracks);
+    }
+
+    // Double-click on a track → play it
+    {
+        let player = player.clone();
+        let player_bar = player_bar.clone();
+        library_view.connect_track_activated(move |track| {
+            player_bar.set_track(&track);
+            player.send(PlayerCommand::Play(track));
+        });
     }
 
     // Add Folder
@@ -119,7 +134,7 @@ pub fn build(
         });
     }
 
-    // Scan — Scanner::scan() opens its own DB connection in a background thread (WAL)
+    // Scan
     {
         let library = Rc::clone(&library);
         let scanner = Rc::clone(&scanner);
@@ -151,6 +166,17 @@ pub fn build(
         });
     }
 
+    // Poll player state every 250 ms and update the player bar
+    {
+        let player_bar = player_bar.clone();
+        glib::timeout_add_local(Duration::from_millis(250), move || {
+            while let Ok(state) = state_rx.try_recv() {
+                player_bar.update_state(&state);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
     window
 }
 
@@ -164,11 +190,7 @@ fn refresh_folder_list(list: &ListBox, library: &Rc<dyn Library>) {
     }
 }
 
-fn folder_row(
-    folder: LibraryFolder,
-    list: &ListBox,
-    library: &Rc<dyn Library>,
-) -> ListBoxRow {
+fn folder_row(folder: LibraryFolder, list: &ListBox, library: &Rc<dyn Library>) -> ListBoxRow {
     let path_label = Label::new(folder.as_path().to_str());
     path_label.set_hexpand(true);
     path_label.set_xalign(0.0);
