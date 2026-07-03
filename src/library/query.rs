@@ -1,3 +1,4 @@
+use crate::library::album::AlbumSummary;
 use crate::library::db::Db;
 use crate::library::db::DbError;
 use crate::library::track::AlbumTitle;
@@ -21,6 +22,17 @@ pub fn tracks_for(filter: &LibraryFilter, db: &Db) -> Result<Vec<Track>, DbError
         LibraryFilter::ByGenre(genre) => db.tracks_by_genre(genre),
         LibraryFilter::ByArtist(artist) => db.tracks_by_artist(artist),
         LibraryFilter::ByAlbum(album) => db.tracks_by_album(album),
+    }
+}
+
+/// Returns the album summaries matching `filter` — the album grid shows only the
+/// albums under the active sidebar filter, or every album when unfiltered.
+pub fn album_summaries_for(filter: &LibraryFilter, db: &Db) -> Result<Vec<AlbumSummary>, DbError> {
+    match filter {
+        LibraryFilter::All => db.album_summaries(),
+        LibraryFilter::ByGenre(genre) => db.album_summaries_by_genre(genre),
+        LibraryFilter::ByArtist(artist) => db.album_summaries_by_artist(artist),
+        LibraryFilter::ByAlbum(album) => db.album_summaries_by_album(album),
     }
 }
 
@@ -110,5 +122,45 @@ mod tests {
         .unwrap();
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].genre.as_str(), "Ambient");
+    }
+
+    #[test]
+    fn album_summaries_for_all_returns_every_album() {
+        let db = library();
+        let albums = album_summaries_for(&LibraryFilter::All, &db).unwrap();
+        assert_eq!(albums.len(), 2);
+    }
+
+    #[test]
+    fn album_summaries_for_by_genre_returns_only_that_genre() {
+        let db = library();
+        let albums =
+            album_summaries_for(&LibraryFilter::ByGenre(Genre::new("Ambient")), &db).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist.as_str(), "Aphex Twin");
+    }
+
+    #[test]
+    fn album_summaries_for_by_artist_returns_only_that_artist() {
+        let db = library();
+        let albums = album_summaries_for(
+            &LibraryFilter::ByArtist(Artist::new("Boards of Canada")),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].album.as_str(), "Music Has the Right to Children");
+    }
+
+    #[test]
+    fn album_summaries_for_by_album_returns_only_that_album() {
+        let db = library();
+        let albums = album_summaries_for(
+            &LibraryFilter::ByAlbum(AlbumTitle::new("Selected Ambient Works 85-92")),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].genre.as_str(), "Ambient");
     }
 }

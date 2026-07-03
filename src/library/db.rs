@@ -2,6 +2,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 
 use crate::library::album::AlbumSummary;
 use crate::library::track::AlbumArtData;
@@ -76,6 +77,11 @@ const SCHEMA: &str = "
         disc_number  INTEGER,
         year         INTEGER,
         art          BLOB
+    );
+
+    CREATE TABLE IF NOT EXISTS settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
     );
 ";
 
@@ -329,13 +335,43 @@ impl Db {
     /// `MAX`, which skips NULLs — so a summary carries art from any track in the
     /// group that has it, even when others don't.
     pub fn album_summaries(&self) -> Result<Vec<AlbumSummary>, DbError> {
-        let mut stmt = self.conn.prepare(
+        self.album_summaries_query("", [])
+    }
+
+    /// Album summaries whose genre equals `genre`.
+    pub fn album_summaries_by_genre(&self, genre: &Genre) -> Result<Vec<AlbumSummary>, DbError> {
+        self.album_summaries_query("WHERE genre = ?1", [genre.as_str()])
+    }
+
+    /// Album summaries by `artist`.
+    pub fn album_summaries_by_artist(&self, artist: &Artist) -> Result<Vec<AlbumSummary>, DbError> {
+        self.album_summaries_query("WHERE artist = ?1", [artist.as_str()])
+    }
+
+    /// Album summaries whose album title equals `album`.
+    pub fn album_summaries_by_album(
+        &self,
+        album: &AlbumTitle,
+    ) -> Result<Vec<AlbumSummary>, DbError> {
+        self.album_summaries_query("WHERE album = ?1", [album.as_str()])
+    }
+
+    /// Runs the album-summary aggregate with the given `WHERE` clause. `MAX` on
+    /// genre/year/art skips NULLs, so a summary carries art from any track in the
+    /// group that has it.
+    fn album_summaries_query(
+        &self,
+        where_clause: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<AlbumSummary>, DbError> {
+        let sql = format!(
             "SELECT album, artist, MAX(genre), MAX(year), MAX(art)
-             FROM tracks
+             FROM tracks {where_clause}
              GROUP BY album, artist
-             ORDER BY artist, album",
-        )?;
-        stmt.query_map([], |row| {
+             ORDER BY artist, album"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        stmt.query_map(params, |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
                 row.get::<_, Option<String>>(1)?,
@@ -346,6 +382,27 @@ impl Db {
         })?
         .map(|r| r.map(build_album_summary).map_err(DbError::from))
         .collect()
+    }
+
+    /// Stores `value` under `key`, overwriting any existing value.
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the value stored under `key`, or `None` when unset.
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, DbError> {
+        let value = self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        Ok(value)
     }
 
     pub fn track_count(&self) -> Result<u64, DbError> {
@@ -871,6 +928,112 @@ mod tests {
         let summaries = db.album_summaries().unwrap();
         assert_eq!(summaries[0].artist.as_str(), "Aphex Twin");
         assert_eq!(summaries[1].artist.as_str(), "Boards of Canada");
+    }
+
+    #[test]
+    fn album_summaries_by_genre_returns_only_matching_albums() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/geogaddi.flac",
+            "Boards of Canada",
+            "Geogaddi",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/miles/kind.flac",
+            "Miles Davis",
+            "Kind of Blue",
+            "Jazz",
+        ))
+        .unwrap();
+
+        let jazz = db.album_summaries_by_genre(&Genre::new("Jazz")).unwrap();
+        assert_eq!(jazz.len(), 1);
+        assert_eq!(jazz[0].album.as_str(), "Kind of Blue");
+    }
+
+    #[test]
+    fn album_summaries_by_artist_returns_only_that_artists_albums() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/geogaddi.flac",
+            "Boards of Canada",
+            "Geogaddi",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/mhtrtc.flac",
+            "Boards of Canada",
+            "Music Has the Right to Children",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/aphex/saw.flac",
+            "Aphex Twin",
+            "Selected Ambient Works 85-92",
+            "Ambient",
+        ))
+        .unwrap();
+
+        let boc = db
+            .album_summaries_by_artist(&Artist::new("Boards of Canada"))
+            .unwrap();
+        assert_eq!(boc.len(), 2);
+    }
+
+    #[test]
+    fn album_summaries_by_album_returns_only_that_album() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/geogaddi.flac",
+            "Boards of Canada",
+            "Geogaddi",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/mhtrtc.flac",
+            "Boards of Canada",
+            "Music Has the Right to Children",
+            "Electronic",
+        ))
+        .unwrap();
+
+        let geogaddi = db
+            .album_summaries_by_album(&AlbumTitle::new("Geogaddi"))
+            .unwrap();
+        assert_eq!(geogaddi.len(), 1);
+        assert_eq!(geogaddi[0].album.as_str(), "Geogaddi");
+    }
+
+    #[test]
+    fn get_setting_returns_none_for_missing_key() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.get_setting("view_mode").unwrap(), None);
+    }
+
+    #[test]
+    fn set_setting_persists_value() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_setting("view_mode", "grid").unwrap();
+        assert_eq!(
+            db.get_setting("view_mode").unwrap(),
+            Some("grid".to_owned())
+        );
+    }
+
+    #[test]
+    fn set_setting_overwrites_existing_value() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_setting("view_mode", "grid").unwrap();
+        db.set_setting("view_mode", "list").unwrap();
+        assert_eq!(
+            db.get_setting("view_mode").unwrap(),
+            Some("list".to_owned())
+        );
     }
 
     #[test]
