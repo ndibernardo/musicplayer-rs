@@ -52,7 +52,7 @@ pub fn build(
     add_btn.set_tooltip_text(Some("Add music folder"));
     header.pack_start(&add_btn);
 
-    let scan_btn = Button::from_icon_name("media-playback-start-symbolic");
+    let scan_btn = Button::from_icon_name("view-refresh-symbolic");
     scan_btn.set_tooltip_text(Some("Scan library"));
     header.pack_start(&scan_btn);
 
