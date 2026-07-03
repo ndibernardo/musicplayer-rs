@@ -9,8 +9,8 @@ use gtk4::SignalListItemFactory;
 use gtk4::gio::ListStore;
 use gtk4::prelude::*;
 
-use crate::domain::track::Track;
-use crate::domain::track::TrackDuration;
+use crate::library::track::Track;
+use crate::library::track::TrackDuration;
 
 #[derive(Clone)]
 pub struct LibraryView {

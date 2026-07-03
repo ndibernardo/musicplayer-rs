@@ -10,11 +10,11 @@ use gtk4::Orientation;
 use gtk4::Scale;
 use gtk4::prelude::*;
 
-use crate::application::player::PlayerHandle;
-use crate::domain::player::PlaybackState;
-use crate::domain::player::PlayerCommand;
-use crate::domain::player::Volume;
-use crate::domain::track::Track;
+use crate::library::track::Track;
+use crate::player::PlaybackState;
+use crate::player::PlayerCommand;
+use crate::player::PlayerHandle;
+use crate::player::Volume;
 
 /// Bar containing transport controls, track info, and volume.
 #[derive(Clone)]
