@@ -16,6 +16,8 @@ use gtk4::ListBoxRow;
 use gtk4::Orientation;
 use gtk4::Paned;
 use gtk4::ScrolledWindow;
+use gtk4::Stack;
+use gtk4::ToggleButton;
 use gtk4::prelude::*;
 
 use crate::library::db::Db;
@@ -25,9 +27,11 @@ use crate::library::scan::spawn_scan;
 use crate::player::PlaybackState;
 use crate::player::PlayerCommand;
 use crate::player::PlayerHandle;
+use crate::ui::album_grid::AlbumGrid;
 use crate::ui::library_view::LibraryView;
 use crate::ui::player_bar::PlayerBar;
 use crate::ui::sidebar::Sidebar;
+use crate::ui::view_mode::ViewMode;
 
 pub fn build(
     app: &Application,
@@ -45,6 +49,19 @@ pub fn build(
     let scan_btn = Button::from_icon_name("media-playback-start-symbolic");
     scan_btn.set_tooltip_text(Some("Scan library"));
     header.pack_start(&scan_btn);
+
+    let list_toggle = ToggleButton::new();
+    list_toggle.set_icon_name("view-list-symbolic");
+    list_toggle.set_tooltip_text(Some("Track list"));
+    list_toggle.set_active(true);
+
+    let grid_toggle = ToggleButton::new();
+    grid_toggle.set_icon_name("view-grid-symbolic");
+    grid_toggle.set_tooltip_text(Some("Album grid"));
+    // One linked group: activating one visually releases the other.
+    grid_toggle.set_group(Some(&list_toggle));
+    header.pack_end(&grid_toggle);
+    header.pack_end(&list_toggle);
 
     let folder_list = ListBox::new();
     folder_list.set_selection_mode(gtk4::SelectionMode::None);
@@ -73,11 +90,31 @@ pub fn build(
     sidebar.append(&status_label);
 
     let library_view = LibraryView::new();
+    let album_grid = AlbumGrid::new();
 
-    let content = GtkBox::new(Orientation::Vertical, 0);
+    let content = Stack::new();
     content.set_hexpand(true);
     content.set_vexpand(true);
-    content.append(&library_view.widget);
+    content.add_named(&library_view.widget, Some(ViewMode::List.child_name()));
+    content.add_named(&album_grid.widget, Some(ViewMode::Grid.child_name()));
+
+    // Header toggles flip the visible child.
+    {
+        let content = content.clone();
+        list_toggle.connect_toggled(move |btn| {
+            if btn.is_active() {
+                content.set_visible_child_name(ViewMode::List.child_name());
+            }
+        });
+    }
+    {
+        let content = content.clone();
+        grid_toggle.connect_toggled(move |btn| {
+            if btn.is_active() {
+                content.set_visible_child_name(ViewMode::Grid.child_name());
+            }
+        });
+    }
 
     let paned = Paned::new(Orientation::Horizontal);
     paned.set_start_child(Some(&sidebar));
@@ -103,6 +140,7 @@ pub fn build(
 
     refresh_folder_list(&folder_list, &db);
     refresh_sidebar(&filter_sidebar, &db);
+    refresh_album_grid(&album_grid, &db);
 
     if let Ok(tracks) = db.list_tracks() {
         library_view.set_tracks(tracks);
@@ -115,6 +153,27 @@ pub fn build(
         filter_sidebar.connect_filter_selected(move |filter| match tracks_for(&filter, &db) {
             Ok(tracks) => library_view.set_tracks(tracks),
             Err(e) => eprintln!("Filter query failed: {e}"),
+        });
+    }
+
+    // Album drawer needs that album's tracks when it opens
+    {
+        let db = Rc::clone(&db);
+        album_grid.set_track_provider(move |summary| {
+            db.tracks_by_album(&summary.album).unwrap_or_else(|e| {
+                eprintln!("Album query failed: {e}");
+                Vec::new()
+            })
+        });
+    }
+
+    // Double-click a track inside an album drawer → play it
+    {
+        let player = player.clone();
+        let player_bar = player_bar.clone();
+        album_grid.connect_track_activated(move |track| {
+            player_bar.set_track(&track);
+            player.send(PlayerCommand::Play(track));
         });
     }
 
@@ -160,6 +219,7 @@ pub fn build(
     {
         let db = Rc::clone(&db);
         let library_view = library_view.clone();
+        let album_grid = album_grid.clone();
         let status_label = status_label.clone();
         let filter_sidebar = filter_sidebar.clone();
         scan_btn.connect_clicked(move |_| {
@@ -176,6 +236,7 @@ pub fn build(
 
             let db = Rc::clone(&db);
             let library_view = library_view.clone();
+            let album_grid = album_grid.clone();
             let status_label = status_label.clone();
             let filter_sidebar = filter_sidebar.clone();
             // Timeout, not idle: an idle callback returning Continue runs every
@@ -187,6 +248,7 @@ pub fn build(
                         library_view.set_tracks(tracks);
                     }
                     refresh_sidebar(&filter_sidebar, &db);
+                    refresh_album_grid(&album_grid, &db);
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {
@@ -218,6 +280,10 @@ fn refresh_sidebar(sidebar: &Sidebar, db: &Rc<Db>) {
     let artists = db.distinct_artists().unwrap_or_default();
     let albums = db.distinct_albums().unwrap_or_default();
     sidebar.populate(genres, artists, albums);
+}
+
+fn refresh_album_grid(grid: &AlbumGrid, db: &Rc<Db>) {
+    grid.set_albums(db.album_summaries().unwrap_or_default());
 }
 
 fn refresh_folder_list(list: &ListBox, db: &Rc<Db>) {
