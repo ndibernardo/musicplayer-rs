@@ -51,11 +51,7 @@ pub fn read(path: &TrackPath) -> Result<Track, MetadataError> {
         track_number: TrackNumber::new(num_field(tag, |t| t.track())),
         disc_number: DiscNumber::new(num_field(tag, |t| t.disk())),
         // `year()` was removed in lofty 0.22+; extract the year from the Timestamp returned by `date()`.
-        year: Year::new(
-            tag.and_then(|t| t.date())
-                .map(|ts| ts.year)
-                .unwrap_or(0),
-        ),
+        year: Year::new(tag.and_then(|t| t.date()).map(|ts| ts.year).unwrap_or(0)),
         art: tag
             .and_then(|t| t.pictures().first())
             .map(|pic| AlbumArtData::new(pic.data().to_vec())),
@@ -67,8 +63,7 @@ fn str_field<F>(tag: Option<&Tag>, f: F) -> String
 where
     F: Fn(&Tag) -> Option<Cow<str>>,
 {
-    tag.and_then(f)
-        .map_or_else(String::new, |s| s.into_owned())
+    tag.and_then(f).map_or_else(String::new, |s| s.into_owned())
 }
 
 fn num_field<F>(tag: Option<&Tag>, f: F) -> u32

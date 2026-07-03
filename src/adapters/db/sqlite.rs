@@ -112,7 +112,9 @@ impl Db {
         let year = (!track.year.is_unknown()).then(|| track.year.value() as i64);
         let art = track.art.as_ref().map(|a| a.as_bytes().to_vec());
 
-        self.conn.execute(
+        // RETURNING yields the row's id on both the insert and the update path;
+        // last_insert_rowid() would be stale after ON CONFLICT DO UPDATE.
+        let id = self.conn.query_row(
             "INSERT INTO tracks (path, title, artist, album, genre, duration_ms, track_number, disc_number, year, art)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(path) DO UPDATE SET
@@ -124,7 +126,8 @@ impl Db {
                  track_number = excluded.track_number,
                  disc_number  = excluded.disc_number,
                  year         = excluded.year,
-                 art          = excluded.art",
+                 art          = excluded.art
+             RETURNING track_id",
             rusqlite::params![
                 path.as_ref(),
                 title,
@@ -137,19 +140,8 @@ impl Db {
                 year,
                 art,
             ],
+            |row| row.get::<_, i64>(0),
         )?;
-
-        // For an insert, last_insert_rowid() is correct.
-        // For an update, we need a separate lookup.
-        let id = if self.conn.last_insert_rowid() != 0 {
-            self.conn.last_insert_rowid()
-        } else {
-            self.conn.query_row(
-                "SELECT track_id FROM tracks WHERE path = ?1",
-                [path.as_ref()],
-                |row| row.get::<_, i64>(0),
-            )?
-        };
 
         Ok(TrackId::new(id))
     }
@@ -385,6 +377,24 @@ mod tests {
         let first_id = db.upsert_track(&minimal_track(path)).unwrap();
         let second_id = db.upsert_track(&full_track(path)).unwrap();
         assert_eq!(first_id, second_id, "track_id must not change on update");
+    }
+
+    #[test]
+    fn upsert_track_returns_own_id_after_inserting_other_tracks() {
+        let db = Db::open_in_memory().unwrap();
+        let roygbiv_id = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        db.upsert_track(&full_track("/music/boc/aquarius.flac"))
+            .unwrap();
+
+        // Update path: last_insert_rowid() still points at aquarius here —
+        // the id must come from the updated row, not the last insert.
+        let updated_id = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+
+        assert_eq!(updated_id, roygbiv_id);
     }
 
     #[test]

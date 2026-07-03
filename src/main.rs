@@ -34,12 +34,9 @@ fn run_ui() {
     let scanner: Rc<dyn Scanner> = lib;
 
     let (state_tx, state_rx) = mpsc::channel::<PlaybackState>();
-    let player = PlayerHandle::launch(
-        RodioAudioBackend::new,
-        move |s| {
-            let _ = state_tx.send(s);
-        },
-    );
+    let player = PlayerHandle::launch(RodioAudioBackend::new, move |s| {
+        let _ = state_tx.send(s);
+    });
 
     ui::run(library, scanner, player, state_rx);
 }

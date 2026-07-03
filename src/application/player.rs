@@ -96,9 +96,7 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                 {
                     on_state(PlaybackState::Playing {
                         track: t.id,
-                        position: SeekPosition::from_millis(
-                            backend.position().as_millis() as u64,
-                        ),
+                        position: SeekPosition::from_millis(backend.position().as_millis() as u64),
                     });
                 }
             }
