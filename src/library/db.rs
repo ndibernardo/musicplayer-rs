@@ -58,7 +58,7 @@ pub enum DbError {
 }
 
 // Columns are nullable for tag fields — NULL means the tag was absent.
-// The adapter maps NULL → domain defaults when reading rows.
+// The adapter maps NULL to the domain defaults when reading rows.
 const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS folders (
         folder_id INTEGER PRIMARY KEY,
@@ -250,12 +250,12 @@ impl Db {
         Ok(TrackId::new(id))
     }
 
-    /// Returns all tracks ordered by artist → album → track number.
+    /// Returns all tracks ordered by artist, then album, then track number.
     pub fn list_tracks(&self) -> Result<Vec<Track>, DbError> {
         self.query_tracks("ORDER BY artist, album, track_number", [])
     }
 
-    /// Returns tracks whose genre equals `genre`, ordered by artist → album → track number.
+    /// Returns tracks whose genre equals `genre`, ordered by artist, then album, then track number.
     pub fn tracks_by_genre(&self, genre: &Genre) -> Result<Vec<Track>, DbError> {
         self.query_tracks(
             "WHERE genre = ?1 ORDER BY artist, album, track_number",
@@ -263,7 +263,7 @@ impl Db {
         )
     }
 
-    /// Returns tracks by `artist`, ordered by album → track number.
+    /// Returns tracks by `artist`, ordered by album, then track number.
     pub fn tracks_by_artist(&self, artist: &Artist) -> Result<Vec<Track>, DbError> {
         self.query_tracks(
             "WHERE artist = ?1 ORDER BY album, track_number",
@@ -271,7 +271,7 @@ impl Db {
         )
     }
 
-    /// Returns tracks on `album`, ordered by disc → track number.
+    /// Returns tracks on `album`, ordered by disc, then track number.
     pub fn tracks_by_album(&self, album: &AlbumTitle) -> Result<Vec<Track>, DbError> {
         self.query_tracks(
             "WHERE album = ?1 ORDER BY disc_number, track_number",

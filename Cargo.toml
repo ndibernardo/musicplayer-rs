@@ -12,6 +12,7 @@ ui = ["dep:gtk4", "dep:glib", "dep:rodio"]
 lofty      = "0.24.0"
 symphonia  = { version = "0.5", features = ["all"] }
 rusqlite   = { version = "0.40.1", features = ["bundled"] }
+notify     = "8.2.0"
 thiserror  = "2.0.18"
 tracing    = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
