@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use rusqlite::Connection;
 
+use crate::library::album::AlbumSummary;
 use crate::library::track::AlbumArtData;
 use crate::library::track::AlbumTitle;
 use crate::library::track::Artist;
@@ -118,6 +119,28 @@ fn build_track(row: TrackRow) -> Result<Track, DbError> {
         year: Year::new(or_zero(year) as u16),
         art: art.map(AlbumArtData::new),
     })
+}
+
+/// Raw columns of one grouped album row: album, artist, genre, year, art.
+type AlbumRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<Vec<u8>>,
+);
+
+/// Builds an `AlbumSummary` from a grouped row. All fields are infallible;
+/// NULLs map to the domain "unknown" defaults.
+fn build_album_summary(row: AlbumRow) -> AlbumSummary {
+    let (album, artist, genre, year, art) = row;
+    AlbumSummary {
+        album: AlbumTitle::new(or_empty(album)),
+        artist: Artist::new(or_empty(artist)),
+        genre: Genre::new(or_empty(genre)),
+        year: Year::new(or_zero(year) as u16),
+        art: art.map(AlbumArtData::new),
+    }
 }
 
 pub struct Db {
@@ -299,6 +322,30 @@ impl Db {
         stmt.query_map([], |row| row.get::<_, String>(0))?
             .map(|r| r.map_err(DbError::from).map(AlbumTitle::new))
             .collect()
+    }
+
+    /// Returns one summary per (album, artist) pair for the album grid, ordered
+    /// by artist then album. Genre, year, and cover art are aggregated with
+    /// `MAX`, which skips NULLs — so a summary carries art from any track in the
+    /// group that has it, even when others don't.
+    pub fn album_summaries(&self) -> Result<Vec<AlbumSummary>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT album, artist, MAX(genre), MAX(year), MAX(art)
+             FROM tracks
+             GROUP BY album, artist
+             ORDER BY artist, album",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+            ))
+        })?
+        .map(|r| r.map(build_album_summary).map_err(DbError::from))
+        .collect()
     }
 
     pub fn track_count(&self) -> Result<u64, DbError> {
@@ -747,5 +794,102 @@ mod tests {
     fn distinct_genres_empty_for_fresh_db() {
         let db = Db::open_in_memory().unwrap();
         assert!(db.distinct_genres().unwrap().is_empty());
+    }
+
+    fn track_with_art(path: &str, album: &str, art: &[u8]) -> Track {
+        Track {
+            album: AlbumTitle::new(album),
+            art: Some(AlbumArtData::new(art.to_vec())),
+            ..full_track(path)
+        }
+    }
+
+    #[test]
+    fn album_summaries_empty_for_fresh_db() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.album_summaries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn album_summaries_collapses_tracks_of_one_album_to_a_single_entry() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        db.upsert_track(&full_track("/music/boc/aquarius.flac"))
+            .unwrap();
+
+        let summaries = db.album_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].album.as_str(),
+            "Music Has the Right to Children"
+        );
+        assert_eq!(summaries[0].artist.as_str(), "Boards of Canada");
+        assert_eq!(summaries[0].year.value(), 1998);
+        assert_eq!(summaries[0].genre.as_str(), "Electronic");
+    }
+
+    #[test]
+    fn album_summaries_separates_same_title_by_different_artists() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/greatest.flac",
+            "Boards of Canada",
+            "Greatest Hits",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/queen/greatest.flac",
+            "Queen",
+            "Greatest Hits",
+            "Rock",
+        ))
+        .unwrap();
+
+        assert_eq!(db.album_summaries().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn album_summaries_orders_by_artist_then_album() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/geogaddi.flac",
+            "Boards of Canada",
+            "Geogaddi",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/aphex/saw.flac",
+            "Aphex Twin",
+            "Selected Ambient Works 85-92",
+            "Ambient",
+        ))
+        .unwrap();
+
+        let summaries = db.album_summaries().unwrap();
+        assert_eq!(summaries[0].artist.as_str(), "Aphex Twin");
+        assert_eq!(summaries[1].artist.as_str(), "Boards of Canada");
+    }
+
+    #[test]
+    fn album_summaries_carries_cover_art_from_any_track_in_the_album() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        db.upsert_track(&track_with_art(
+            "/music/boc/aquarius.flac",
+            "Music Has the Right to Children",
+            &[0xFF, 0xD8, 0xFF],
+        ))
+        .unwrap();
+
+        let summaries = db.album_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].art.as_ref().map(AlbumArtData::as_bytes),
+            Some(&[0xFF, 0xD8, 0xFF][..])
+        );
     }
 }

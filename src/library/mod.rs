@@ -1,3 +1,4 @@
+pub mod album;
 pub mod db;
 pub mod metadata;
 pub mod query;
