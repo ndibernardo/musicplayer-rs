@@ -148,7 +148,9 @@ pub fn build(
             let library = Rc::clone(&library);
             let library_view = library_view.clone();
             let status_label = status_label.clone();
-            glib::idle_add_local(move || match rx.try_recv() {
+            // Timeout, not idle: an idle callback returning Continue runs every
+            // main-loop iteration and pins a core for the whole scan.
+            glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
                 Ok(Ok(n)) => {
                     status_label.set_text(&format!("Indexed {n} tracks"));
                     if let Ok(tracks) = library.all_tracks() {
