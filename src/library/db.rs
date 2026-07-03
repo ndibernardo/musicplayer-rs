@@ -183,11 +183,21 @@ impl Db {
         Ok(())
     }
 
+    /// Removes a watched folder and every track indexed beneath it. Both deletes
+    /// run in one transaction so the folder and its tracks vanish together.
     pub fn remove_folder(&self, folder: &LibraryFolder) -> Result<(), DbError> {
-        self.conn.execute(
-            "DELETE FROM folders WHERE path = ?1",
-            [folder.as_path().to_string_lossy().as_ref()],
+        let folder_str = folder.as_path().to_string_lossy();
+        // Nested files share this prefix; the trailing separator stops a sibling
+        // like ".../MusicOld" from matching ".../Music".
+        let prefix = format!("{folder_str}/");
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM tracks WHERE substr(path, 1, length(?1)) = ?1",
+            [&prefix],
         )?;
+        tx.execute("DELETE FROM folders WHERE path = ?1", [folder_str.as_ref()])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -515,6 +525,49 @@ mod tests {
         db.add_folder(&folder).unwrap();
         db.remove_folder(&folder).unwrap();
         assert!(db.list_folders().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_folder_deletes_its_tracks_only() {
+        let db = Db::open_in_memory().unwrap();
+        let music = LibraryFolder::new("/home/user/Music").unwrap();
+        let downloads = LibraryFolder::new("/home/user/Downloads").unwrap();
+        db.add_folder(&music).unwrap();
+        db.add_folder(&downloads).unwrap();
+        db.upsert_track(&full_track("/home/user/Music/boc/roygbiv.flac"))
+            .unwrap();
+        db.upsert_track(&full_track("/home/user/Downloads/aphex/xtal.flac"))
+            .unwrap();
+
+        db.remove_folder(&music).unwrap();
+
+        let remaining = db.list_tracks().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].path.as_path().to_str().unwrap(),
+            "/home/user/Downloads/aphex/xtal.flac"
+        );
+    }
+
+    #[test]
+    fn remove_folder_spares_sibling_folder_with_shared_prefix() {
+        let db = Db::open_in_memory().unwrap();
+        let music = LibraryFolder::new("/home/user/Music").unwrap();
+        db.add_folder(&music).unwrap();
+        db.upsert_track(&full_track("/home/user/Music/boc/roygbiv.flac"))
+            .unwrap();
+        // Same string prefix, different folder — must survive.
+        db.upsert_track(&full_track("/home/user/MusicOld/aphex/xtal.flac"))
+            .unwrap();
+
+        db.remove_folder(&music).unwrap();
+
+        let remaining = db.list_tracks().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].path.as_path().to_str().unwrap(),
+            "/home/user/MusicOld/aphex/xtal.flac"
+        );
     }
 
     fn minimal_track(path: &str) -> Track {
