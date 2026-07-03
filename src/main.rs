@@ -1,8 +1,3 @@
-mod library;
-mod player;
-#[cfg(feature = "ui")]
-mod ui;
-
 fn main() {
     #[cfg(feature = "ui")]
     run_ui();
@@ -13,10 +8,11 @@ fn run_ui() {
     use std::rc::Rc;
     use std::sync::mpsc;
 
-    use crate::library::db::Db;
-    use crate::player::PlaybackState;
-    use crate::player::PlayerHandle;
-    use crate::player::rodio::RodioAudioBackend;
+    use musicplayer_rs::library::db::Db;
+    use musicplayer_rs::player::PlaybackState;
+    use musicplayer_rs::player::PlayerHandle;
+    use musicplayer_rs::player::rodio::RodioAudioBackend;
+    use musicplayer_rs::ui;
 
     let db_path = data_dir().join("library.db");
     let db = match Db::open(&db_path) {
