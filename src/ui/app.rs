@@ -6,9 +6,9 @@ use std::sync::mpsc;
 use gtk4::Application;
 use gtk4::prelude::*;
 
-use crate::adapters::db::sqlite::Db;
-use crate::application::player::PlayerHandle;
-use crate::domain::player::PlaybackState;
+use crate::library::db::Db;
+use crate::player::PlaybackState;
+use crate::player::PlayerHandle;
 
 pub fn run(
     db: Rc<Db>,

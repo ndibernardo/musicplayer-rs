@@ -1,20 +1,51 @@
 use std::path::Path;
+use std::path::PathBuf;
 
 use rusqlite::Connection;
 
-use crate::domain::library::LibraryFolder;
-use crate::domain::track::AlbumArtData;
-use crate::domain::track::AlbumTitle;
-use crate::domain::track::Artist;
-use crate::domain::track::DiscNumber;
-use crate::domain::track::Genre;
-use crate::domain::track::Title;
-use crate::domain::track::Track;
-use crate::domain::track::TrackDuration;
-use crate::domain::track::TrackId;
-use crate::domain::track::TrackNumber;
-use crate::domain::track::TrackPath;
-use crate::domain::track::Year;
+use crate::library::track::AlbumArtData;
+use crate::library::track::AlbumTitle;
+use crate::library::track::Artist;
+use crate::library::track::DiscNumber;
+use crate::library::track::Genre;
+use crate::library::track::Title;
+use crate::library::track::Track;
+use crate::library::track::TrackDuration;
+use crate::library::track::TrackId;
+use crate::library::track::TrackNumber;
+use crate::library::track::TrackPath;
+use crate::library::track::Year;
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum LibraryError {
+    #[error("library folder path must be absolute: {0:?}")]
+    RelativePath(PathBuf),
+}
+
+/// Absolute path to a watched music folder.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LibraryFolder(PathBuf);
+
+impl LibraryFolder {
+    /// Returns `Err(RelativePath)` if `path` is not absolute.
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, LibraryError> {
+        let p = path.into();
+        if !p.is_absolute() {
+            return Err(LibraryError::RelativePath(p));
+        }
+        Ok(Self(p))
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for LibraryFolder {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -231,16 +262,30 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::track::AlbumTitle;
-    use crate::domain::track::Artist;
-    use crate::domain::track::DiscNumber;
-    use crate::domain::track::Genre;
-    use crate::domain::track::Title;
-    use crate::domain::track::TrackDuration;
-    use crate::domain::track::TrackId;
-    use crate::domain::track::TrackNumber;
-    use crate::domain::track::TrackPath;
-    use crate::domain::track::Year;
+    use crate::library::track::AlbumTitle;
+    use crate::library::track::Artist;
+    use crate::library::track::DiscNumber;
+    use crate::library::track::Genre;
+    use crate::library::track::Title;
+    use crate::library::track::TrackDuration;
+    use crate::library::track::TrackId;
+    use crate::library::track::TrackNumber;
+    use crate::library::track::TrackPath;
+    use crate::library::track::Year;
+
+    #[test]
+    fn library_folder_new_accepts_absolute_path() {
+        let folder = LibraryFolder::new("/home/user/Music").unwrap();
+        assert_eq!(folder.as_path().to_str().unwrap(), "/home/user/Music");
+    }
+
+    #[test]
+    fn library_folder_new_rejects_relative_path() {
+        assert!(matches!(
+            LibraryFolder::new("Music"),
+            Err(LibraryError::RelativePath(_))
+        ));
+    }
 
     fn table_exists(db: &Db, name: &str) -> bool {
         db.conn

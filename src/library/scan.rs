@@ -4,11 +4,11 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 
-use crate::adapters::db::sqlite::Db;
-use crate::adapters::db::sqlite::DbError;
-use crate::domain::library::LibraryFolder;
-use crate::domain::track::Track;
-use crate::domain::track::TrackPath;
+use crate::library::db::Db;
+use crate::library::db::DbError;
+use crate::library::db::LibraryFolder;
+use crate::library::track::Track;
+use crate::library::track::TrackPath;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
@@ -66,9 +66,7 @@ pub fn spawn_scan(
 
         let mut total = 0u32;
         for folder in &folders {
-            match scan_folder(folder, &db, |p| {
-                crate::adapters::metadata::lofty::read(p).ok()
-            }) {
+            match scan_folder(folder, &db, |p| crate::library::metadata::read(p).ok()) {
                 Ok(n) => total += n,
                 Err(e) => {
                     let _ = tx.send(Err(e));
@@ -119,16 +117,16 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::domain::library::LibraryFolder;
-    use crate::domain::track::AlbumTitle;
-    use crate::domain::track::Artist;
-    use crate::domain::track::DiscNumber;
-    use crate::domain::track::Genre;
-    use crate::domain::track::Title;
-    use crate::domain::track::TrackDuration;
-    use crate::domain::track::TrackId;
-    use crate::domain::track::TrackNumber;
-    use crate::domain::track::Year;
+    use crate::library::db::LibraryFolder;
+    use crate::library::track::AlbumTitle;
+    use crate::library::track::Artist;
+    use crate::library::track::DiscNumber;
+    use crate::library::track::Genre;
+    use crate::library::track::Title;
+    use crate::library::track::TrackDuration;
+    use crate::library::track::TrackId;
+    use crate::library::track::TrackNumber;
+    use crate::library::track::Year;
 
     fn fake_track(path: &TrackPath) -> Track {
         Track {

@@ -1,6 +1,5 @@
-mod adapters;
-mod application;
-mod domain;
+mod library;
+mod player;
 #[cfg(feature = "ui")]
 mod ui;
 
@@ -14,10 +13,10 @@ fn run_ui() {
     use std::rc::Rc;
     use std::sync::mpsc;
 
-    use crate::adapters::audio::rodio::RodioAudioBackend;
-    use crate::adapters::db::sqlite::Db;
-    use crate::application::player::PlayerHandle;
-    use crate::domain::player::PlaybackState;
+    use crate::library::db::Db;
+    use crate::player::PlaybackState;
+    use crate::player::PlayerHandle;
+    use crate::player::rodio::RodioAudioBackend;
 
     let db_path = data_dir().join("library.db");
     let db = match Db::open(&db_path) {

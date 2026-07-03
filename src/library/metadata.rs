@@ -5,18 +5,18 @@ use lofty::prelude::AudioFile;
 use lofty::tag::Accessor;
 use lofty::tag::Tag;
 
-use crate::domain::track::AlbumArtData;
-use crate::domain::track::AlbumTitle;
-use crate::domain::track::Artist;
-use crate::domain::track::DiscNumber;
-use crate::domain::track::Genre;
-use crate::domain::track::Title;
-use crate::domain::track::Track;
-use crate::domain::track::TrackDuration;
-use crate::domain::track::TrackId;
-use crate::domain::track::TrackNumber;
-use crate::domain::track::TrackPath;
-use crate::domain::track::Year;
+use crate::library::track::AlbumArtData;
+use crate::library::track::AlbumTitle;
+use crate::library::track::Artist;
+use crate::library::track::DiscNumber;
+use crate::library::track::Genre;
+use crate::library::track::Title;
+use crate::library::track::Track;
+use crate::library::track::TrackDuration;
+use crate::library::track::TrackId;
+use crate::library::track::TrackNumber;
+use crate::library::track::TrackPath;
+use crate::library::track::Year;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetadataError {

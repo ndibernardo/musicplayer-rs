@@ -17,12 +17,12 @@ use gtk4::Paned;
 use gtk4::ScrolledWindow;
 use gtk4::prelude::*;
 
-use crate::adapters::db::sqlite::Db;
-use crate::application::player::PlayerHandle;
-use crate::application::scanner::spawn_scan;
-use crate::domain::library::LibraryFolder;
-use crate::domain::player::PlaybackState;
-use crate::domain::player::PlayerCommand;
+use crate::library::db::Db;
+use crate::library::db::LibraryFolder;
+use crate::library::scan::spawn_scan;
+use crate::player::PlaybackState;
+use crate::player::PlayerCommand;
+use crate::player::PlayerHandle;
 use crate::ui::library_view::LibraryView;
 use crate::ui::player_bar::PlayerBar;
 

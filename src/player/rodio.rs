@@ -7,10 +7,10 @@ use rodio::DeviceSinkBuilder;
 use rodio::MixerDeviceSink;
 use rodio::Player;
 
-use crate::application::ports::audio::AudioBackend;
-use crate::application::ports::audio::AudioError;
-use crate::domain::player::Volume;
-use crate::domain::track::TrackPath;
+use crate::library::track::TrackPath;
+use crate::player::AudioBackend;
+use crate::player::AudioError;
+use crate::player::Volume;
 
 pub struct RodioAudioBackend {
     // Keeps the OS audio stream alive. Must outlive `player`.
