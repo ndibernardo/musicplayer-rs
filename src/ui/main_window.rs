@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -31,6 +32,8 @@ use crate::library::query::album_summaries_for;
 use crate::library::query::tracks_for;
 use crate::library::scan::ScanEvent;
 use crate::library::scan::spawn_scan;
+use crate::library::watch::FolderWatcher;
+use crate::library::watch::watch_folders;
 use crate::player::PlaybackState;
 use crate::player::PlayerCommand;
 use crate::player::PlayerHandle;
@@ -248,15 +251,48 @@ pub fn build(
         })
     };
 
-    refresh_folder_list(&folder_list, &db, &refresh_views);
+    // Watches the folders on disk; a change sends `()` on `watch_rx`. `rewatch`
+    // re-arms the watcher for the current folder set (kept alive in `folder_watcher`).
+    let (watch_tx, watch_rx) = mpsc::channel::<()>();
+    let folder_watcher: Rc<RefCell<Option<FolderWatcher>>> = Rc::new(RefCell::new(None));
+    let rewatch: Rc<dyn Fn()> = {
+        let db = Rc::clone(&db);
+        let watch_tx = watch_tx.clone();
+        let folder_watcher = Rc::clone(&folder_watcher);
+        Rc::new(move || {
+            // Drop the previous watcher before starting a fresh one.
+            *folder_watcher.borrow_mut() = None;
+            let folders = db.list_folders().unwrap_or_default();
+            if folders.is_empty() {
+                return;
+            }
+            match watch_folders(&folders, watch_tx.clone()) {
+                Ok(watcher) => *folder_watcher.borrow_mut() = Some(watcher),
+                Err(e) => eprintln!("Failed to watch folders: {e}"),
+            }
+        })
+    };
+
+    // Adding/removing a watched folder reloads the views and re-arms the watcher.
+    let on_folders_changed: Rc<dyn Fn()> = {
+        let refresh_views = Rc::clone(&refresh_views);
+        let rewatch = Rc::clone(&rewatch);
+        Rc::new(move || {
+            refresh_views();
+            rewatch();
+        })
+    };
+
+    refresh_folder_list(&folder_list, &db, &on_folders_changed);
     refresh_sidebar(&filter_sidebar, &db);
     refresh_album_grid(&album_grid, &db, &current_filter.borrow());
+    rewatch();
 
     if let Ok(tracks) = db.list_tracks() {
         library_view.set_tracks(tracks);
     }
 
-    // Sidebar selection → filter both the track list and the album grid
+    // A sidebar selection filters both the track list and the album grid.
     {
         let db = Rc::clone(&db);
         let library_view = library_view.clone();
@@ -283,7 +319,7 @@ pub fn build(
         });
     }
 
-    // Double-click a track inside an album drawer → play it
+    // Double-clicking a track inside an album drawer plays it.
     {
         let player = player.clone();
         let player_bar = player_bar.clone();
@@ -293,7 +329,7 @@ pub fn build(
         });
     }
 
-    // Double-click on a track → play it
+    // Double-clicking a track plays it.
     {
         let player = player.clone();
         let player_bar = player_bar.clone();
@@ -384,24 +420,26 @@ pub fn build(
         })
     };
 
-    // Scan button → scan all watched folders
+    // The scan button scans every watched folder.
     {
         let start_scan = Rc::clone(&start_scan);
         scan_btn.connect_clicked(move |_| start_scan());
     }
 
-    // Add Folder → persist it, refresh, then scan automatically
+    // Adding a folder persists it, refreshes the views, starts watching it, and then scans automatically.
     {
         let db = Rc::clone(&db);
         let folder_list = folder_list.clone();
         let window = window.clone();
-        let refresh_views = Rc::clone(&refresh_views);
+        let on_folders_changed = Rc::clone(&on_folders_changed);
+        let rewatch = Rc::clone(&rewatch);
         let start_scan = Rc::clone(&start_scan);
         add_btn.connect_clicked(move |_| {
             let db = Rc::clone(&db);
             let folder_list = folder_list.clone();
             let window = window.clone();
-            let refresh_views = Rc::clone(&refresh_views);
+            let on_folders_changed = Rc::clone(&on_folders_changed);
+            let rewatch = Rc::clone(&rewatch);
             let start_scan = Rc::clone(&start_scan);
             glib::spawn_future_local(async move {
                 let dialog = FileDialog::new();
@@ -417,9 +455,29 @@ pub fn build(
                     eprintln!("Failed to add folder: {e}");
                     return;
                 }
-                refresh_folder_list(&folder_list, &db, &refresh_views);
+                refresh_folder_list(&folder_list, &db, &on_folders_changed);
+                rewatch();
                 start_scan();
             });
+        });
+    }
+
+    // Debounced auto-rescan: coalesce filesystem events and rescan once the
+    // changes settle, so a bulk copy triggers a single scan, not one per file.
+    {
+        let start_scan = Rc::clone(&start_scan);
+        let dirty = Rc::new(Cell::new(false));
+        glib::timeout_add_local(Duration::from_millis(700), move || {
+            let mut changed = false;
+            while watch_rx.try_recv().is_ok() {
+                changed = true;
+            }
+            if changed {
+                dirty.set(true); // still changing — wait for a quiet tick
+            } else if dirty.replace(false) {
+                start_scan();
+            }
+            glib::ControlFlow::Continue
         });
     }
 
