@@ -8,6 +8,7 @@ use crate::library::album::AlbumSummary;
 use crate::library::track::AlbumArtData;
 use crate::library::track::AlbumTitle;
 use crate::library::track::Artist;
+use crate::library::track::Composer;
 use crate::library::track::DiscNumber;
 use crate::library::track::Genre;
 use crate::library::track::Title;
@@ -70,8 +71,10 @@ const SCHEMA: &str = "
         path         TEXT    NOT NULL UNIQUE,
         title        TEXT,
         artist       TEXT,
+        album_artist TEXT,
         album        TEXT,
         genre        TEXT,
+        composer     TEXT,
         duration_ms  INTEGER,
         track_number INTEGER,
         disc_number  INTEGER,
@@ -93,7 +96,9 @@ fn or_zero(v: Option<i64>) -> i64 {
     v.unwrap_or(0)
 }
 
-/// Raw column values of a `tracks` row, before domain validation.
+/// Raw column values of a `tracks` row, before domain validation. The trailing
+/// `album_artist` and `composer` come last, matching the `SELECT` in
+/// `query_tracks`.
 type TrackRow = (
     i64,
     String,
@@ -106,19 +111,37 @@ type TrackRow = (
     Option<i64>,
     Option<i64>,
     Option<Vec<u8>>,
+    Option<String>,
+    Option<String>,
 );
 
 /// Builds a domain `Track` from a raw row, validating the path.
 fn build_track(row: TrackRow) -> Result<Track, DbError> {
-    let (id, path, title, artist, album, genre, duration_ms, track_num, disc_num, year, art) = row;
+    let (
+        id,
+        path,
+        title,
+        artist,
+        album,
+        genre,
+        duration_ms,
+        track_num,
+        disc_num,
+        year,
+        art,
+        album_artist,
+        composer,
+    ) = row;
     let path = TrackPath::new(path).map_err(|e| DbError::InvalidData(e.to_string()))?;
     Ok(Track {
         id: TrackId::new(id),
         path,
         title: Title::new(or_empty(title)),
         artist: Artist::new(or_empty(artist)),
+        album_artist: Artist::new(or_empty(album_artist)),
         album: AlbumTitle::new(or_empty(album)),
         genre: Genre::new(or_empty(genre)),
+        composer: Composer::new(or_empty(composer)),
         duration: TrackDuration::from_millis(or_zero(duration_ms) as u64),
         track_number: TrackNumber::new(or_zero(track_num) as u32),
         disc_number: DiscNumber::new(or_zero(disc_num) as u32),
@@ -172,7 +195,31 @@ impl Db {
 
     fn migrate(&self) -> Result<(), DbError> {
         self.conn.execute_batch(SCHEMA)?;
+        self.add_missing_track_columns()?;
         Ok(())
+    }
+
+    /// Adds columns introduced after the original schema to `tracks` when a
+    /// database created by an earlier version lacks them. `CREATE TABLE IF NOT
+    /// EXISTS` never alters an existing table, so extra columns need an explicit
+    /// `ALTER TABLE` guarded by the current column set.
+    fn add_missing_track_columns(&self) -> Result<(), DbError> {
+        let existing = self.track_columns()?;
+        for (name, decl) in [("album_artist", "TEXT"), ("composer", "TEXT")] {
+            if !existing.iter().any(|c| c == name) {
+                self.conn
+                    .execute(&format!("ALTER TABLE tracks ADD COLUMN {name} {decl}"), [])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The column names of the `tracks` table, in declaration order.
+    fn track_columns(&self) -> Result<Vec<String>, DbError> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(tracks)")?;
+        stmt.query_map([], |row| row.get::<_, String>(1))?
+            .map(|r| r.map_err(DbError::from))
+            .collect()
     }
 
     pub fn add_folder(&self, folder: &LibraryFolder) -> Result<(), DbError> {
@@ -206,6 +253,9 @@ impl Db {
         let path = track.path.as_path().to_string_lossy();
         let title = (!track.title.is_unknown()).then(|| track.title.as_str().to_owned());
         let artist = (!track.artist.is_unknown()).then(|| track.artist.as_str().to_owned());
+        let album_artist =
+            (!track.album_artist.is_unknown()).then(|| track.album_artist.as_str().to_owned());
+        let composer = (!track.composer.is_unknown()).then(|| track.composer.as_str().to_owned());
         let album = (!track.album.as_str().is_empty()).then(|| track.album.as_str().to_owned());
         let genre = (!track.genre.as_str().is_empty()).then(|| track.genre.as_str().to_owned());
         let duration_ms = track.duration.as_duration().as_millis() as i64;
@@ -219,8 +269,8 @@ impl Db {
         // RETURNING yields the row's id on both the insert and the update path;
         // last_insert_rowid() would be stale after ON CONFLICT DO UPDATE.
         let id = self.conn.query_row(
-            "INSERT INTO tracks (path, title, artist, album, genre, duration_ms, track_number, disc_number, year, art)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO tracks (path, title, artist, album, genre, duration_ms, track_number, disc_number, year, art, album_artist, composer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(path) DO UPDATE SET
                  title        = excluded.title,
                  artist       = excluded.artist,
@@ -230,7 +280,9 @@ impl Db {
                  track_number = excluded.track_number,
                  disc_number  = excluded.disc_number,
                  year         = excluded.year,
-                 art          = excluded.art
+                 art          = excluded.art,
+                 album_artist = excluded.album_artist,
+                 composer     = excluded.composer
              RETURNING track_id",
             rusqlite::params![
                 path.as_ref(),
@@ -243,6 +295,8 @@ impl Db {
                 disc_number,
                 year,
                 art,
+                album_artist,
+                composer,
             ],
             |row| row.get::<_, i64>(0),
         )?;
@@ -287,7 +341,8 @@ impl Db {
     ) -> Result<Vec<Track>, DbError> {
         let sql = format!(
             "SELECT track_id, path, title, artist, album, genre,
-                    duration_ms, track_number, disc_number, year, art
+                    duration_ms, track_number, disc_number, year, art,
+                    album_artist, composer
              FROM tracks {filter_and_order}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -304,6 +359,8 @@ impl Db {
                 row.get::<_, Option<i64>>(8)?,
                 row.get::<_, Option<i64>>(9)?,
                 row.get::<_, Option<Vec<u8>>>(10)?,
+                row.get::<_, Option<String>>(11)?,
+                row.get::<_, Option<String>>(12)?,
             ))
         })?;
         rows.map(|r| build_track(r.map_err(DbError::from)?))
@@ -340,10 +397,14 @@ impl Db {
             .collect()
     }
 
-    /// Returns one summary per (album, artist) pair for the album grid, ordered
-    /// by artist then album. Genre, year, and cover art are aggregated with
-    /// `MAX`, which skips NULLs — so a summary carries art from any track in the
-    /// group that has it, even when others don't.
+    /// Returns one summary per (album, album artist) pair for the album grid,
+    /// ordered by album artist then album. The album artist is
+    /// `COALESCE(album_artist, artist)`, so a compilation credited to one album
+    /// artist collapses to a single entry even when its tracks name different
+    /// performers, and a track without an album-artist tag falls back to its own
+    /// artist. Genre, year, and cover art are aggregated with `MAX`, which skips
+    /// NULLs — so a summary carries art from any track in the group that has it,
+    /// even when others don't.
     pub fn album_summaries(&self) -> Result<Vec<AlbumSummary>, DbError> {
         self.album_summaries_query("", [])
     }
@@ -366,19 +427,22 @@ impl Db {
         self.album_summaries_query("WHERE album = ?1", [album.as_str()])
     }
 
-    /// Runs the album-summary aggregate with the given `WHERE` clause. `MAX` on
-    /// genre/year/art skips NULLs, so a summary carries art from any track in the
-    /// group that has it.
+    /// Runs the album-summary aggregate with the given `WHERE` clause. Albums are
+    /// grouped by their album artist, `COALESCE(album_artist, artist)`, so a
+    /// compilation collapses to one entry and a missing album-artist tag falls
+    /// back to the track artist. `MAX` on genre/year/art skips NULLs, so a summary
+    /// carries art from any track in the group that has it.
     fn album_summaries_query(
         &self,
         where_clause: &str,
         params: impl rusqlite::Params,
     ) -> Result<Vec<AlbumSummary>, DbError> {
         let sql = format!(
-            "SELECT album, artist, MAX(genre), MAX(year), MAX(art)
+            "SELECT album, COALESCE(album_artist, artist) AS album_artist,
+                    MAX(genre), MAX(year), MAX(art)
              FROM tracks {where_clause}
-             GROUP BY album, artist
-             ORDER BY artist, album"
+             GROUP BY album, album_artist
+             ORDER BY album_artist, album"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         stmt.query_map(params, |row| {
@@ -576,8 +640,10 @@ mod tests {
             path: TrackPath::new(path).unwrap(),
             title: Title::new(""),
             artist: Artist::new(""),
+            album_artist: Artist::new(""),
             album: AlbumTitle::new(""),
             genre: Genre::new(""),
+            composer: Composer::new(""),
             duration: TrackDuration::from_secs(0),
             track_number: TrackNumber::new(0),
             disc_number: DiscNumber::new(0),
@@ -592,8 +658,10 @@ mod tests {
             path: TrackPath::new(path).unwrap(),
             title: Title::new("Roygbiv"),
             artist: Artist::new("Boards of Canada"),
+            album_artist: Artist::new("Boards of Canada"),
             album: AlbumTitle::new("Music Has the Right to Children"),
             genre: Genre::new("Electronic"),
+            composer: Composer::new("Boards of Canada"),
             duration: TrackDuration::from_secs(193),
             track_number: TrackNumber::new(7),
             disc_number: DiscNumber::new(1),
@@ -605,6 +673,9 @@ mod tests {
     fn track_tagged(path: &str, artist: &str, album: &str, genre: &str) -> Track {
         Track {
             artist: Artist::new(artist),
+            // Match the album artist to the track artist so grouping by album
+            // artist behaves like grouping by artist for these fixtures.
+            album_artist: Artist::new(artist),
             album: AlbumTitle::new(album),
             genre: Genre::new(genre),
             ..full_track(path)
@@ -725,6 +796,61 @@ mod tests {
         assert!(tracks[0].artist.is_unknown());
         assert!(tracks[0].track_number.is_unknown());
         assert!(tracks[0].year.is_unknown());
+    }
+
+    #[test]
+    fn upsert_track_round_trips_album_artist_and_composer() {
+        let db = Db::open_in_memory().unwrap();
+        let track = Track {
+            album_artist: Artist::new("Various Artists"),
+            composer: Composer::new("Erik Satie"),
+            ..full_track("/music/comp/gymnopedie.flac")
+        };
+        db.upsert_track(&track).unwrap();
+
+        let stored = db.list_tracks().unwrap();
+        assert_eq!(stored[0].album_artist.as_str(), "Various Artists");
+        assert_eq!(stored[0].composer.as_str(), "Erik Satie");
+    }
+
+    #[test]
+    fn list_tracks_maps_absent_album_artist_and_composer_to_unknown() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&minimal_track("/music/unknown.mp3"))
+            .unwrap();
+
+        let stored = db.list_tracks().unwrap();
+        assert!(stored[0].album_artist.is_unknown());
+        assert!(stored[0].composer.is_unknown());
+    }
+
+    #[test]
+    fn schema_has_album_artist_and_composer_columns() {
+        let db = Db::open_in_memory().unwrap();
+        let columns = db.track_columns().unwrap();
+        assert!(columns.iter().any(|c| c == "album_artist"));
+        assert!(columns.iter().any(|c| c == "composer"));
+    }
+
+    #[test]
+    fn migrate_adds_new_columns_to_a_legacy_tracks_table() {
+        // A database from before album_artist/composer existed.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tracks (
+                 track_id INTEGER PRIMARY KEY,
+                 path     TEXT NOT NULL UNIQUE,
+                 title    TEXT
+             );",
+        )
+        .unwrap();
+        let db = Db { conn };
+
+        db.migrate().unwrap();
+
+        let columns = db.track_columns().unwrap();
+        assert!(columns.iter().any(|c| c == "album_artist"));
+        assert!(columns.iter().any(|c| c == "composer"));
     }
 
     #[test]
@@ -981,6 +1107,57 @@ mod tests {
         let summaries = db.album_summaries().unwrap();
         assert_eq!(summaries[0].artist.as_str(), "Aphex Twin");
         assert_eq!(summaries[1].artist.as_str(), "Boards of Canada");
+    }
+
+    /// A track whose credited album artist differs from its performing artist —
+    /// the shape of a compilation entry.
+    fn compilation_track(path: &str, artist: &str, album_artist: &str) -> Track {
+        Track {
+            artist: Artist::new(artist),
+            album_artist: Artist::new(album_artist),
+            album: AlbumTitle::new("Warp10+3 Remixes"),
+            ..full_track(path)
+        }
+    }
+
+    #[test]
+    fn album_summaries_group_compilation_under_one_album_artist() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&compilation_track(
+            "/music/warp/track01.flac",
+            "Aphex Twin",
+            "Various Artists",
+        ))
+        .unwrap();
+        db.upsert_track(&compilation_track(
+            "/music/warp/track02.flac",
+            "Autechre",
+            "Various Artists",
+        ))
+        .unwrap();
+
+        let summaries = db.album_summaries().unwrap();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "one album artist collapses to one entry"
+        );
+        assert_eq!(summaries[0].artist.as_str(), "Various Artists");
+    }
+
+    #[test]
+    fn album_summaries_fall_back_to_track_artist_when_album_artist_absent() {
+        let db = Db::open_in_memory().unwrap();
+        // No album-artist tag: is_unknown means it is stored as NULL.
+        let track = Track {
+            album_artist: Artist::new(""),
+            ..full_track("/music/boc/roygbiv.flac")
+        };
+        db.upsert_track(&track).unwrap();
+
+        let summaries = db.album_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].artist.as_str(), "Boards of Canada");
     }
 
     #[test]

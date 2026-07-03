@@ -41,6 +41,7 @@ mod tests {
     use super::*;
     use crate::library::track::AlbumTitle;
     use crate::library::track::Artist;
+    use crate::library::track::Composer;
     use crate::library::track::DiscNumber;
     use crate::library::track::Genre;
     use crate::library::track::Title;
@@ -56,8 +57,10 @@ mod tests {
             path: TrackPath::new(path).unwrap(),
             title: Title::new("Roygbiv"),
             artist: Artist::new(artist),
+            album_artist: Artist::new(artist),
             album: AlbumTitle::new(album),
             genre: Genre::new(genre),
+            composer: Composer::new(""),
             duration: TrackDuration::from_secs(193),
             track_number: TrackNumber::new(7),
             disc_number: DiscNumber::new(1),

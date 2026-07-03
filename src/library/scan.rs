@@ -148,6 +148,7 @@ mod tests {
     use crate::library::db::LibraryFolder;
     use crate::library::track::AlbumTitle;
     use crate::library::track::Artist;
+    use crate::library::track::Composer;
     use crate::library::track::DiscNumber;
     use crate::library::track::Genre;
     use crate::library::track::Title;
@@ -162,8 +163,10 @@ mod tests {
             path: path.clone(),
             title: Title::new("Roygbiv"),
             artist: Artist::new("Boards of Canada"),
+            album_artist: Artist::new("Boards of Canada"),
             album: AlbumTitle::new("Music Has the Right to Children"),
             genre: Genre::new("Electronic"),
+            composer: Composer::new(""),
             duration: TrackDuration::from_secs(193),
             track_number: TrackNumber::new(7),
             disc_number: DiscNumber::new(1),

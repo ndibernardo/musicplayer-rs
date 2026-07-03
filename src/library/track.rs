@@ -85,6 +85,24 @@ impl Genre {
     }
 }
 
+/// Composer name. Empty means the tag was absent or unreadable.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct Composer(String);
+
+impl Composer {
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(raw.into().trim().to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// Audio track duration. Always non-negative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct TrackDuration(std::time::Duration);
@@ -207,8 +225,11 @@ pub struct Track {
     pub path: TrackPath,
     pub title: Title,
     pub artist: Artist,
+    /// The album's credited artist. Empty falls back to `artist` for grouping.
+    pub album_artist: Artist,
     pub album: AlbumTitle,
     pub genre: Genre,
+    pub composer: Composer,
     pub duration: TrackDuration,
     pub track_number: TrackNumber,
     pub disc_number: DiscNumber,
@@ -251,6 +272,21 @@ mod tests {
     #[test]
     fn artist_is_unknown_returns_false_for_known_artist() {
         assert!(!Artist::new("Boards of Canada").is_unknown());
+    }
+
+    #[test]
+    fn composer_new_trims_surrounding_whitespace() {
+        assert_eq!(Composer::new("  Wendy Carlos  ").as_str(), "Wendy Carlos");
+    }
+
+    #[test]
+    fn composer_new_empty_string_is_unknown() {
+        assert!(Composer::new("").is_unknown());
+    }
+
+    #[test]
+    fn composer_is_unknown_returns_false_for_known_composer() {
+        assert!(!Composer::new("Wendy Carlos").is_unknown());
     }
 
     #[test]
