@@ -15,30 +15,25 @@ fn run_ui() {
     use std::sync::mpsc;
 
     use crate::adapters::audio::rodio::RodioAudioBackend;
-    use crate::adapters::library::SqliteLibrary;
+    use crate::adapters::db::sqlite::Db;
     use crate::application::player::PlayerHandle;
-    use crate::application::ports::library::Library;
-    use crate::application::ports::scanner::Scanner;
     use crate::domain::player::PlaybackState;
 
     let db_path = data_dir().join("library.db");
-    let lib = match SqliteLibrary::open(db_path) {
-        Ok(lib) => Rc::new(lib),
+    let db = match Db::open(&db_path) {
+        Ok(db) => Rc::new(db),
         Err(e) => {
             eprintln!("Failed to open database: {e}");
             return;
         }
     };
 
-    let library: Rc<dyn Library> = lib.clone();
-    let scanner: Rc<dyn Scanner> = lib;
-
     let (state_tx, state_rx) = mpsc::channel::<PlaybackState>();
     let player = PlayerHandle::launch(RodioAudioBackend::new, move |s| {
         let _ = state_tx.send(s);
     });
 
-    ui::run(library, scanner, player, state_rx);
+    ui::run(db, db_path, player, state_rx);
 }
 
 #[cfg(feature = "ui")]
