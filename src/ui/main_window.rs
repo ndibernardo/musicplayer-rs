@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -22,6 +23,8 @@ use gtk4::prelude::*;
 
 use crate::library::db::Db;
 use crate::library::db::LibraryFolder;
+use crate::library::query::LibraryFilter;
+use crate::library::query::album_summaries_for;
 use crate::library::query::tracks_for;
 use crate::library::scan::spawn_scan;
 use crate::player::PlaybackState;
@@ -32,6 +35,9 @@ use crate::ui::library_view::LibraryView;
 use crate::ui::player_bar::PlayerBar;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::view_mode::ViewMode;
+
+/// Settings key for the persisted list/grid view choice.
+const VIEW_MODE_KEY: &str = "view_mode";
 
 pub fn build(
     app: &Application,
@@ -92,28 +98,45 @@ pub fn build(
     let library_view = LibraryView::new();
     let album_grid = AlbumGrid::new();
 
+    // The album grid mirrors the active sidebar filter (all albums when unfiltered).
+    let current_filter = Rc::new(RefCell::new(LibraryFilter::All));
+
     let content = Stack::new();
     content.set_hexpand(true);
     content.set_vexpand(true);
     content.add_named(&library_view.widget, Some(ViewMode::List.child_name()));
     content.add_named(&album_grid.widget, Some(ViewMode::Grid.child_name()));
 
-    // Header toggles flip the visible child.
+    // Header toggles flip the visible child and persist the choice.
     {
         let content = content.clone();
+        let db = Rc::clone(&db);
         list_toggle.connect_toggled(move |btn| {
             if btn.is_active() {
                 content.set_visible_child_name(ViewMode::List.child_name());
+                save_view_mode(&db, ViewMode::List);
             }
         });
     }
     {
         let content = content.clone();
+        let db = Rc::clone(&db);
         grid_toggle.connect_toggled(move |btn| {
             if btn.is_active() {
                 content.set_visible_child_name(ViewMode::Grid.child_name());
+                save_view_mode(&db, ViewMode::Grid);
             }
         });
+    }
+
+    // Restore the view chosen in the previous session.
+    {
+        let mode = load_view_mode(&db);
+        match mode {
+            ViewMode::List => list_toggle.set_active(true),
+            ViewMode::Grid => grid_toggle.set_active(true),
+        }
+        content.set_visible_child_name(mode.child_name());
     }
 
     let paned = Paned::new(Orientation::Horizontal);
@@ -140,19 +163,25 @@ pub fn build(
 
     refresh_folder_list(&folder_list, &db);
     refresh_sidebar(&filter_sidebar, &db);
-    refresh_album_grid(&album_grid, &db);
+    refresh_album_grid(&album_grid, &db, &current_filter.borrow());
 
     if let Ok(tracks) = db.list_tracks() {
         library_view.set_tracks(tracks);
     }
 
-    // Sidebar selection → filter the track list
+    // Sidebar selection → filter both the track list and the album grid
     {
         let db = Rc::clone(&db);
         let library_view = library_view.clone();
-        filter_sidebar.connect_filter_selected(move |filter| match tracks_for(&filter, &db) {
-            Ok(tracks) => library_view.set_tracks(tracks),
-            Err(e) => eprintln!("Filter query failed: {e}"),
+        let album_grid = album_grid.clone();
+        let current_filter = Rc::clone(&current_filter);
+        filter_sidebar.connect_filter_selected(move |filter| {
+            *current_filter.borrow_mut() = filter.clone();
+            match tracks_for(&filter, &db) {
+                Ok(tracks) => library_view.set_tracks(tracks),
+                Err(e) => eprintln!("Filter query failed: {e}"),
+            }
+            refresh_album_grid(&album_grid, &db, &filter);
         });
     }
 
@@ -222,6 +251,7 @@ pub fn build(
         let album_grid = album_grid.clone();
         let status_label = status_label.clone();
         let filter_sidebar = filter_sidebar.clone();
+        let current_filter = Rc::clone(&current_filter);
         scan_btn.connect_clicked(move |_| {
             let folders = match db.list_folders() {
                 Ok(folders) => folders,
@@ -239,6 +269,7 @@ pub fn build(
             let album_grid = album_grid.clone();
             let status_label = status_label.clone();
             let filter_sidebar = filter_sidebar.clone();
+            let current_filter = Rc::clone(&current_filter);
             // Timeout, not idle: an idle callback returning Continue runs every
             // main-loop iteration and pins a core for the whole scan.
             glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
@@ -248,7 +279,7 @@ pub fn build(
                         library_view.set_tracks(tracks);
                     }
                     refresh_sidebar(&filter_sidebar, &db);
-                    refresh_album_grid(&album_grid, &db);
+                    refresh_album_grid(&album_grid, &db, &current_filter.borrow());
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {
@@ -282,8 +313,24 @@ fn refresh_sidebar(sidebar: &Sidebar, db: &Rc<Db>) {
     sidebar.populate(genres, artists, albums);
 }
 
-fn refresh_album_grid(grid: &AlbumGrid, db: &Rc<Db>) {
-    grid.set_albums(db.album_summaries().unwrap_or_default());
+fn refresh_album_grid(grid: &AlbumGrid, db: &Rc<Db>, filter: &LibraryFilter) {
+    grid.set_albums(album_summaries_for(filter, db).unwrap_or_default());
+}
+
+/// Persists the chosen view; a failed write is non-fatal (logged only).
+fn save_view_mode(db: &Rc<Db>, mode: ViewMode) {
+    if let Err(e) = db.set_setting(VIEW_MODE_KEY, mode.child_name()) {
+        eprintln!("Failed to save view mode: {e}");
+    }
+}
+
+/// Loads the persisted view, defaulting to the track list when unset or invalid.
+fn load_view_mode(db: &Rc<Db>) -> ViewMode {
+    db.get_setting(VIEW_MODE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|name| ViewMode::from_name(&name))
+        .unwrap_or(ViewMode::List)
 }
 
 fn refresh_folder_list(list: &ListBox, db: &Rc<Db>) {
