@@ -303,39 +303,11 @@ pub fn build(
         });
     }
 
-    // Add Folder
-    {
+    // Starts a background scan of every watched folder, with live progress and
+    // the spinner overlay. Shared by the Scan button and the Add-Folder flow.
+    let start_scan: Rc<dyn Fn()> = {
         let db = Rc::clone(&db);
-        let folder_list = folder_list.clone();
-        let window = window.clone();
-        let refresh_views = Rc::clone(&refresh_views);
-        add_btn.connect_clicked(move |_| {
-            let db = Rc::clone(&db);
-            let folder_list = folder_list.clone();
-            let window = window.clone();
-            let refresh_views = Rc::clone(&refresh_views);
-            glib::spawn_future_local(async move {
-                let dialog = FileDialog::new();
-                dialog.set_title("Add Music Folder");
-                let Ok(file) = dialog.select_folder_future(Some(&window)).await else {
-                    return;
-                };
-                let Some(path) = file.path() else { return };
-                let Ok(folder) = LibraryFolder::new(path) else {
-                    return;
-                };
-                if let Err(e) = db.add_folder(&folder) {
-                    eprintln!("Failed to add folder: {e}");
-                    return;
-                }
-                refresh_folder_list(&folder_list, &db, &refresh_views);
-            });
-        });
-    }
-
-    // Scan
-    {
-        let db = Rc::clone(&db);
+        let db_path = db_path.clone();
         let library_view = library_view.clone();
         let album_grid = album_grid.clone();
         let status_label = status_label.clone();
@@ -344,7 +316,7 @@ pub fn build(
         let scan_spinner = scan_spinner.clone();
         let scan_status = scan_status.clone();
         let scan_indicator = scan_indicator.clone();
-        scan_btn.connect_clicked(move |_| {
+        Rc::new(move || {
             let folders = match db.list_folders() {
                 Ok(folders) => folders,
                 Err(e) => {
@@ -352,6 +324,9 @@ pub fn build(
                     return;
                 }
             };
+            if folders.is_empty() {
+                return;
+            }
 
             status_label.set_text("Scanning…");
             scan_status.set_text("Scanning…");
@@ -405,6 +380,45 @@ pub fn build(
                         }
                     }
                 }
+            });
+        })
+    };
+
+    // Scan button → scan all watched folders
+    {
+        let start_scan = Rc::clone(&start_scan);
+        scan_btn.connect_clicked(move |_| start_scan());
+    }
+
+    // Add Folder → persist it, refresh, then scan automatically
+    {
+        let db = Rc::clone(&db);
+        let folder_list = folder_list.clone();
+        let window = window.clone();
+        let refresh_views = Rc::clone(&refresh_views);
+        let start_scan = Rc::clone(&start_scan);
+        add_btn.connect_clicked(move |_| {
+            let db = Rc::clone(&db);
+            let folder_list = folder_list.clone();
+            let window = window.clone();
+            let refresh_views = Rc::clone(&refresh_views);
+            let start_scan = Rc::clone(&start_scan);
+            glib::spawn_future_local(async move {
+                let dialog = FileDialog::new();
+                dialog.set_title("Add Music Folder");
+                let Ok(file) = dialog.select_folder_future(Some(&window)).await else {
+                    return;
+                };
+                let Some(path) = file.path() else { return };
+                let Ok(folder) = LibraryFolder::new(path) else {
+                    return;
+                };
+                if let Err(e) = db.add_folder(&folder) {
+                    eprintln!("Failed to add folder: {e}");
+                    return;
+                }
+                refresh_folder_list(&folder_list, &db, &refresh_views);
+                start_scan();
             });
         });
     }
