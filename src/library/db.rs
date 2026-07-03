@@ -86,6 +86,40 @@ fn or_zero(v: Option<i64>) -> i64 {
     v.unwrap_or(0)
 }
 
+/// Raw column values of a `tracks` row, before domain validation.
+type TrackRow = (
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<Vec<u8>>,
+);
+
+/// Builds a domain `Track` from a raw row, validating the path.
+fn build_track(row: TrackRow) -> Result<Track, DbError> {
+    let (id, path, title, artist, album, genre, duration_ms, track_num, disc_num, year, art) = row;
+    let path = TrackPath::new(path).map_err(|e| DbError::InvalidData(e.to_string()))?;
+    Ok(Track {
+        id: TrackId::new(id),
+        path,
+        title: Title::new(or_empty(title)),
+        artist: Artist::new(or_empty(artist)),
+        album: AlbumTitle::new(or_empty(album)),
+        genre: Genre::new(or_empty(genre)),
+        duration: TrackDuration::from_millis(or_zero(duration_ms) as u64),
+        track_number: TrackNumber::new(or_zero(track_num) as u32),
+        disc_number: DiscNumber::new(or_zero(disc_num) as u32),
+        year: Year::new(or_zero(year) as u16),
+        art: art.map(AlbumArtData::new),
+    })
+}
+
 pub struct Db {
     pub(crate) conn: Connection,
 }
@@ -179,14 +213,46 @@ impl Db {
 
     /// Returns all tracks ordered by artist → album → track number.
     pub fn list_tracks(&self) -> Result<Vec<Track>, DbError> {
-        let mut stmt = self.conn.prepare(
+        self.query_tracks("ORDER BY artist, album, track_number", [])
+    }
+
+    /// Returns tracks whose genre equals `genre`, ordered by artist → album → track number.
+    pub fn tracks_by_genre(&self, genre: &Genre) -> Result<Vec<Track>, DbError> {
+        self.query_tracks(
+            "WHERE genre = ?1 ORDER BY artist, album, track_number",
+            [genre.as_str()],
+        )
+    }
+
+    /// Returns tracks by `artist`, ordered by album → track number.
+    pub fn tracks_by_artist(&self, artist: &Artist) -> Result<Vec<Track>, DbError> {
+        self.query_tracks(
+            "WHERE artist = ?1 ORDER BY album, track_number",
+            [artist.as_str()],
+        )
+    }
+
+    /// Returns tracks on `album`, ordered by disc → track number.
+    pub fn tracks_by_album(&self, album: &AlbumTitle) -> Result<Vec<Track>, DbError> {
+        self.query_tracks(
+            "WHERE album = ?1 ORDER BY disc_number, track_number",
+            [album.as_str()],
+        )
+    }
+
+    /// Runs a track query with the given `WHERE`/`ORDER BY` clause and parameters.
+    fn query_tracks(
+        &self,
+        filter_and_order: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<Track>, DbError> {
+        let sql = format!(
             "SELECT track_id, path, title, artist, album, genre,
                     duration_ms, track_number, disc_number, year, art
-             FROM tracks
-             ORDER BY artist, album, track_number",
-        )?;
-
-        stmt.query_map([], |row| {
+             FROM tracks {filter_and_order}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params, |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
@@ -200,38 +266,39 @@ impl Db {
                 row.get::<_, Option<i64>>(9)?,
                 row.get::<_, Option<Vec<u8>>>(10)?,
             ))
-        })?
-        .map(|r| r.map_err(DbError::from))
-        .map(|r| {
-            let (
-                id,
-                path,
-                title,
-                artist,
-                album,
-                genre,
-                duration_ms,
-                track_num,
-                disc_num,
-                year,
-                art,
-            ) = r?;
-            let path = TrackPath::new(path).map_err(|e| DbError::InvalidData(e.to_string()))?;
-            Ok(Track {
-                id: TrackId::new(id),
-                path,
-                title: Title::new(or_empty(title)),
-                artist: Artist::new(or_empty(artist)),
-                album: AlbumTitle::new(or_empty(album)),
-                genre: Genre::new(or_empty(genre)),
-                duration: TrackDuration::from_millis(or_zero(duration_ms) as u64),
-                track_number: TrackNumber::new(or_zero(track_num) as u32),
-                disc_number: DiscNumber::new(or_zero(disc_num) as u32),
-                year: Year::new(or_zero(year) as u16),
-                art: art.map(AlbumArtData::new),
-            })
-        })
-        .collect()
+        })?;
+        rows.map(|r| build_track(r.map_err(DbError::from)?))
+            .collect()
+    }
+
+    /// Distinct non-empty genres present in the library, alphabetically ordered.
+    pub fn distinct_genres(&self) -> Result<Vec<Genre>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT genre FROM tracks WHERE genre IS NOT NULL ORDER BY genre")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .map(|r| r.map_err(DbError::from).map(Genre::new))
+            .collect()
+    }
+
+    /// Distinct non-empty artists present in the library, alphabetically ordered.
+    pub fn distinct_artists(&self) -> Result<Vec<Artist>, DbError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT artist FROM tracks WHERE artist IS NOT NULL ORDER BY artist",
+        )?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .map(|r| r.map_err(DbError::from).map(Artist::new))
+            .collect()
+    }
+
+    /// Distinct non-empty albums present in the library, alphabetically ordered.
+    pub fn distinct_albums(&self) -> Result<Vec<AlbumTitle>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT album FROM tracks WHERE album IS NOT NULL ORDER BY album")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .map(|r| r.map_err(DbError::from).map(AlbumTitle::new))
+            .collect()
     }
 
     pub fn track_count(&self) -> Result<u64, DbError> {
@@ -375,6 +442,15 @@ mod tests {
             disc_number: DiscNumber::new(1),
             year: Year::new(1998),
             art: None,
+        }
+    }
+
+    fn track_tagged(path: &str, artist: &str, album: &str, genre: &str) -> Track {
+        Track {
+            artist: Artist::new(artist),
+            album: AlbumTitle::new(album),
+            genre: Genre::new(genre),
+            ..full_track(path)
         }
     }
 
@@ -522,5 +598,154 @@ mod tests {
         db.add_folder(&LibraryFolder::new("/home/user/Downloads").unwrap())
             .unwrap();
         assert_eq!(db.list_folders().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn tracks_by_genre_returns_only_matching_genre() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/roygbiv.flac",
+            "Boards of Canada",
+            "Music Has the Right to Children",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/aphex/xtal.flac",
+            "Aphex Twin",
+            "Selected Ambient Works 85-92",
+            "Ambient",
+        ))
+        .unwrap();
+
+        let electronic = db.tracks_by_genre(&Genre::new("Electronic")).unwrap();
+        assert_eq!(electronic.len(), 1);
+        assert_eq!(electronic[0].artist.as_str(), "Boards of Canada");
+    }
+
+    #[test]
+    fn tracks_by_genre_returns_empty_for_unknown_genre() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        assert!(db.tracks_by_genre(&Genre::new("Jazz")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tracks_by_artist_returns_only_matching_artist() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/roygbiv.flac",
+            "Boards of Canada",
+            "Music Has the Right to Children",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/aphex/xtal.flac",
+            "Aphex Twin",
+            "Selected Ambient Works 85-92",
+            "Ambient",
+        ))
+        .unwrap();
+
+        let aphex = db.tracks_by_artist(&Artist::new("Aphex Twin")).unwrap();
+        assert_eq!(aphex.len(), 1);
+        assert_eq!(aphex[0].album.as_str(), "Selected Ambient Works 85-92");
+    }
+
+    #[test]
+    fn tracks_by_album_returns_only_matching_album() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/roygbiv.flac",
+            "Boards of Canada",
+            "Music Has the Right to Children",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/olsonic.flac",
+            "Boards of Canada",
+            "Geogaddi",
+            "Electronic",
+        ))
+        .unwrap();
+
+        let geogaddi = db.tracks_by_album(&AlbumTitle::new("Geogaddi")).unwrap();
+        assert_eq!(geogaddi.len(), 1);
+        assert_eq!(geogaddi[0].album.as_str(), "Geogaddi");
+    }
+
+    #[test]
+    fn distinct_genres_returns_sorted_unique_values() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/roygbiv.flac",
+            "Boards of Canada",
+            "Geogaddi",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/olsonic.flac",
+            "Boards of Canada",
+            "Geogaddi",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/aphex/xtal.flac",
+            "Aphex Twin",
+            "Selected Ambient Works 85-92",
+            "Ambient",
+        ))
+        .unwrap();
+
+        let genres = db.distinct_genres().unwrap();
+        assert_eq!(
+            genres,
+            vec![Genre::new("Ambient"), Genre::new("Electronic")]
+        );
+    }
+
+    #[test]
+    fn distinct_artists_excludes_absent_tag() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        db.upsert_track(&minimal_track("/music/unknown.mp3"))
+            .unwrap();
+
+        let artists = db.distinct_artists().unwrap();
+        assert_eq!(artists, vec![Artist::new("Boards of Canada")]);
+    }
+
+    #[test]
+    fn distinct_albums_returns_unique_albums() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/roygbiv.flac",
+            "Boards of Canada",
+            "Geogaddi",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/olsonic.flac",
+            "Boards of Canada",
+            "Geogaddi",
+            "Electronic",
+        ))
+        .unwrap();
+
+        let albums = db.distinct_albums().unwrap();
+        assert_eq!(albums, vec![AlbumTitle::new("Geogaddi")]);
+    }
+
+    #[test]
+    fn distinct_genres_empty_for_fresh_db() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.distinct_genres().unwrap().is_empty());
     }
 }
