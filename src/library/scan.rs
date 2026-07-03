@@ -21,6 +21,15 @@ pub enum ScanError {
     Database(#[from] DbError),
 }
 
+/// A message sent from the background scan to the UI over the scan channel.
+#[derive(Debug)]
+pub enum ScanEvent {
+    /// Running count of files indexed so far, across all folders.
+    Progress(u32),
+    /// The scan finished: total indexed, or the first error encountered.
+    Finished(Result<u32, ScanError>),
+}
+
 /// Walks `folder` recursively, reads each audio file with `read_track`, and upserts to `db`.
 ///
 /// `read_track` returns `None` to skip a file (e.g. format error). Returns the count of
@@ -29,6 +38,17 @@ pub fn scan_folder(
     folder: &LibraryFolder,
     db: &Db,
     read_track: impl Fn(&TrackPath) -> Option<Track>,
+) -> Result<u32, ScanError> {
+    scan_folder_with_progress(folder, db, read_track, |_| {})
+}
+
+/// Like [`scan_folder`], but invokes `on_progress` with the running indexed count
+/// after each file, so a caller can report scan progress live.
+pub fn scan_folder_with_progress(
+    folder: &LibraryFolder,
+    db: &Db,
+    read_track: impl Fn(&TrackPath) -> Option<Track>,
+    mut on_progress: impl FnMut(u32),
 ) -> Result<u32, ScanError> {
     let files = collect_audio_files(folder.as_path())?;
     let mut count = 0u32;
@@ -40,6 +60,7 @@ pub fn scan_folder(
         if let Some(track) = read_track(&track_path) {
             db.upsert_track(&track)?;
             count += 1;
+            on_progress(count);
         }
     }
 
@@ -47,35 +68,42 @@ pub fn scan_folder(
 }
 
 /// Scans `folders` on a background thread with its own DB connection (WAL mode
-/// lets it write while the UI reads). Reports the total indexed count, or the
-/// first error, on the returned channel.
-pub fn spawn_scan(
-    db_path: PathBuf,
-    folders: Vec<LibraryFolder>,
-) -> Receiver<Result<u32, ScanError>> {
+/// lets it write while the UI reads). Streams `ScanEvent::Progress` as files are
+/// indexed, then a final `ScanEvent::Finished` with the total or the first error.
+pub fn spawn_scan(db_path: PathBuf, folders: Vec<LibraryFolder>) -> Receiver<ScanEvent> {
     let (tx, rx) = mpsc::channel();
 
     std::thread::spawn(move || {
         let db = match Db::open(&db_path) {
             Ok(db) => db,
             Err(e) => {
-                let _ = tx.send(Err(ScanError::from(e)));
+                let _ = tx.send(ScanEvent::Finished(Err(ScanError::from(e))));
                 return;
             }
         };
 
         let mut total = 0u32;
         for folder in &folders {
-            match scan_folder(folder, &db, |p| crate::library::metadata::read(p).ok()) {
+            let base = total;
+            let progress_tx = tx.clone();
+            let result = scan_folder_with_progress(
+                folder,
+                &db,
+                |p| crate::library::metadata::read(p).ok(),
+                |n| {
+                    let _ = progress_tx.send(ScanEvent::Progress(base + n));
+                },
+            );
+            match result {
                 Ok(n) => total += n,
                 Err(e) => {
-                    let _ = tx.send(Err(e));
+                    let _ = tx.send(ScanEvent::Finished(Err(e)));
                     return;
                 }
             }
         }
 
-        let _ = tx.send(Ok(total));
+        let _ = tx.send(ScanEvent::Finished(Ok(total)));
     });
 
     rx
@@ -233,6 +261,25 @@ mod tests {
         let folder = LibraryFolder::new("/nonexistent/path/that/does/not/exist").unwrap();
         let result = scan_folder(&folder, &db, |p| Some(fake_track(p)));
         assert!(matches!(result, Err(ScanError::ReadDir { .. })));
+    }
+
+    #[test]
+    fn scan_folder_with_progress_reports_running_count() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("track01.flac"));
+        touch(&dir.path().join("track02.flac"));
+        touch(&dir.path().join("track03.flac"));
+
+        let db = Db::open_in_memory().unwrap();
+        let folder = LibraryFolder::new(dir.path()).unwrap();
+
+        let mut seen = Vec::new();
+        let total =
+            scan_folder_with_progress(&folder, &db, |p| Some(fake_track(p)), |n| seen.push(n))
+                .unwrap();
+
+        assert_eq!(total, 3);
+        assert_eq!(seen, vec![1, 2, 3], "progress is the running indexed count");
     }
 
     #[test]
