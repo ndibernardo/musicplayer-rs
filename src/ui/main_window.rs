@@ -15,8 +15,11 @@ use gtk4::Label;
 use gtk4::ListBox;
 use gtk4::ListBoxRow;
 use gtk4::Orientation;
+use gtk4::Overlay;
 use gtk4::Paned;
+use gtk4::Scale;
 use gtk4::ScrolledWindow;
+use gtk4::Spinner;
 use gtk4::Stack;
 use gtk4::ToggleButton;
 use gtk4::prelude::*;
@@ -26,6 +29,7 @@ use crate::library::db::LibraryFolder;
 use crate::library::query::LibraryFilter;
 use crate::library::query::album_summaries_for;
 use crate::library::query::tracks_for;
+use crate::library::scan::ScanEvent;
 use crate::library::scan::spawn_scan;
 use crate::player::PlaybackState;
 use crate::player::PlayerCommand;
@@ -38,6 +42,14 @@ use crate::ui::view_mode::ViewMode;
 
 /// Settings key for the persisted list/grid view choice.
 const VIEW_MODE_KEY: &str = "view_mode";
+/// Settings key for the persisted album-cover size (px).
+const COVER_SIZE_KEY: &str = "cover_size";
+/// Settings key for the persisted playback volume (0–100).
+const VOLUME_KEY: &str = "volume";
+
+/// Album-cover size slider bounds (px).
+const COVER_SIZE_MIN: f64 = 200.0;
+const COVER_SIZE_MAX: f64 = 500.0;
 
 pub fn build(
     app: &Application,
@@ -55,6 +67,19 @@ pub fn build(
     let scan_btn = Button::from_icon_name("view-refresh-symbolic");
     scan_btn.set_tooltip_text(Some("Scan library"));
     header.pack_start(&scan_btn);
+
+    // Album-art size slider, sitting next to the scan button.
+    let size_scale = Scale::with_range(
+        Orientation::Horizontal,
+        COVER_SIZE_MIN,
+        COVER_SIZE_MAX,
+        10.0,
+    );
+    size_scale.set_size_request(120, -1);
+    size_scale.set_draw_value(false);
+    size_scale.set_tooltip_text(Some("Album art size"));
+    size_scale.set_valign(gtk4::Align::Center);
+    header.pack_start(&size_scale);
 
     let list_toggle = ToggleButton::new();
     list_toggle.set_icon_name("view-list-symbolic");
@@ -139,13 +164,42 @@ pub fn build(
         content.set_visible_child_name(mode.child_name());
     }
 
+    // A scanning spinner + count, centred over the content while a scan runs.
+    let scan_spinner = Spinner::new();
+    scan_spinner.set_size_request(48, 48);
+    let scan_status = Label::new(None);
+    scan_status.add_css_class("title-4");
+    let scan_indicator = GtkBox::new(Orientation::Vertical, 12);
+    scan_indicator.add_css_class("osd");
+    scan_indicator.set_halign(gtk4::Align::Center);
+    scan_indicator.set_valign(gtk4::Align::Center);
+    scan_indicator.set_margin_top(24);
+    scan_indicator.set_margin_bottom(24);
+    scan_indicator.set_margin_start(24);
+    scan_indicator.set_margin_end(24);
+    scan_indicator.append(&scan_spinner);
+    scan_indicator.append(&scan_status);
+    scan_indicator.set_visible(false);
+
+    let content_overlay = Overlay::new();
+    content_overlay.set_child(Some(&content));
+    content_overlay.add_overlay(&scan_indicator);
+
     let paned = Paned::new(Orientation::Horizontal);
     paned.set_start_child(Some(&sidebar));
-    paned.set_end_child(Some(&content));
+    paned.set_end_child(Some(&content_overlay));
     paned.set_position(220);
     paned.set_vexpand(true);
 
-    let player_bar = PlayerBar::new(player.clone());
+    let player_bar = PlayerBar::new(player.clone(), load_volume(&db));
+
+    // Persist the volume whenever the user moves the slider.
+    {
+        let db = Rc::clone(&db);
+        player_bar.connect_volume_changed(move |percent| {
+            save_setting(&db, VOLUME_KEY, &(percent as i64).to_string());
+        });
+    }
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.append(&paned);
@@ -161,7 +215,40 @@ pub fn build(
 
     window.set_titlebar(Some(&header));
 
-    refresh_folder_list(&folder_list, &db);
+    // Restore the album-cover size, then wire the slider to resize + persist.
+    let initial_cover_size = load_cover_size(&db);
+    size_scale.set_value(initial_cover_size as f64);
+    album_grid.set_cover_size(initial_cover_size);
+    {
+        let album_grid = album_grid.clone();
+        let db = Rc::clone(&db);
+        size_scale.connect_value_changed(move |scale| {
+            let size = scale.value() as i32;
+            album_grid.set_cover_size(size);
+            save_setting(&db, COVER_SIZE_KEY, &size.to_string());
+        });
+    }
+
+    // Reloads the tracks/sidebar/grid after the library changes (e.g. a folder
+    // and its tracks were removed), keeping the active filter applied.
+    let refresh_views: Rc<dyn Fn()> = {
+        let db = Rc::clone(&db);
+        let library_view = library_view.clone();
+        let album_grid = album_grid.clone();
+        let filter_sidebar = filter_sidebar.clone();
+        let current_filter = Rc::clone(&current_filter);
+        Rc::new(move || {
+            let filter = current_filter.borrow();
+            match tracks_for(&filter, &db) {
+                Ok(tracks) => library_view.set_tracks(tracks),
+                Err(e) => eprintln!("Reload after library change failed: {e}"),
+            }
+            refresh_sidebar(&filter_sidebar, &db);
+            refresh_album_grid(&album_grid, &db, &filter);
+        })
+    };
+
+    refresh_folder_list(&folder_list, &db, &refresh_views);
     refresh_sidebar(&filter_sidebar, &db);
     refresh_album_grid(&album_grid, &db, &current_filter.borrow());
 
@@ -221,10 +308,12 @@ pub fn build(
         let db = Rc::clone(&db);
         let folder_list = folder_list.clone();
         let window = window.clone();
+        let refresh_views = Rc::clone(&refresh_views);
         add_btn.connect_clicked(move |_| {
             let db = Rc::clone(&db);
             let folder_list = folder_list.clone();
             let window = window.clone();
+            let refresh_views = Rc::clone(&refresh_views);
             glib::spawn_future_local(async move {
                 let dialog = FileDialog::new();
                 dialog.set_title("Add Music Folder");
@@ -239,7 +328,7 @@ pub fn build(
                     eprintln!("Failed to add folder: {e}");
                     return;
                 }
-                refresh_folder_list(&folder_list, &db);
+                refresh_folder_list(&folder_list, &db, &refresh_views);
             });
         });
     }
@@ -252,6 +341,9 @@ pub fn build(
         let status_label = status_label.clone();
         let filter_sidebar = filter_sidebar.clone();
         let current_filter = Rc::clone(&current_filter);
+        let scan_spinner = scan_spinner.clone();
+        let scan_status = scan_status.clone();
+        let scan_indicator = scan_indicator.clone();
         scan_btn.connect_clicked(move |_| {
             let folders = match db.list_folders() {
                 Ok(folders) => folders,
@@ -262,6 +354,9 @@ pub fn build(
             };
 
             status_label.set_text("Scanning…");
+            scan_status.set_text("Scanning…");
+            scan_indicator.set_visible(true);
+            scan_spinner.start();
             let rx = spawn_scan(db_path.clone(), folders);
 
             let db = Rc::clone(&db);
@@ -270,24 +365,46 @@ pub fn build(
             let status_label = status_label.clone();
             let filter_sidebar = filter_sidebar.clone();
             let current_filter = Rc::clone(&current_filter);
+            let scan_spinner = scan_spinner.clone();
+            let scan_status = scan_status.clone();
+            let scan_indicator = scan_indicator.clone();
+            let stop_indicator = move |spinner: &Spinner, indicator: &GtkBox| {
+                spinner.stop();
+                indicator.set_visible(false);
+            };
             // Timeout, not idle: an idle callback returning Continue runs every
-            // main-loop iteration and pins a core for the whole scan.
-            glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
-                Ok(Ok(n)) => {
-                    status_label.set_text(&format!("Indexed {n} tracks"));
-                    if let Ok(tracks) = db.list_tracks() {
-                        library_view.set_tracks(tracks);
+            // main-loop iteration and pins a core for the whole scan. Drain all
+            // pending events each tick so the count keeps up with the scan.
+            glib::timeout_add_local(Duration::from_millis(100), move || {
+                loop {
+                    match rx.try_recv() {
+                        Ok(ScanEvent::Progress(n)) => {
+                            let msg = format!("Scanning… {n} files");
+                            status_label.set_text(&msg);
+                            scan_status.set_text(&msg);
+                        }
+                        Ok(ScanEvent::Finished(Ok(n))) => {
+                            status_label.set_text(&format!("Indexed {n} tracks"));
+                            stop_indicator(&scan_spinner, &scan_indicator);
+                            if let Ok(tracks) = db.list_tracks() {
+                                library_view.set_tracks(tracks);
+                            }
+                            refresh_sidebar(&filter_sidebar, &db);
+                            refresh_album_grid(&album_grid, &db, &current_filter.borrow());
+                            return glib::ControlFlow::Break;
+                        }
+                        Ok(ScanEvent::Finished(Err(e))) => {
+                            status_label.set_text(&format!("Scan error: {e}"));
+                            stop_indicator(&scan_spinner, &scan_indicator);
+                            return glib::ControlFlow::Break;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            stop_indicator(&scan_spinner, &scan_indicator);
+                            return glib::ControlFlow::Break;
+                        }
                     }
-                    refresh_sidebar(&filter_sidebar, &db);
-                    refresh_album_grid(&album_grid, &db, &current_filter.borrow());
-                    glib::ControlFlow::Break
                 }
-                Ok(Err(e)) => {
-                    status_label.set_text(&format!("Scan error: {e}"));
-                    glib::ControlFlow::Break
-                }
-                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
             });
         });
     }
@@ -309,19 +426,23 @@ pub fn build(
 fn refresh_sidebar(sidebar: &Sidebar, db: &Rc<Db>) {
     let genres = db.distinct_genres().unwrap_or_default();
     let artists = db.distinct_artists().unwrap_or_default();
-    let albums = db.distinct_albums().unwrap_or_default();
-    sidebar.populate(genres, artists, albums);
+    sidebar.populate(genres, artists);
 }
 
 fn refresh_album_grid(grid: &AlbumGrid, db: &Rc<Db>, filter: &LibraryFilter) {
     grid.set_albums(album_summaries_for(filter, db).unwrap_or_default());
 }
 
-/// Persists the chosen view; a failed write is non-fatal (logged only).
-fn save_view_mode(db: &Rc<Db>, mode: ViewMode) {
-    if let Err(e) = db.set_setting(VIEW_MODE_KEY, mode.child_name()) {
-        eprintln!("Failed to save view mode: {e}");
+/// Persists a setting; a failed write is non-fatal (logged only).
+fn save_setting(db: &Rc<Db>, key: &str, value: &str) {
+    if let Err(e) = db.set_setting(key, value) {
+        eprintln!("Failed to save setting {key}: {e}");
     }
+}
+
+/// Persists the chosen view.
+fn save_view_mode(db: &Rc<Db>, mode: ViewMode) {
+    save_setting(db, VIEW_MODE_KEY, mode.child_name());
 }
 
 /// Loads the persisted view, defaulting to the track list when unset or invalid.
@@ -333,17 +454,43 @@ fn load_view_mode(db: &Rc<Db>) -> ViewMode {
         .unwrap_or(ViewMode::List)
 }
 
-fn refresh_folder_list(list: &ListBox, db: &Rc<Db>) {
+/// Loads the persisted cover size, clamped to the slider bounds; defaults to the
+/// minimum when unset or invalid.
+fn load_cover_size(db: &Rc<Db>) -> i32 {
+    db.get_setting(COVER_SIZE_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i32>().ok())
+        .map(|n| n.clamp(COVER_SIZE_MIN as i32, COVER_SIZE_MAX as i32))
+        .unwrap_or(COVER_SIZE_MIN as i32)
+}
+
+/// Loads the persisted volume (0–100), defaulting to 70 when unset or invalid.
+fn load_volume(db: &Rc<Db>) -> f64 {
+    db.get_setting(VOLUME_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|v| v.clamp(0.0, 100.0))
+        .unwrap_or(70.0)
+}
+
+fn refresh_folder_list(list: &ListBox, db: &Rc<Db>, on_change: &Rc<dyn Fn()>) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
     let configured = db.list_folders().unwrap_or_default();
     for folder in configured {
-        list.append(&folder_row(folder, list, db));
+        list.append(&folder_row(folder, list, db, on_change));
     }
 }
 
-fn folder_row(folder: LibraryFolder, list: &ListBox, db: &Rc<Db>) -> ListBoxRow {
+fn folder_row(
+    folder: LibraryFolder,
+    list: &ListBox,
+    db: &Rc<Db>,
+    on_change: &Rc<dyn Fn()>,
+) -> ListBoxRow {
     let path_label = Label::new(folder.as_path().to_str());
     path_label.set_hexpand(true);
     path_label.set_xalign(0.0);
@@ -362,12 +509,14 @@ fn folder_row(folder: LibraryFolder, list: &ListBox, db: &Rc<Db>) -> ListBoxRow 
 
     let db = Rc::clone(db);
     let list = list.clone();
+    let on_change = Rc::clone(on_change);
     remove_btn.connect_clicked(move |_| {
         if let Err(e) = db.remove_folder(&folder) {
             eprintln!("Failed to remove folder: {e}");
             return;
         }
-        refresh_folder_list(&list, &db);
+        refresh_folder_list(&list, &db, &on_change);
+        on_change();
     });
 
     let row = ListBoxRow::new();

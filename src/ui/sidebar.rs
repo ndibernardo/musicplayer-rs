@@ -12,23 +12,20 @@ use gtk4::ScrolledWindow;
 use gtk4::prelude::*;
 
 use crate::library::query::LibraryFilter;
-use crate::library::track::AlbumTitle;
 use crate::library::track::Artist;
 use crate::library::track::Genre;
 
 type FilterCallback = Rc<dyn Fn(LibraryFilter)>;
 
-/// Genre / artist / album browser. Emits a `LibraryFilter` when the user
-/// selects an entry.
+/// Genre / artist browser. Emits a `LibraryFilter` when the user selects an
+/// entry.
 #[derive(Clone)]
 pub struct Sidebar {
     pub widget: GtkBox,
     genres: ListBox,
     artists: ListBox,
-    albums: ListBox,
     genre_values: Rc<RefCell<Vec<Genre>>>,
     artist_values: Rc<RefCell<Vec<Artist>>>,
-    album_values: Rc<RefCell<Vec<AlbumTitle>>>,
     on_select: Rc<RefCell<Option<FilterCallback>>>,
 }
 
@@ -44,11 +41,10 @@ impl Sidebar {
 
         let genres = section_list();
         let artists = section_list();
-        let albums = section_list();
 
         {
             let on_select = Rc::clone(&on_select);
-            let lists = [genres.clone(), artists.clone(), albums.clone()];
+            let lists = [genres.clone(), artists.clone()];
             all_btn.connect_clicked(move |_| {
                 clear_selections(&lists);
                 emit(&on_select, LibraryFilter::All);
@@ -57,12 +53,11 @@ impl Sidebar {
 
         let genre_values: Rc<RefCell<Vec<Genre>>> = Rc::new(RefCell::new(Vec::new()));
         let artist_values: Rc<RefCell<Vec<Artist>>> = Rc::new(RefCell::new(Vec::new()));
-        let album_values: Rc<RefCell<Vec<AlbumTitle>>> = Rc::new(RefCell::new(Vec::new()));
 
         {
             let on_select = Rc::clone(&on_select);
             let values = Rc::clone(&genre_values);
-            let others = [artists.clone(), albums.clone()];
+            let others = [artists.clone()];
             genres.connect_row_activated(move |_, row| {
                 clear_selections(&others);
                 if let Some(genre) = values.borrow().get(row.index() as usize).cloned() {
@@ -73,22 +68,11 @@ impl Sidebar {
         {
             let on_select = Rc::clone(&on_select);
             let values = Rc::clone(&artist_values);
-            let others = [genres.clone(), albums.clone()];
+            let others = [genres.clone()];
             artists.connect_row_activated(move |_, row| {
                 clear_selections(&others);
                 if let Some(artist) = values.borrow().get(row.index() as usize).cloned() {
                     emit(&on_select, LibraryFilter::ByArtist(artist));
-                }
-            });
-        }
-        {
-            let on_select = Rc::clone(&on_select);
-            let values = Rc::clone(&album_values);
-            let others = [genres.clone(), artists.clone()];
-            albums.connect_row_activated(move |_, row| {
-                clear_selections(&others);
-                if let Some(album) = values.borrow().get(row.index() as usize).cloned() {
-                    emit(&on_select, LibraryFilter::ByAlbum(album));
                 }
             });
         }
@@ -97,7 +81,6 @@ impl Sidebar {
         inner.append(&all_btn);
         inner.append(&section("Genres", &genres, true));
         inner.append(&section("Artists", &artists, false));
-        inner.append(&section("Albums", &albums, false));
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_vexpand(true);
@@ -111,10 +94,8 @@ impl Sidebar {
             widget,
             genres,
             artists,
-            albums,
             genre_values,
             artist_values,
-            album_values,
             on_select,
         }
     }
@@ -125,13 +106,11 @@ impl Sidebar {
     }
 
     /// Replaces every section's entries with the given distinct values.
-    pub fn populate(&self, genres: Vec<Genre>, artists: Vec<Artist>, albums: Vec<AlbumTitle>) {
+    pub fn populate(&self, genres: Vec<Genre>, artists: Vec<Artist>) {
         fill(&self.genres, genres.iter().map(Genre::as_str));
         fill(&self.artists, artists.iter().map(Artist::as_str));
-        fill(&self.albums, albums.iter().map(AlbumTitle::as_str));
         *self.genre_values.borrow_mut() = genres;
         *self.artist_values.borrow_mut() = artists;
-        *self.album_values.borrow_mut() = albums;
     }
 }
 

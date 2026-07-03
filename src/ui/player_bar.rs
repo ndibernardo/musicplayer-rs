@@ -23,12 +23,14 @@ pub struct PlayerBar {
     track_label: Label,
     time_label: Label,
     play_pause_btn: Button,
+    volume_scale: Scale,
     // Tracks whether the engine is currently playing so the button can toggle correctly.
     is_playing: Rc<Cell<bool>>,
 }
 
 impl PlayerBar {
-    pub fn new(player: PlayerHandle) -> Self {
+    /// `initial_volume` is a 0–100 percentage restored from settings.
+    pub fn new(player: PlayerHandle, initial_volume: f64) -> Self {
         let play_pause_btn = Button::from_icon_name("media-playback-start-symbolic");
         let stop_btn = Button::from_icon_name("media-playback-stop-symbolic");
 
@@ -43,7 +45,7 @@ impl PlayerBar {
         time_label.set_width_chars(6);
         time_label.set_xalign(1.0);
 
-        let vol_adj = Adjustment::new(70.0, 0.0, 100.0, 1.0, 10.0, 0.0);
+        let vol_adj = Adjustment::new(initial_volume, 0.0, 100.0, 1.0, 10.0, 0.0);
         let volume_scale = Scale::new(Orientation::Horizontal, Some(&vol_adj));
         volume_scale.set_width_request(120);
         volume_scale.set_draw_value(false);
@@ -103,13 +105,27 @@ impl PlayerBar {
             });
         }
 
+        // Sync the engine to the restored volume; the adjustment starts there, so
+        // no value-changed fires to do it for us.
+        if let Ok(v) = Volume::new(initial_volume as f32 / 100.0) {
+            player.send(PlayerCommand::SetVolume(v));
+        }
+
         Self {
             widget,
             track_label,
             time_label,
             play_pause_btn,
+            volume_scale,
             is_playing,
         }
+    }
+
+    /// Registers a callback invoked with the new 0–100 volume whenever the user
+    /// moves the volume slider.
+    pub fn connect_volume_changed<F: Fn(f64) + 'static>(&self, f: F) {
+        self.volume_scale
+            .connect_value_changed(move |scale| f(scale.value()));
     }
 
     /// Called when a new track starts (from double-click or auto-advance).
