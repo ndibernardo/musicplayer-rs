@@ -1,14 +1,15 @@
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use gtk4::Align;
 use gtk4::Box as GtkBox;
 use gtk4::Button;
-use gtk4::ContentFit;
+use gtk4::Image;
 use gtk4::Label;
 use gtk4::ListBox;
 use gtk4::ListBoxRow;
 use gtk4::Orientation;
-use gtk4::Picture;
 use gtk4::ScrolledWindow;
 use gtk4::SelectionMode;
 use gtk4::Widget;
@@ -20,9 +21,21 @@ use crate::library::album::AlbumSummary;
 use crate::library::track::Track;
 use crate::library::track::TrackDuration;
 
-/// Fixed number of album covers per row. The grid is hand-built (not a
-/// `GridView`) so a full-width track drawer can be inserted between rows.
-const COLUMNS: usize = 4;
+/// Column count before the first width-driven reflow. The grid is hand-built
+/// (not a `GridView`) so a full-width track drawer can be inserted between rows;
+/// columns are recomputed from the viewport width (see `reflow`).
+const DEFAULT_COLUMNS: usize = 4;
+
+/// Per-cover horizontal budget beyond the cover itself (button padding + inter-
+/// cover spacing) — used to estimate how many covers fit a given width.
+const COVER_SLOT_EXTRA: i32 = 24;
+
+/// Combined left+right margin of the grid container (px).
+const GRID_MARGIN_TOTAL: i32 = 12;
+
+/// Default cover side length (px), used until a saved or user-chosen value is
+/// applied via `set_cover_size`.
+const DEFAULT_COVER_SIZE: i32 = 200;
 
 type TrackProvider = Rc<dyn Fn(&AlbumSummary) -> Vec<Track>>;
 type TrackCallback = Rc<dyn Fn(Track)>;
@@ -38,6 +51,13 @@ pub struct AlbumGrid {
     albums: Rc<RefCell<Vec<AlbumSummary>>>,
     open_album: Rc<RefCell<Option<usize>>>,
     drawer: Rc<RefCell<Option<Widget>>>,
+    cover_size: Rc<Cell<i32>>,
+    // Current column count, recomputed from the viewport width.
+    columns: Rc<Cell<usize>>,
+    // Cover buttons in album order, reused when the grid reflows (no re-decode).
+    buttons: Rc<RefCell<Vec<Button>>>,
+    // Cover image + its cell box, kept so `set_cover_size` can resize in place.
+    covers: Rc<RefCell<Vec<(Image, GtkBox)>>>,
     track_provider: Rc<RefCell<Option<TrackProvider>>>,
     on_track_activated: Rc<RefCell<Option<TrackCallback>>>,
 }
@@ -55,16 +75,30 @@ impl AlbumGrid {
         scrolled.set_vexpand(true);
         scrolled.set_child(Some(&grid_box));
 
-        Self {
+        let grid = Self {
             widget: scrolled,
             grid_box,
             row_boxes: Rc::new(RefCell::new(Vec::new())),
             albums: Rc::new(RefCell::new(Vec::new())),
             open_album: Rc::new(RefCell::new(None)),
             drawer: Rc::new(RefCell::new(None)),
+            cover_size: Rc::new(Cell::new(DEFAULT_COVER_SIZE)),
+            columns: Rc::new(Cell::new(DEFAULT_COLUMNS)),
+            buttons: Rc::new(RefCell::new(Vec::new())),
+            covers: Rc::new(RefCell::new(Vec::new())),
             track_provider: Rc::new(RefCell::new(None)),
             on_track_activated: Rc::new(RefCell::new(None)),
-        }
+        };
+        grid.install_reflow_handler();
+        grid
+    }
+
+    /// Reflows whenever the scroll viewport's width changes.
+    fn install_reflow_handler(&self) {
+        let this = self.clone();
+        self.widget
+            .hadjustment()
+            .connect_page_size_notify(move |_| this.reflow());
     }
 
     /// Rebuilds the cover grid and closes any open drawer.
@@ -74,19 +108,60 @@ impl AlbumGrid {
         }
         *self.open_album.borrow_mut() = None;
         *self.drawer.borrow_mut() = None;
+        self.covers.borrow_mut().clear();
 
+        let buttons: Vec<Button> = albums
+            .iter()
+            .enumerate()
+            .map(|(index, summary)| self.cover_button(index, summary))
+            .collect();
+        *self.buttons.borrow_mut() = buttons;
+        *self.albums.borrow_mut() = albums;
+
+        self.lay_out(self.columns_for_current_width());
+    }
+
+    /// Arranges the existing cover buttons into rows of `columns`.
+    fn lay_out(&self, columns: usize) {
+        self.columns.set(columns);
+        let buttons = self.buttons.borrow();
         let mut row_boxes = Vec::new();
-        for (row_index, chunk) in albums.chunks(COLUMNS).enumerate() {
+        for chunk in buttons.chunks(columns) {
             let row_box = GtkBox::new(Orientation::Horizontal, 6);
-            for (col, summary) in chunk.iter().enumerate() {
-                let index = row_index * COLUMNS + col;
-                row_box.append(&self.cover_button(index, summary));
+            for button in chunk {
+                row_box.append(button);
             }
             self.grid_box.append(&row_box);
             row_boxes.push(row_box);
         }
         *self.row_boxes.borrow_mut() = row_boxes;
-        *self.albums.borrow_mut() = albums;
+    }
+
+    /// Re-lays the covers when the column count changes (window resize or a new
+    /// cover size). Reuses the built buttons — no texture re-decode.
+    fn reflow(&self) {
+        let columns = self.columns_for_current_width();
+        if columns == self.columns.get() {
+            return;
+        }
+        if let Some(open) = self.drawer.borrow_mut().take() {
+            self.grid_box.remove(&open);
+        }
+        *self.open_album.borrow_mut() = None;
+        for button in self.buttons.borrow().iter() {
+            button.unparent();
+        }
+        while let Some(child) = self.grid_box.first_child() {
+            self.grid_box.remove(&child);
+        }
+        self.lay_out(columns);
+    }
+
+    /// How many covers fit the current viewport width (at least one).
+    fn columns_for_current_width(&self) -> usize {
+        let available = self.widget.hadjustment().page_size() as i32 - GRID_MARGIN_TOTAL;
+        let slot = self.cover_size.get() + COVER_SLOT_EXTRA;
+        (available / slot).max(1) as usize
     }
 
     /// Supplies the tracks of an album, fetched when its drawer opens.
@@ -99,26 +174,45 @@ impl AlbumGrid {
         *self.on_track_activated.borrow_mut() = Some(Rc::new(f));
     }
 
+    /// Resizes every cover in place to `size` px, then reflows since a different
+    /// cover size changes how many fit per row. No texture re-decode.
+    pub fn set_cover_size(&self, size: i32) {
+        self.cover_size.set(size);
+        for (image, cell) in self.covers.borrow().iter() {
+            image.set_pixel_size(size);
+            cell.set_width_request(size);
+        }
+        self.reflow();
+    }
+
     fn cover_button(&self, index: usize, summary: &AlbumSummary) -> Button {
-        let picture = Picture::new();
-        picture.set_size_request(160, 160);
-        picture.set_content_fit(ContentFit::Cover);
-        picture.set_paintable(cover_paintable(summary).as_ref());
+        let size = self.cover_size.get();
+
+        // GtkImage renders at a fixed pixel size; GtkPicture instead grows to the
+        // texture's natural size (the covers-too-big bug), since size_request only
+        // sets a minimum.
+        let image = Image::new();
+        image.set_pixel_size(size);
+        image.set_halign(Align::Center);
+        image.set_paintable(cover_paintable(summary).as_ref());
 
         let album_label = Label::new(Some(summary.album.as_str()));
         album_label.set_xalign(0.0);
-        album_label.set_max_width_chars(20);
+        album_label.set_max_width_chars(16);
         album_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         album_label.add_css_class("heading");
 
         let artist_label = Label::new(Some(summary.artist.as_str()));
         artist_label.set_xalign(0.0);
-        artist_label.set_max_width_chars(20);
+        artist_label.set_max_width_chars(16);
         artist_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         artist_label.add_css_class("dim-label");
 
         let cell = GtkBox::new(Orientation::Vertical, 4);
-        cell.append(&picture);
+        // Pin the cell to the cover width so labels ellipsize instead of widening it.
+        cell.set_width_request(size);
+        cell.set_halign(Align::Start);
+        cell.append(&image);
         cell.append(&album_label);
         cell.append(&artist_label);
 
@@ -128,6 +222,8 @@ impl AlbumGrid {
 
         let this = self.clone();
         button.connect_clicked(move |_| this.toggle_drawer(index));
+
+        self.covers.borrow_mut().push((image, cell));
         button
     }
 
@@ -154,7 +250,7 @@ impl AlbumGrid {
         };
 
         let row_boxes = self.row_boxes.borrow();
-        let Some(row_box) = row_boxes.get(index / COLUMNS) else {
+        let Some(row_box) = row_boxes.get(index / self.columns.get()) else {
             return;
         };
         self.grid_box.insert_child_after(&drawer, Some(row_box));
