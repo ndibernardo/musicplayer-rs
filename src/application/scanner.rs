@@ -53,8 +53,13 @@ fn collect_audio_files(dir: &Path) -> Result<Vec<PathBuf>, ScanError> {
     let mut files = vec![];
     for entry in entries.flatten() {
         let path = entry.path();
+        // Never recurse through symlinks: a link pointing back up the tree
+        // would otherwise make the walk cycle forever.
+        let is_symlink = entry.file_type().is_ok_and(|ft| ft.is_symlink());
         if path.is_dir() {
-            files.extend(collect_audio_files(&path)?);
+            if !is_symlink {
+                files.extend(collect_audio_files(&path)?);
+            }
         } else if is_audio_file(&path) {
             files.push(path);
         }
@@ -214,6 +219,20 @@ mod tests {
 
         assert_eq!(count, 1);
         assert_eq!(lib.count(), 1);
+    }
+
+    #[test]
+    fn scan_folder_skips_symlinked_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("track.flac"));
+        // A symlink back to the folder itself recurses forever if followed.
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+
+        let lib = InMemoryLibrary::new();
+        let folder = LibraryFolder::new(dir.path()).unwrap();
+        let count = scan_folder(&folder, &lib, |p| Some(fake_track(p))).unwrap();
+
+        assert_eq!(count, 1);
     }
 
     #[test]
