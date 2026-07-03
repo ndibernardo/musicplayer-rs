@@ -31,8 +31,12 @@ pub struct PlayerBar {
 impl PlayerBar {
     /// `initial_volume` is a 0–100 percentage restored from settings.
     pub fn new(player: PlayerHandle, initial_volume: f64) -> Self {
+        let prev_btn = Button::from_icon_name("media-skip-backward-symbolic");
+        prev_btn.set_tooltip_text(Some("Previous track"));
         let play_pause_btn = Button::from_icon_name("media-playback-start-symbolic");
         let stop_btn = Button::from_icon_name("media-playback-stop-symbolic");
+        let next_btn = Button::from_icon_name("media-skip-forward-symbolic");
+        next_btn.set_tooltip_text(Some("Next track"));
 
         let track_label = Label::new(None);
         track_label.set_hexpand(true);
@@ -54,8 +58,10 @@ impl PlayerBar {
         controls.set_margin_start(8);
         controls.set_margin_end(8);
         controls.set_valign(gtk4::Align::Center);
+        controls.append(&prev_btn);
         controls.append(&play_pause_btn);
         controls.append(&stop_btn);
+        controls.append(&next_btn);
 
         let info = GtkBox::new(Orientation::Horizontal, 8);
         info.set_hexpand(true);
@@ -94,6 +100,14 @@ impl PlayerBar {
         {
             let player = player.clone();
             stop_btn.connect_clicked(move |_| player.send(PlayerCommand::Stop));
+        }
+        {
+            let player = player.clone();
+            prev_btn.connect_clicked(move |_| player.send(PlayerCommand::Previous));
+        }
+        {
+            let player = player.clone();
+            next_btn.connect_clicked(move |_| player.send(PlayerCommand::Next));
         }
         {
             let player = player.clone();

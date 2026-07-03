@@ -38,7 +38,9 @@ const GRID_MARGIN_TOTAL: i32 = 12;
 const DEFAULT_COVER_SIZE: i32 = 200;
 
 type TrackProvider = Rc<dyn Fn(&AlbumSummary) -> Vec<Track>>;
-type TrackCallback = Rc<dyn Fn(Track)>;
+/// Invoked with the album's full track list and the index of the activated one,
+/// so the caller can enqueue the whole album starting at that track.
+type TrackCallback = Rc<dyn Fn(Vec<Track>, usize)>;
 
 /// Album-art browser: a grid of cover cells. Activating a cover opens a
 /// full-width drawer with that album's full track list, inline on its own row
@@ -170,7 +172,8 @@ impl AlbumGrid {
     }
 
     /// Registers the callback invoked when a track inside a drawer is activated.
-    pub fn connect_track_activated<F: Fn(Track) + 'static>(&self, f: F) {
+    /// It receives the album's full track list and the activated track's index.
+    pub fn connect_track_activated<F: Fn(Vec<Track>, usize) + 'static>(&self, f: F) {
         *self.on_track_activated.borrow_mut() = Some(Rc::new(f));
     }
 
@@ -286,8 +289,9 @@ fn build_drawer(
     }
     if let Some(callback) = on_track {
         list.connect_row_activated(move |_, row| {
-            if let Some(track) = tracks.get(row.index() as usize) {
-                callback(track.clone());
+            let index = row.index() as usize;
+            if index < tracks.len() {
+                callback(tracks.clone(), index);
             }
         });
     }

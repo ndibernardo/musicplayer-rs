@@ -319,23 +319,33 @@ pub fn build(
         });
     }
 
-    // Double-clicking a track inside an album drawer plays it.
+    // Double-clicking a track inside an album drawer plays the album from there.
     {
         let player = player.clone();
         let player_bar = player_bar.clone();
-        album_grid.connect_track_activated(move |track| {
-            player_bar.set_track(&track);
-            player.send(PlayerCommand::Play(track));
+        album_grid.connect_track_activated(move |tracks, index| {
+            if let Some(track) = tracks.get(index) {
+                player_bar.set_track(track);
+            }
+            player.send(PlayerCommand::PlayQueue {
+                tracks,
+                start: index,
+            });
         });
     }
 
-    // Double-clicking a track plays it.
+    // Double-clicking a track plays the visible list from that track.
     {
         let player = player.clone();
         let player_bar = player_bar.clone();
-        library_view.connect_track_activated(move |track| {
-            player_bar.set_track(&track);
-            player.send(PlayerCommand::Play(track));
+        library_view.connect_track_activated(move |tracks, index| {
+            if let Some(track) = tracks.get(index) {
+                player_bar.set_track(track);
+            }
+            player.send(PlayerCommand::PlayQueue {
+                tracks,
+                start: index,
+            });
         });
     }
 

@@ -69,17 +69,22 @@ impl LibraryView {
         }
     }
 
-    /// Calls `f` with the activated `Track` whenever the user double-clicks a row.
-    pub fn connect_track_activated<F: Fn(Track) + 'static>(&self, f: F) {
+    /// Calls `f` with the full visible track list and the index of the
+    /// double-clicked row, so the caller can enqueue the list from that track.
+    pub fn connect_track_activated<F: Fn(Vec<Track>, usize) + 'static>(&self, f: F) {
         let store = self.store.clone();
         self.column_view.connect_activate(move |_, position| {
-            let Some(obj) = store.item(position).and_downcast::<BoxedAnyObject>() else {
-                return;
-            };
-            let track = obj.borrow::<Track>().clone();
-            f(track);
+            f(collect_tracks(&store), position as usize);
         });
     }
+}
+
+/// Snapshots the store's tracks in display order.
+fn collect_tracks(store: &ListStore) -> Vec<Track> {
+    (0..store.n_items())
+        .filter_map(|i| store.item(i).and_downcast::<BoxedAnyObject>())
+        .map(|obj| obj.borrow::<Track>().clone())
+        .collect()
 }
 
 fn text_column<F>(title: &str, extract: F) -> ColumnViewColumn
