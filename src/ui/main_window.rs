@@ -7,6 +7,7 @@ use gtk4::Application;
 use gtk4::ApplicationWindow;
 use gtk4::Box as GtkBox;
 use gtk4::Button;
+use gtk4::Expander;
 use gtk4::FileDialog;
 use gtk4::HeaderBar;
 use gtk4::Label;
@@ -19,12 +20,14 @@ use gtk4::prelude::*;
 
 use crate::library::db::Db;
 use crate::library::db::LibraryFolder;
+use crate::library::query::tracks_for;
 use crate::library::scan::spawn_scan;
 use crate::player::PlaybackState;
 use crate::player::PlayerCommand;
 use crate::player::PlayerHandle;
 use crate::ui::library_view::LibraryView;
 use crate::ui::player_bar::PlayerBar;
+use crate::ui::sidebar::Sidebar;
 
 pub fn build(
     app: &Application,
@@ -53,13 +56,20 @@ pub fn build(
     status_label.set_margin_top(4);
     status_label.set_margin_bottom(4);
 
+    let filter_sidebar = Sidebar::new();
+
+    let folders_scrolled = ScrolledWindow::new();
+    folders_scrolled.set_min_content_height(120);
+    folders_scrolled.set_child(Some(&folder_list));
+
+    let folders_expander = Expander::new(Some("Watched Folders"));
+    folders_expander.set_margin_start(4);
+    folders_expander.set_child(Some(&folders_scrolled));
+
     let sidebar = GtkBox::new(Orientation::Vertical, 0);
     sidebar.set_width_request(220);
-
-    let scrolled = ScrolledWindow::new();
-    scrolled.set_vexpand(true);
-    scrolled.set_child(Some(&folder_list));
-    sidebar.append(&scrolled);
+    sidebar.append(&filter_sidebar.widget);
+    sidebar.append(&folders_expander);
     sidebar.append(&status_label);
 
     let library_view = LibraryView::new();
@@ -92,9 +102,20 @@ pub fn build(
     window.set_titlebar(Some(&header));
 
     refresh_folder_list(&folder_list, &db);
+    refresh_sidebar(&filter_sidebar, &db);
 
     if let Ok(tracks) = db.list_tracks() {
         library_view.set_tracks(tracks);
+    }
+
+    // Sidebar selection → filter the track list
+    {
+        let db = Rc::clone(&db);
+        let library_view = library_view.clone();
+        filter_sidebar.connect_filter_selected(move |filter| match tracks_for(&filter, &db) {
+            Ok(tracks) => library_view.set_tracks(tracks),
+            Err(e) => eprintln!("Filter query failed: {e}"),
+        });
     }
 
     // Double-click on a track → play it
@@ -140,6 +161,7 @@ pub fn build(
         let db = Rc::clone(&db);
         let library_view = library_view.clone();
         let status_label = status_label.clone();
+        let filter_sidebar = filter_sidebar.clone();
         scan_btn.connect_clicked(move |_| {
             let folders = match db.list_folders() {
                 Ok(folders) => folders,
@@ -155,6 +177,7 @@ pub fn build(
             let db = Rc::clone(&db);
             let library_view = library_view.clone();
             let status_label = status_label.clone();
+            let filter_sidebar = filter_sidebar.clone();
             // Timeout, not idle: an idle callback returning Continue runs every
             // main-loop iteration and pins a core for the whole scan.
             glib::timeout_add_local(Duration::from_millis(100), move || match rx.try_recv() {
@@ -163,6 +186,7 @@ pub fn build(
                     if let Ok(tracks) = db.list_tracks() {
                         library_view.set_tracks(tracks);
                     }
+                    refresh_sidebar(&filter_sidebar, &db);
                     glib::ControlFlow::Break
                 }
                 Ok(Err(e)) => {
@@ -187,6 +211,13 @@ pub fn build(
     }
 
     window
+}
+
+fn refresh_sidebar(sidebar: &Sidebar, db: &Rc<Db>) {
+    let genres = db.distinct_genres().unwrap_or_default();
+    let artists = db.distinct_artists().unwrap_or_default();
+    let albums = db.distinct_albums().unwrap_or_default();
+    sidebar.populate(genres, artists, albums);
 }
 
 fn refresh_folder_list(list: &ListBox, db: &Rc<Db>) {
