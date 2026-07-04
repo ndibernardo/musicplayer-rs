@@ -9,9 +9,11 @@ use gtk4::Application;
 use gtk4::ApplicationWindow;
 use gtk4::Box as GtkBox;
 use gtk4::Button;
+use gtk4::DropDown;
 use gtk4::Expander;
 use gtk4::FileDialog;
 use gtk4::HeaderBar;
+use gtk4::Image;
 use gtk4::Label;
 use gtk4::ListBox;
 use gtk4::ListBoxRow;
@@ -25,6 +27,9 @@ use gtk4::Stack;
 use gtk4::ToggleButton;
 use gtk4::prelude::*;
 
+use crate::library::album::AlbumSort;
+use crate::library::album::AlbumSortField;
+use crate::library::album::SortDirection;
 use crate::library::db::Db;
 use crate::library::db::LibraryFolder;
 use crate::library::query::LibraryFilter;
@@ -59,6 +64,19 @@ const QUEUE_KEY: &str = "queue";
 const QUEUE_CURRENT_KEY: &str = "queue_current";
 /// Settings key for the persisted playback position (milliseconds).
 const QUEUE_POSITION_KEY: &str = "queue_position";
+/// Settings keys for the persisted album-grid sort field and direction.
+const ALBUM_SORT_FIELD_KEY: &str = "album_sort_field";
+const ALBUM_SORT_DIR_KEY: &str = "album_sort_dir";
+
+/// The album-grid sort fields in dropdown order.
+const SORT_FIELDS: [AlbumSortField; 4] = [
+    AlbumSortField::AlbumArtist,
+    AlbumSortField::Year,
+    AlbumSortField::Genre,
+    AlbumSortField::Album,
+];
+/// Human labels for `SORT_FIELDS`, in the same order.
+const SORT_FIELD_LABELS: [&str; 4] = ["Album Artist", "Year", "Genre", "Album"];
 
 /// Album-cover size slider bounds (px).
 const COVER_SIZE_MIN: f64 = 200.0;
@@ -81,7 +99,25 @@ pub fn build(
     scan_btn.set_tooltip_text(Some("Scan library"));
     header.pack_start(&scan_btn);
 
-    // Album-art size slider, shown beside the view toggles only in grid view.
+    // Sort controls (a sort icon, the field, and the direction), shown to the
+    // left of the view toggles and only in grid view.
+    let sort_icon = Image::from_icon_name("view-sort-descending-symbolic");
+
+    let sort_field = DropDown::from_strings(&SORT_FIELD_LABELS);
+    sort_field.set_tooltip_text(Some("Sort albums by"));
+    sort_field.set_valign(gtk4::Align::Center);
+
+    let sort_dir = ToggleButton::new();
+    sort_dir.set_tooltip_text(Some("Sort direction"));
+    sort_dir.set_valign(gtk4::Align::Center);
+
+    let sort_controls = GtkBox::new(Orientation::Horizontal, 6);
+    sort_controls.set_valign(gtk4::Align::Center);
+    sort_controls.append(&sort_icon);
+    sort_controls.append(&sort_field);
+    sort_controls.append(&sort_dir);
+
+    // Album-art size slider, shown to the right of the toggles, grid view only.
     let size_scale = Scale::with_range(
         Orientation::Horizontal,
         COVER_SIZE_MIN,
@@ -103,10 +139,21 @@ pub fn build(
     grid_toggle.set_tooltip_text(Some("Album grid"));
     // One linked group: activating one visually releases the other.
     grid_toggle.set_group(Some(&list_toggle));
-    // Packed end-first, so left to right this reads: list, grid, slider.
+    // Packed end-first, so left to right this reads: sort controls, list, grid, slider.
     header.pack_end(&size_scale);
     header.pack_end(&grid_toggle);
     header.pack_end(&list_toggle);
+    header.pack_end(&sort_controls);
+
+    // Shows or hides both grid-only control groups together.
+    let toggle_grid_controls: Rc<dyn Fn(bool)> = {
+        let sort_controls = sort_controls.clone();
+        let size_scale = size_scale.clone();
+        Rc::new(move |visible| {
+            sort_controls.set_visible(visible);
+            size_scale.set_visible(visible);
+        })
+    };
 
     let folder_list = ListBox::new();
     folder_list.set_selection_mode(gtk4::SelectionMode::None);
@@ -147,6 +194,9 @@ pub fn build(
     // The album grid mirrors the active sidebar filter (all albums when unfiltered).
     let current_filter = Rc::new(RefCell::new(LibraryFilter::All));
 
+    // The album grid's current sort, restored from the previous session.
+    let current_sort = Rc::new(RefCell::new(load_album_sort(&db)));
+
     // The tracks currently in the play queue, mirrored to the sidebar queue view.
     let current_queue: Rc<RefCell<Vec<Track>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -160,25 +210,25 @@ pub fn build(
     {
         let content = content.clone();
         let db = Rc::clone(&db);
-        let size_scale = size_scale.clone();
+        let toggle_grid_controls = Rc::clone(&toggle_grid_controls);
         list_toggle.connect_toggled(move |btn| {
             if btn.is_active() {
                 content.set_visible_child_name(ViewMode::List.child_name());
                 save_view_mode(&db, ViewMode::List);
-                // The cover-size slider is only meaningful for the album grid.
-                size_scale.set_visible(false);
+                // The sort and cover-size controls are only meaningful in grid view.
+                toggle_grid_controls(false);
             }
         });
     }
     {
         let content = content.clone();
         let db = Rc::clone(&db);
-        let size_scale = size_scale.clone();
+        let toggle_grid_controls = Rc::clone(&toggle_grid_controls);
         grid_toggle.connect_toggled(move |btn| {
             if btn.is_active() {
                 content.set_visible_child_name(ViewMode::Grid.child_name());
                 save_view_mode(&db, ViewMode::Grid);
-                size_scale.set_visible(true);
+                toggle_grid_controls(true);
             }
         });
     }
@@ -191,7 +241,7 @@ pub fn build(
             ViewMode::Grid => grid_toggle.set_active(true),
         }
         content.set_visible_child_name(mode.child_name());
-        size_scale.set_visible(matches!(mode, ViewMode::Grid));
+        toggle_grid_controls(matches!(mode, ViewMode::Grid));
     }
 
     // A scanning spinner + count, centred over the content while a scan runs.
@@ -283,6 +333,45 @@ pub fn build(
         });
     }
 
+    // Show the restored sort in the header controls, then wire changes to re-sort
+    // the grid and persist. State is set before connecting so it doesn't re-fire.
+    {
+        let sort = *current_sort.borrow();
+        sort_field.set_selected(sort_field_index(sort.field));
+        sort_dir.set_active(matches!(sort.direction, SortDirection::Descending));
+        sort_dir.set_icon_name(direction_icon(sort.direction));
+    }
+    {
+        let album_grid = album_grid.clone();
+        let db = Rc::clone(&db);
+        let current_filter = Rc::clone(&current_filter);
+        let current_sort = Rc::clone(&current_sort);
+        sort_field.connect_selected_notify(move |dropdown| {
+            current_sort.borrow_mut().field = sort_field_at(dropdown.selected());
+            let sort = *current_sort.borrow();
+            save_album_sort(&db, sort);
+            refresh_album_grid(&album_grid, &db, &current_filter.borrow(), sort);
+        });
+    }
+    {
+        let album_grid = album_grid.clone();
+        let db = Rc::clone(&db);
+        let current_filter = Rc::clone(&current_filter);
+        let current_sort = Rc::clone(&current_sort);
+        sort_dir.connect_toggled(move |btn| {
+            let direction = if btn.is_active() {
+                SortDirection::Descending
+            } else {
+                SortDirection::Ascending
+            };
+            current_sort.borrow_mut().direction = direction;
+            btn.set_icon_name(direction_icon(direction));
+            let sort = *current_sort.borrow();
+            save_album_sort(&db, sort);
+            refresh_album_grid(&album_grid, &db, &current_filter.borrow(), sort);
+        });
+    }
+
     // Reloads the tracks/sidebar/grid after the library changes (e.g. a folder
     // and its tracks were removed), keeping the active filter applied.
     let refresh_views: Rc<dyn Fn()> = {
@@ -291,6 +380,7 @@ pub fn build(
         let album_grid = album_grid.clone();
         let filter_sidebar = filter_sidebar.clone();
         let current_filter = Rc::clone(&current_filter);
+        let current_sort = Rc::clone(&current_sort);
         Rc::new(move || {
             let filter = current_filter.borrow();
             match tracks_for(&filter, &db) {
@@ -298,7 +388,7 @@ pub fn build(
                 Err(e) => eprintln!("Reload after library change failed: {e}"),
             }
             refresh_sidebar(&filter_sidebar, &db);
-            refresh_album_grid(&album_grid, &db, &filter);
+            refresh_album_grid(&album_grid, &db, &filter, *current_sort.borrow());
         })
     };
 
@@ -336,7 +426,12 @@ pub fn build(
 
     refresh_folder_list(&folder_list, &db, &on_folders_changed);
     refresh_sidebar(&filter_sidebar, &db);
-    refresh_album_grid(&album_grid, &db, &current_filter.borrow());
+    refresh_album_grid(
+        &album_grid,
+        &db,
+        &current_filter.borrow(),
+        *current_sort.borrow(),
+    );
     rewatch();
 
     if let Ok(tracks) = db.list_tracks() {
@@ -373,13 +468,14 @@ pub fn build(
         let library_view = library_view.clone();
         let album_grid = album_grid.clone();
         let current_filter = Rc::clone(&current_filter);
+        let current_sort = Rc::clone(&current_sort);
         filter_sidebar.connect_filter_selected(move |filter| {
             *current_filter.borrow_mut() = filter.clone();
             match tracks_for(&filter, &db) {
                 Ok(tracks) => library_view.set_tracks(tracks),
                 Err(e) => eprintln!("Filter query failed: {e}"),
             }
-            refresh_album_grid(&album_grid, &db, &filter);
+            refresh_album_grid(&album_grid, &db, &filter, *current_sort.borrow());
         });
     }
 
@@ -440,6 +536,7 @@ pub fn build(
         let status_label = status_label.clone();
         let filter_sidebar = filter_sidebar.clone();
         let current_filter = Rc::clone(&current_filter);
+        let current_sort = Rc::clone(&current_sort);
         let scan_spinner = scan_spinner.clone();
         let scan_status = scan_status.clone();
         let scan_indicator = scan_indicator.clone();
@@ -467,6 +564,7 @@ pub fn build(
             let status_label = status_label.clone();
             let filter_sidebar = filter_sidebar.clone();
             let current_filter = Rc::clone(&current_filter);
+            let current_sort = Rc::clone(&current_sort);
             let scan_spinner = scan_spinner.clone();
             let scan_status = scan_status.clone();
             let scan_indicator = scan_indicator.clone();
@@ -492,7 +590,12 @@ pub fn build(
                                 library_view.set_tracks(tracks);
                             }
                             refresh_sidebar(&filter_sidebar, &db);
-                            refresh_album_grid(&album_grid, &db, &current_filter.borrow());
+                            refresh_album_grid(
+                                &album_grid,
+                                &db,
+                                &current_filter.borrow(),
+                                *current_sort.borrow(),
+                            );
                             return glib::ControlFlow::Break;
                         }
                         Ok(ScanEvent::Finished(Err(e))) => {
@@ -626,8 +729,8 @@ fn refresh_sidebar(sidebar: &Sidebar, db: &Rc<Db>) {
     sidebar.populate(genres, artists);
 }
 
-fn refresh_album_grid(grid: &AlbumGrid, db: &Rc<Db>, filter: &LibraryFilter) {
-    grid.set_albums(album_summaries_for(filter, db).unwrap_or_default());
+fn refresh_album_grid(grid: &AlbumGrid, db: &Rc<Db>, filter: &LibraryFilter, sort: AlbumSort) {
+    grid.set_albums(album_summaries_for(filter, &sort, db).unwrap_or_default());
 }
 
 /// Persists a setting; a failed write is non-fatal (logged only).
@@ -711,6 +814,50 @@ fn load_current(db: &Rc<Db>) -> Option<i64> {
         .ok()
         .flatten()
         .and_then(|s| s.parse::<i64>().ok())
+}
+
+/// Persists the album-grid sort field and direction.
+fn save_album_sort(db: &Rc<Db>, sort: AlbumSort) {
+    save_setting(db, ALBUM_SORT_FIELD_KEY, sort.field.as_key());
+    save_setting(db, ALBUM_SORT_DIR_KEY, sort.direction.as_key());
+}
+
+/// Loads the persisted album-grid sort, defaulting to album artist ascending.
+fn load_album_sort(db: &Rc<Db>) -> AlbumSort {
+    let field = db
+        .get_setting(ALBUM_SORT_FIELD_KEY)
+        .ok()
+        .flatten()
+        .and_then(|k| AlbumSortField::from_key(&k))
+        .unwrap_or(AlbumSortField::AlbumArtist);
+    let direction = db
+        .get_setting(ALBUM_SORT_DIR_KEY)
+        .ok()
+        .flatten()
+        .and_then(|k| SortDirection::from_key(&k))
+        .unwrap_or(SortDirection::Ascending);
+    AlbumSort::new(field, direction)
+}
+
+/// The dropdown position of `field`.
+fn sort_field_index(field: AlbumSortField) -> u32 {
+    SORT_FIELDS.iter().position(|f| *f == field).unwrap_or(0) as u32
+}
+
+/// The sort field at dropdown position `index`.
+fn sort_field_at(index: u32) -> AlbumSortField {
+    SORT_FIELDS
+        .get(index as usize)
+        .copied()
+        .unwrap_or(AlbumSortField::AlbumArtist)
+}
+
+/// The icon name for a sort direction.
+fn direction_icon(direction: SortDirection) -> &'static str {
+    match direction {
+        SortDirection::Ascending => "view-sort-ascending-symbolic",
+        SortDirection::Descending => "view-sort-descending-symbolic",
+    }
 }
 
 /// Loads the persisted volume (0–100), defaulting to 70 when unset or invalid.
