@@ -44,24 +44,33 @@ pub fn scan_folder(
 
 /// Like [`scan_folder`], but invokes `on_progress` with the running indexed count
 /// after each file, so a caller can report scan progress live.
+///
+/// Upserts are batched into transactions of up to `BATCH_SIZE` files. One WAL
+/// commit per batch is orders of magnitude faster than one per file for large
+/// libraries while still calling `on_progress` after every individual file.
 pub fn scan_folder_with_progress(
     folder: &LibraryFolder,
     db: &Db,
     read_track: impl Fn(&TrackPath) -> Option<Track>,
     mut on_progress: impl FnMut(u32),
 ) -> Result<u32, ScanError> {
+    const BATCH_SIZE: usize = 200;
     let files = collect_audio_files(folder.as_path())?;
     let mut count = 0u32;
 
-    for path in files {
-        let Ok(track_path) = TrackPath::new(&path) else {
-            continue;
-        };
-        if let Some(track) = read_track(&track_path) {
-            db.upsert_track(&track)?;
-            count += 1;
-            on_progress(count);
+    for chunk in files.chunks(BATCH_SIZE) {
+        let tx = db.conn.unchecked_transaction().map_err(DbError::from)?;
+        for path in chunk {
+            let Ok(track_path) = TrackPath::new(path) else {
+                continue;
+            };
+            if let Some(track) = read_track(&track_path) {
+                Db::upsert_one(&tx, &track)?;
+                count += 1;
+                on_progress(count);
+            }
         }
+        tx.commit().map_err(DbError::from)?;
     }
 
     Ok(count)

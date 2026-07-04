@@ -190,7 +190,7 @@ impl PlayerHandle {
         let (command_tx, command_rx) = mpsc::channel();
         std::thread::spawn(move || match make_backend() {
             Ok(mut backend) => player_loop(&mut backend, command_rx, on_state),
-            Err(e) => eprintln!("audio backend init failed: {e}"),
+            Err(e) => tracing::error!("audio backend init failed: {e}"),
         });
         Self { command_tx }
     }
@@ -208,7 +208,7 @@ fn play_track<B: AudioBackend, F: Fn(PlaybackState)>(backend: &mut B, track: &Tr
             track: track.id,
             position: SeekPosition::zero(),
         }),
-        Err(e) => eprintln!("playback error: {e}"),
+        Err(e) => tracing::error!("playback error: {e}"),
     }
 }
 
@@ -252,7 +252,7 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                             track: track.id,
                             position,
                         }),
-                        Err(e) => eprintln!("restore error: {e}"),
+                        Err(e) => tracing::error!("restore error: {e}"),
                     }
                 }
             }

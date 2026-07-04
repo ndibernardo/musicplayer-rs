@@ -423,7 +423,7 @@ pub fn build(
             let filter = current_filter.borrow();
             match tracks_for(&filter, &db) {
                 Ok(tracks) => library_view.set_tracks(tracks),
-                Err(e) => eprintln!("Reload after library change failed: {e}"),
+                Err(e) => tracing::error!("Reload after library change failed: {e}"),
             }
             refresh_sidebar(&filter_sidebar, &db);
             refresh_album_grid(&album_grid, &db, &filter, *current_sort.borrow());
@@ -447,7 +447,7 @@ pub fn build(
             }
             match watch_folders(&folders, watch_tx.clone()) {
                 Ok(watcher) => *folder_watcher.borrow_mut() = Some(watcher),
-                Err(e) => eprintln!("Failed to watch folders: {e}"),
+                Err(e) => tracing::error!("Failed to watch folders: {e}"),
             }
         })
     };
@@ -511,7 +511,7 @@ pub fn build(
             *current_filter.borrow_mut() = filter.clone();
             match tracks_for(&filter, &db) {
                 Ok(tracks) => library_view.set_tracks(tracks),
-                Err(e) => eprintln!("Filter query failed: {e}"),
+                Err(e) => tracing::error!("Filter query failed: {e}"),
             }
             refresh_album_grid(&album_grid, &db, &filter, *current_sort.borrow());
         });
@@ -522,7 +522,7 @@ pub fn build(
         let db = Rc::clone(&db);
         album_grid.set_track_provider(move |summary| {
             db.tracks_by_album(&summary.album).unwrap_or_else(|e| {
-                eprintln!("Album query failed: {e}");
+                tracing::error!("Album query failed: {e}");
                 Vec::new()
             })
         });
@@ -684,7 +684,7 @@ pub fn build(
                     return;
                 };
                 if let Err(e) = db.add_folder(&folder) {
-                    eprintln!("Failed to add folder: {e}");
+                    tracing::error!("Failed to add folder: {e}");
                     return;
                 }
                 refresh_folder_list(&folder_list, &db, &on_folders_changed);
@@ -787,7 +787,7 @@ fn refresh_album_grid(grid: &AlbumGrid, db: &Rc<Db>, filter: &LibraryFilter, sor
 /// Persists a setting; a failed write is non-fatal (logged only).
 fn save_setting(db: &Rc<Db>, key: &str, value: &str) {
     if let Err(e) = db.set_setting(key, value) {
-        eprintln!("Failed to save setting {key}: {e}");
+        tracing::error!("Failed to save setting {key}: {e}");
     }
 }
 
@@ -847,16 +847,21 @@ fn load_position(db: &Rc<Db>) -> SeekPosition {
         .unwrap_or_else(SeekPosition::zero)
 }
 
-/// Rebuilds the persisted queue from its stored track ids, skipping any ids no
-/// longer present in the library.
+/// Rebuilds the persisted queue from its stored track ids in a single query,
+/// skipping any ids no longer present in the library.
 fn load_queue(db: &Rc<Db>) -> Vec<Track> {
     let Some(raw) = db.get_setting(QUEUE_KEY).ok().flatten() else {
         return Vec::new();
     };
-    raw.split(',')
+    let ids: Vec<TrackId> = raw
+        .split(',')
         .filter_map(|s| s.parse::<i64>().ok())
-        .filter_map(|id| db.track_by_id(TrackId::new(id)).ok().flatten())
-        .collect()
+        .map(TrackId::new)
+        .collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    db.tracks_by_ids(&ids).unwrap_or_default()
 }
 
 /// Loads the persisted current track id, or `None` when unset or invalid.
@@ -958,7 +963,7 @@ fn folder_row(
     let on_change = Rc::clone(on_change);
     remove_btn.connect_clicked(move |_| {
         if let Err(e) = db.remove_folder(&folder) {
-            eprintln!("Failed to remove folder: {e}");
+            tracing::error!("Failed to remove folder: {e}");
             return;
         }
         refresh_folder_list(&list, &db, &on_change);

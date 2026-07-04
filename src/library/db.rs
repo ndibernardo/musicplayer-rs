@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -180,8 +181,15 @@ pub struct Db {
 impl Db {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
-        // WAL allows a background writer and the UI reader to proceed without blocking each other.
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // WAL: concurrent UI reader + background scan writer without blocking.
+        // busy_timeout: wait up to 5 s instead of returning SQLITE_BUSY immediately
+        // when a second writer (e.g. settings save during a scan) contends.
+        // synchronous=NORMAL: safe with WAL and eliminates per-commit fsyncs.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA busy_timeout=5000;
+             PRAGMA synchronous=NORMAL;",
+        )?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -189,6 +197,8 @@ impl Db {
 
     pub fn open_in_memory() -> Result<Self, DbError> {
         let conn = Connection::open_in_memory()?;
+        // busy_timeout matches open() so tests exercise the same configuration.
+        conn.execute_batch("PRAGMA busy_timeout=5000;")?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -196,17 +206,44 @@ impl Db {
 
     fn migrate(&self) -> Result<(), DbError> {
         self.conn.execute_batch(SCHEMA)?;
+        // Column migrations must run before index creation: indexes referencing
+        // columns that don't exist yet would fail on a legacy database.
         self.add_missing_track_columns()?;
+        self.ensure_indexes()?;
         Ok(())
     }
 
-    /// Adds columns introduced after the original schema to `tracks` when a
-    /// database created by an earlier version lacks them. `CREATE TABLE IF NOT
-    /// EXISTS` never alters an existing table, so extra columns need an explicit
-    /// `ALTER TABLE` guarded by the current column set.
+    /// Creates the three query indexes idempotently. Runs after all column
+    /// migrations so every referenced column is guaranteed to exist.
+    fn ensure_indexes(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist, album, track_number);
+             CREATE INDEX IF NOT EXISTS idx_tracks_album  ON tracks(album, disc_number, track_number);
+             CREATE INDEX IF NOT EXISTS idx_tracks_genre  ON tracks(genre);",
+        )?;
+        Ok(())
+    }
+
+    /// Ensures every optional column exists in `tracks`. `CREATE TABLE IF NOT
+    /// EXISTS` never alters an existing table, so columns added after the initial
+    /// creation need an explicit `ALTER TABLE` guarded by the current column set.
+    /// Checking all optional columns (not just the most recently added ones) keeps
+    /// migration correct for databases created by very old versions.
     fn add_missing_track_columns(&self) -> Result<(), DbError> {
         let existing = self.track_columns()?;
-        for (name, decl) in [("album_artist", "TEXT"), ("composer", "TEXT")] {
+        for (name, decl) in [
+            ("title",        "TEXT"),
+            ("artist",       "TEXT"),
+            ("album",        "TEXT"),
+            ("genre",        "TEXT"),
+            ("duration_ms",  "INTEGER"),
+            ("track_number", "INTEGER"),
+            ("disc_number",  "INTEGER"),
+            ("year",         "INTEGER"),
+            ("art",          "BLOB"),
+            ("album_artist", "TEXT"),
+            ("composer",     "TEXT"),
+        ] {
             if !existing.iter().any(|c| c == name) {
                 self.conn
                     .execute(&format!("ALTER TABLE tracks ADD COLUMN {name} {decl}"), [])?;
@@ -249,8 +286,11 @@ impl Db {
         Ok(())
     }
 
-    /// Inserts or updates a track keyed on its path. Returns the assigned track_id.
-    pub fn upsert_track(&self, track: &Track) -> Result<TrackId, DbError> {
+    /// Upserts `track` via `conn` (which may be a `Transaction` deref'd to
+    /// `Connection`) and returns the assigned `track_id`. Uses `prepare_cached`
+    /// so the statement is compiled once and reused on subsequent calls with the
+    /// same connection.
+    pub(crate) fn upsert_one(conn: &Connection, track: &Track) -> Result<TrackId, DbError> {
         let path = track.path.as_path().to_string_lossy();
         let title = (!track.title.is_unknown()).then(|| track.title.as_str().to_owned());
         let artist = (!track.artist.is_unknown()).then(|| track.artist.as_str().to_owned());
@@ -269,7 +309,7 @@ impl Db {
 
         // RETURNING yields the row's id on both the insert and the update path;
         // last_insert_rowid() would be stale after ON CONFLICT DO UPDATE.
-        let id = self.conn.query_row(
+        let mut stmt = conn.prepare_cached(
             "INSERT INTO tracks (path, title, artist, album, genre, duration_ms, track_number, disc_number, year, art, album_artist, composer)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(path) DO UPDATE SET
@@ -285,6 +325,8 @@ impl Db {
                  album_artist = excluded.album_artist,
                  composer     = excluded.composer
              RETURNING track_id",
+        )?;
+        let id = stmt.query_row(
             rusqlite::params![
                 path.as_ref(),
                 title,
@@ -305,18 +347,59 @@ impl Db {
         Ok(TrackId::new(id))
     }
 
+    /// Inserts or updates a track keyed on its path. Returns the assigned track_id.
+    pub fn upsert_track(&self, track: &Track) -> Result<TrackId, DbError> {
+        Self::upsert_one(&self.conn, track)
+    }
+
+    /// Upserts all `tracks` in a single transaction. Prefer this over calling
+    /// `upsert_track` in a loop when indexing a batch of files — one commit per
+    /// batch is orders of magnitude faster than one implicit commit per file.
+    pub fn upsert_tracks(&self, tracks: &[Track]) -> Result<(), DbError> {
+        let tx = self.conn.unchecked_transaction()?;
+        for track in tracks {
+            Self::upsert_one(&tx, track)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Returns all tracks ordered by artist, then album, then track number.
     pub fn list_tracks(&self) -> Result<Vec<Track>, DbError> {
         self.query_tracks("ORDER BY artist, album, track_number", [])
     }
 
-    /// Returns the track with `id`, or `None` when no such row exists. Used to
-    /// rebuild a persisted queue from its stored track ids.
+    /// Returns the track with `id`, or `None` when no such row exists.
     pub fn track_by_id(&self, id: TrackId) -> Result<Option<Track>, DbError> {
         Ok(self
             .query_tracks("WHERE track_id = ?1", [id.value()])?
             .into_iter()
             .next())
+    }
+
+    /// Returns the tracks matching `ids` in the same order as the input slice.
+    /// IDs not present in the database are silently skipped. One query replaces
+    /// the N-query loop a caller would otherwise need.
+    pub fn tracks_by_ids(&self, ids: &[TrackId]) -> Result<Vec<Track>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let filter = format!("WHERE track_id IN ({placeholders})");
+        let params = rusqlite::params_from_iter(ids.iter().map(|id| id.value()));
+        let mut tracks = self.query_tracks(&filter, params)?;
+        // Re-order to match the caller's id sequence; the IN clause doesn't
+        // guarantee ordering relative to the parameter list.
+        let position: HashMap<i64, usize> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.value(), i))
+            .collect();
+        tracks.sort_by_key(|t| position.get(&t.id.value()).copied().unwrap_or(usize::MAX));
+        Ok(tracks)
     }
 
     /// Returns tracks whose genre equals `genre`, ordered by artist, then album, then track number.
@@ -355,7 +438,7 @@ impl Db {
                     album_artist, composer
              FROM tracks {filter_and_order}"
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(params, |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -381,7 +464,7 @@ impl Db {
     pub fn distinct_genres(&self) -> Result<Vec<Genre>, DbError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT genre FROM tracks WHERE genre IS NOT NULL ORDER BY genre")?;
+            .prepare_cached("SELECT DISTINCT genre FROM tracks WHERE genre IS NOT NULL ORDER BY genre")?;
         stmt.query_map([], |row| row.get::<_, String>(0))?
             .map(|r| r.map_err(DbError::from).map(Genre::new))
             .collect()
@@ -389,7 +472,7 @@ impl Db {
 
     /// Distinct non-empty artists present in the library, alphabetically ordered.
     pub fn distinct_artists(&self) -> Result<Vec<Artist>, DbError> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT DISTINCT artist FROM tracks WHERE artist IS NOT NULL ORDER BY artist",
         )?;
         stmt.query_map([], |row| row.get::<_, String>(0))?
@@ -401,7 +484,7 @@ impl Db {
     pub fn distinct_albums(&self) -> Result<Vec<AlbumTitle>, DbError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT DISTINCT album FROM tracks WHERE album IS NOT NULL ORDER BY album")?;
+            .prepare_cached("SELECT DISTINCT album FROM tracks WHERE album IS NOT NULL ORDER BY album")?;
         stmt.query_map([], |row| row.get::<_, String>(0))?
             .map(|r| r.map_err(DbError::from).map(AlbumTitle::new))
             .collect()
@@ -488,7 +571,7 @@ impl Db {
              GROUP BY album, album_artist
              {order_by}"
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         stmt.query_map(params, |row| {
             Ok((
                 row.get::<_, Option<String>>(0)?,
@@ -535,7 +618,7 @@ impl Db {
     pub fn list_folders(&self) -> Result<Vec<LibraryFolder>, DbError> {
         let mut stmt = self
             .conn
-            .prepare("SELECT path FROM folders ORDER BY path")?;
+            .prepare_cached("SELECT path FROM folders ORDER BY path")?;
 
         stmt.query_map([], |row| row.get::<_, String>(0))?
             .map(|res| res.map_err(DbError::from))
@@ -1359,6 +1442,60 @@ mod tests {
             db.get_setting("view_mode").unwrap(),
             Some("list".to_owned())
         );
+    }
+
+    #[test]
+    fn upsert_tracks_inserts_all_in_one_transaction() {
+        let db = Db::open_in_memory().unwrap();
+        let tracks = vec![
+            full_track("/music/boc/roygbiv.flac"),
+            full_track("/music/boc/aquarius.flac"),
+        ];
+        db.upsert_tracks(&tracks).unwrap();
+        assert_eq!(db.track_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn upsert_tracks_is_idempotent() {
+        let db = Db::open_in_memory().unwrap();
+        let tracks = vec![full_track("/music/boc/roygbiv.flac")];
+        db.upsert_tracks(&tracks).unwrap();
+        db.upsert_tracks(&tracks).unwrap();
+        assert_eq!(db.track_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn tracks_by_ids_returns_empty_for_empty_input() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.tracks_by_ids(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tracks_by_ids_skips_ids_not_in_the_library() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        let unknown = TrackId::new(9999);
+        let tracks = db.tracks_by_ids(&[id, unknown]).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].title.as_str(), "Roygbiv");
+    }
+
+    #[test]
+    fn tracks_by_ids_preserves_input_order() {
+        let db = Db::open_in_memory().unwrap();
+        let id1 = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        let id2 = db
+            .upsert_track(&full_track("/music/boc/aquarius.flac"))
+            .unwrap();
+        // Request in reverse insertion order.
+        let tracks = db.tracks_by_ids(&[id2, id1]).unwrap();
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].id, id2);
+        assert_eq!(tracks[1].id, id1);
     }
 
     #[test]

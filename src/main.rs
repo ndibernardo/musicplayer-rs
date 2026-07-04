@@ -14,11 +14,14 @@ fn run_ui() {
     use musicplayer_rs::player::rodio::RodioAudioBackend;
     use musicplayer_rs::ui;
 
+    // Reads RUST_LOG; defaults to no output when unset so users see clean startup.
+    tracing_subscriber::fmt::init();
+
     let db_path = data_dir().join("library.db");
     let db = match Db::open(&db_path) {
         Ok(db) => Rc::new(db),
         Err(e) => {
-            eprintln!("Failed to open database: {e}");
+            tracing::error!("Failed to open database: {e}");
             return;
         }
     };
