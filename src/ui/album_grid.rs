@@ -27,9 +27,9 @@ use crate::library::track::TrackDuration;
 /// columns are recomputed from the viewport width (see `reflow`).
 const DEFAULT_COLUMNS: usize = 4;
 
-/// Per-cover horizontal budget beyond the cover itself (button padding + inter-
+/// Per-cover horizontal budget beyond the cover itself (cell padding + inter-
 /// cover spacing) — used to estimate how many covers fit a given width.
-const COVER_SLOT_EXTRA: i32 = 24;
+const COVER_SLOT_EXTRA: i32 = 34;
 
 /// Combined left+right margin of the grid container (px).
 const GRID_MARGIN_TOTAL: i32 = 12;
@@ -70,7 +70,7 @@ pub struct AlbumGrid {
 
 impl AlbumGrid {
     pub fn new() -> Self {
-        let grid_box = GtkBox::new(Orientation::Vertical, 6);
+        let grid_box = GtkBox::new(Orientation::Vertical, 16);
         grid_box.set_margin_start(6);
         grid_box.set_margin_end(6);
         grid_box.set_margin_top(6);
@@ -134,7 +134,10 @@ impl AlbumGrid {
         let cells = self.cells.borrow();
         let mut row_boxes = Vec::new();
         for chunk in cells.chunks(columns) {
-            let row_box = GtkBox::new(Orientation::Horizontal, 6);
+            let row_box = GtkBox::new(Orientation::Horizontal, 16);
+            // Centre the row so the leftover width splits evenly on both sides
+            // instead of pooling on the right.
+            row_box.set_halign(Align::Center);
             for cell in chunk {
                 row_box.append(cell);
             }
@@ -216,11 +219,11 @@ impl AlbumGrid {
         album_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         album_label.add_css_class("heading");
 
+        // Full opacity (no dim-label) so the artist reads clearly under the album.
         let artist_label = Label::new(Some(summary.artist.as_str()));
         artist_label.set_xalign(0.0);
         artist_label.set_max_width_chars(16);
         artist_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        artist_label.add_css_class("dim-label");
 
         let cell = GtkBox::new(Orientation::Vertical, 4);
         cell.add_css_class("activatable");
@@ -230,6 +233,13 @@ impl AlbumGrid {
         cell.append(&image);
         cell.append(&album_label);
         cell.append(&artist_label);
+        if !summary.year.is_unknown() {
+            let year_label = Label::new(Some(&summary.year.value().to_string()));
+            year_label.set_xalign(0.0);
+            year_label.add_css_class("dim-label");
+            year_label.add_css_class("caption");
+            cell.append(&year_label);
+        }
 
         // Clicking a cover opens its track drawer without playing; the album is
         // played from the ▶ button in that drawer's header. Only the first press
