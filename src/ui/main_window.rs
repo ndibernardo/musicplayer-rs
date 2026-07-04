@@ -88,6 +88,13 @@ const APP_CSS: &str = "\
     background-color: rgba(0, 0, 0, 0.24);
     border-radius: 10px;
 }
+.album-drawer list,
+.album-drawer row {
+    background-color: transparent;
+}
+.album-drawer row:hover {
+    background-color: rgba(255, 255, 255, 0.12);
+}
 ";
 
 /// Shared application controller. All fields are ref-counted so the struct is
@@ -377,6 +384,8 @@ pub fn build(
         initial_queue_ids,
         initial_queue_current,
         initial_queue_position_ms,
+        initial_window_size,
+        initial_window_maximized,
     ) = {
         let s = Settings::new(&db);
         (
@@ -390,6 +399,8 @@ pub fn build(
             s.queue_track_ids(),
             s.queue_current_id(),
             s.queue_position_millis(),
+            s.window_size(),
+            s.window_maximized(),
         )
     };
 
@@ -524,11 +535,13 @@ pub fn build(
     root.append(&paned);
     root.append(&player_bar.widget);
 
+    let (initial_width, initial_height) = initial_window_size.unwrap_or((1200, 700));
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Music Player")
-        .default_width(1200)
-        .default_height(700)
+        .default_width(initial_width)
+        .default_height(initial_height)
+        .maximized(initial_window_maximized)
         .child(&root)
         .build();
     window.set_titlebar(Some(&header));
@@ -856,6 +869,22 @@ pub fn build(
                     mw.settings().set_queue_position_millis(millis);
                 }
             }
+        });
+    }
+
+    // Persist window geometry so the next launch reopens at the same size.
+    // `default_width`/`default_height` hold the pre-maximize size even while
+    // maximized, but the guard below is a defensive no-op either way: don't
+    // overwrite the restore size with whatever a maximized window reports.
+    {
+        let mw = mw.clone();
+        window.connect_close_request(move |window| {
+            let s = mw.settings();
+            if !window.is_maximized() {
+                s.set_window_size(window.default_width(), window.default_height());
+            }
+            s.set_window_maximized(window.is_maximized());
+            glib::Propagation::Proceed
         });
     }
 

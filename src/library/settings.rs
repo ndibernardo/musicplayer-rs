@@ -20,6 +20,10 @@ const ALBUM_SORT_DIR_KEY: &str = "album_sort_dir";
 
 pub const VIEW_MODE_KEY: &str = "view_mode";
 
+const WINDOW_WIDTH_KEY: &str = "window_width";
+const WINDOW_HEIGHT_KEY: &str = "window_height";
+const WINDOW_MAXIMIZED_KEY: &str = "window_maximized";
+
 /// A typed façade over the persisted application settings stored in `Db`.
 /// All methods return domain-appropriate defaults when the setting is absent
 /// or stored with an unrecognised value.
@@ -123,6 +127,32 @@ impl<'a> Settings<'a> {
 
     pub fn set_view_mode_name(&self, name: &str) {
         self.set(VIEW_MODE_KEY, name);
+    }
+
+    /// Persisted window size in device pixels, or `None` on first run (both
+    /// dimensions must be present and parse; a half-written pair is treated
+    /// as absent).
+    pub fn window_size(&self) -> Option<(i32, i32)> {
+        let width = self.get(WINDOW_WIDTH_KEY)?.parse::<i32>().ok()?;
+        let height = self.get(WINDOW_HEIGHT_KEY)?.parse::<i32>().ok()?;
+        Some((width, height))
+    }
+
+    pub fn set_window_size(&self, width: i32, height: i32) {
+        self.set(WINDOW_WIDTH_KEY, &width.to_string());
+        self.set(WINDOW_HEIGHT_KEY, &height.to_string());
+    }
+
+    /// Persisted maximized state. Defaults to `false` when unset.
+    pub fn window_maximized(&self) -> bool {
+        self.get(WINDOW_MAXIMIZED_KEY).as_deref() == Some("true")
+    }
+
+    pub fn set_window_maximized(&self, maximized: bool) {
+        self.set(
+            WINDOW_MAXIMIZED_KEY,
+            if maximized { "true" } else { "false" },
+        );
     }
 
     fn get(&self, key: &str) -> Option<String> {
@@ -261,5 +291,38 @@ mod tests {
         let db = fresh();
         Settings::new(&db).set_view_mode_name("grid");
         assert_eq!(Settings::new(&db).view_mode_name().as_deref(), Some("grid"));
+    }
+
+    #[test]
+    fn window_size_returns_none_when_unset() {
+        let db = fresh();
+        assert_eq!(Settings::new(&db).window_size(), None);
+    }
+
+    #[test]
+    fn window_size_round_trips() {
+        let db = fresh();
+        Settings::new(&db).set_window_size(1440, 900);
+        assert_eq!(Settings::new(&db).window_size(), Some((1440, 900)));
+    }
+
+    #[test]
+    fn window_size_is_none_when_only_width_is_set() {
+        let db = fresh();
+        db.set_setting(WINDOW_WIDTH_KEY, "1440").unwrap();
+        assert_eq!(Settings::new(&db).window_size(), None);
+    }
+
+    #[test]
+    fn window_maximized_defaults_to_false_when_unset() {
+        let db = fresh();
+        assert!(!Settings::new(&db).window_maximized());
+    }
+
+    #[test]
+    fn window_maximized_round_trips() {
+        let db = fresh();
+        Settings::new(&db).set_window_maximized(true);
+        assert!(Settings::new(&db).window_maximized());
     }
 }
