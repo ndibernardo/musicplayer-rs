@@ -7,6 +7,7 @@ use std::sync::mpsc::Receiver;
 use crate::library::db::Db;
 use crate::library::db::DbError;
 use crate::library::db::LibraryFolder;
+use crate::library::track::AlbumArtData;
 use crate::library::track::Track;
 use crate::library::track::TrackPath;
 
@@ -37,7 +38,7 @@ pub enum ScanEvent {
 pub fn scan_folder(
     folder: &LibraryFolder,
     db: &Db,
-    read_track: impl Fn(&TrackPath) -> Option<Track>,
+    read_track: impl Fn(&TrackPath) -> Option<(Track, Option<AlbumArtData>)>,
 ) -> Result<u32, ScanError> {
     scan_folder_with_progress(folder, db, read_track, |_| {})
 }
@@ -51,7 +52,7 @@ pub fn scan_folder(
 pub fn scan_folder_with_progress(
     folder: &LibraryFolder,
     db: &Db,
-    read_track: impl Fn(&TrackPath) -> Option<Track>,
+    read_track: impl Fn(&TrackPath) -> Option<(Track, Option<AlbumArtData>)>,
     mut on_progress: impl FnMut(u32),
 ) -> Result<u32, ScanError> {
     const BATCH_SIZE: usize = 200;
@@ -64,8 +65,18 @@ pub fn scan_folder_with_progress(
             let Ok(track_path) = TrackPath::new(path) else {
                 continue;
             };
-            if let Some(track) = read_track(&track_path) {
+            if let Some((track, art_opt)) = read_track(&track_path) {
                 Db::upsert_one(&tx, &track)?;
+                if let Some(art) = art_opt {
+                    // Use the effective album artist (COALESCE logic) so the key
+                    // matches the JOIN condition in album_summaries_query.
+                    let effective_artist = if track.album_artist.is_unknown() {
+                        &track.artist
+                    } else {
+                        &track.album_artist
+                    };
+                    Db::upsert_art(&tx, &track.album, effective_artist, art.as_bytes())?;
+                }
                 count += 1;
                 on_progress(count);
             }
@@ -180,7 +191,6 @@ mod tests {
             track_number: TrackNumber::new(7),
             disc_number: DiscNumber::new(1),
             year: Year::new(1998),
-            art: None,
         }
     }
 
@@ -196,7 +206,7 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
+        let count = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
 
         assert_eq!(count, 2);
         assert_eq!(db.track_count().unwrap(), 2);
@@ -211,7 +221,7 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
+        let count = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
 
         assert_eq!(count, 1);
     }
@@ -226,7 +236,7 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
+        let count = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
 
         assert_eq!(count, 2);
     }
@@ -244,7 +254,7 @@ mod tests {
             if p.as_path().file_name() == Some(OsStr::new("corrupt.flac")) {
                 None
             } else {
-                Some(fake_track(p))
+                Some((fake_track(p), None))
             }
         })
         .unwrap();
@@ -262,7 +272,7 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
+        let count = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
 
         assert_eq!(count, 1);
     }
@@ -271,7 +281,7 @@ mod tests {
     fn scan_folder_returns_error_for_nonexistent_directory() {
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new("/nonexistent/path/that/does/not/exist").unwrap();
-        let result = scan_folder(&folder, &db, |p| Some(fake_track(p)));
+        let result = scan_folder(&folder, &db, |p| Some((fake_track(p), None)));
         assert!(matches!(result, Err(ScanError::ReadDir { .. })));
     }
 
@@ -287,7 +297,7 @@ mod tests {
 
         let mut seen = Vec::new();
         let total =
-            scan_folder_with_progress(&folder, &db, |p| Some(fake_track(p)), |n| seen.push(n))
+            scan_folder_with_progress(&folder, &db, |p| Some((fake_track(p), None)), |n| seen.push(n))
                 .unwrap();
 
         assert_eq!(total, 3);
@@ -301,8 +311,8 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
-        scan_folder(&folder, &db, |p| Some(fake_track(p))).unwrap();
+        scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
 
         assert_eq!(
             db.track_count().unwrap(),

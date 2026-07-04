@@ -102,7 +102,6 @@ mod tests {
             track_number: TrackNumber::new(id as u32),
             disc_number: DiscNumber::new(1),
             year: Year::new(2002),
-            art: None,
         }
     }
 

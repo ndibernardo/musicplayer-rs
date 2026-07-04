@@ -88,6 +88,14 @@ const SCHEMA: &str = "
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS album_art (
+        art_id       INTEGER PRIMARY KEY,
+        album        TEXT NOT NULL,
+        album_artist TEXT NOT NULL,
+        data         BLOB NOT NULL,
+        UNIQUE(album, album_artist)
+    );
 ";
 
 fn or_empty(v: Option<String>) -> String {
@@ -98,9 +106,7 @@ fn or_zero(v: Option<i64>) -> i64 {
     v.unwrap_or(0)
 }
 
-/// Raw column values of a `tracks` row, before domain validation. The trailing
-/// `album_artist` and `composer` come last, matching the `SELECT` in
-/// `query_tracks`.
+/// Raw column values of a `tracks` row, before domain validation.
 type TrackRow = (
     i64,
     String,
@@ -112,28 +118,13 @@ type TrackRow = (
     Option<i64>,
     Option<i64>,
     Option<i64>,
-    Option<Vec<u8>>,
     Option<String>,
     Option<String>,
 );
 
 /// Builds a domain `Track` from a raw row, validating the path.
 fn build_track(row: TrackRow) -> Result<Track, DbError> {
-    let (
-        id,
-        path,
-        title,
-        artist,
-        album,
-        genre,
-        duration_ms,
-        track_num,
-        disc_num,
-        year,
-        art,
-        album_artist,
-        composer,
-    ) = row;
+    let (id, path, title, artist, album, genre, duration_ms, track_num, disc_num, year, album_artist, composer) = row;
     let path = TrackPath::new(path).map_err(|e| DbError::InvalidData(e.to_string()))?;
     Ok(Track {
         id: TrackId::new(id),
@@ -148,7 +139,6 @@ fn build_track(row: TrackRow) -> Result<Track, DbError> {
         track_number: TrackNumber::new(or_zero(track_num) as u32),
         disc_number: DiscNumber::new(or_zero(disc_num) as u32),
         year: Year::new(or_zero(year) as u16),
-        art: art.map(AlbumArtData::new),
     })
 }
 
@@ -305,13 +295,12 @@ impl Db {
         let disc_number =
             (!track.disc_number.is_unknown()).then(|| track.disc_number.value() as i64);
         let year = (!track.year.is_unknown()).then(|| track.year.value() as i64);
-        let art = track.art.as_ref().map(|a| a.as_bytes().to_vec());
 
         // RETURNING yields the row's id on both the insert and the update path;
         // last_insert_rowid() would be stale after ON CONFLICT DO UPDATE.
         let mut stmt = conn.prepare_cached(
-            "INSERT INTO tracks (path, title, artist, album, genre, duration_ms, track_number, disc_number, year, art, album_artist, composer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO tracks (path, title, artist, album, genre, duration_ms, track_number, disc_number, year, album_artist, composer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(path) DO UPDATE SET
                  title        = excluded.title,
                  artist       = excluded.artist,
@@ -321,7 +310,6 @@ impl Db {
                  track_number = excluded.track_number,
                  disc_number  = excluded.disc_number,
                  year         = excluded.year,
-                 art          = excluded.art,
                  album_artist = excluded.album_artist,
                  composer     = excluded.composer
              RETURNING track_id",
@@ -337,7 +325,6 @@ impl Db {
                 track_number,
                 disc_number,
                 year,
-                art,
                 album_artist,
                 composer,
             ],
@@ -345,6 +332,43 @@ impl Db {
         )?;
 
         Ok(TrackId::new(id))
+    }
+
+    /// Upserts cover art for `(album, album_artist)`. Uses the effective album artist
+    /// (already COALESCEd by the caller) so it matches the JOIN key in album summaries.
+    /// Does nothing when `album` is empty — art without an album cannot be keyed.
+    pub(crate) fn upsert_art(
+        conn: &Connection,
+        album: &AlbumTitle,
+        album_artist: &Artist,
+        data: &[u8],
+    ) -> Result<(), DbError> {
+        if album.as_str().is_empty() {
+            return Ok(());
+        }
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO album_art (album, album_artist, data) VALUES (?1, ?2, ?3)
+             ON CONFLICT(album, album_artist) DO UPDATE SET data = excluded.data",
+        )?;
+        stmt.execute(rusqlite::params![album.as_str(), album_artist.as_str(), data])?;
+        Ok(())
+    }
+
+    /// Returns the cover art for the album identified by `(album, album_artist)`.
+    pub fn art_for_album(
+        &self,
+        album: &AlbumTitle,
+        album_artist: &Artist,
+    ) -> Result<Option<AlbumArtData>, DbError> {
+        let data = self
+            .conn
+            .query_row(
+                "SELECT data FROM album_art WHERE album = ?1 AND album_artist = ?2",
+                rusqlite::params![album.as_str(), album_artist.as_str()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        Ok(data.map(AlbumArtData::new))
     }
 
     /// Inserts or updates a track keyed on its path. Returns the assigned track_id.
@@ -434,7 +458,7 @@ impl Db {
     ) -> Result<Vec<Track>, DbError> {
         let sql = format!(
             "SELECT track_id, path, title, artist, album, genre,
-                    duration_ms, track_number, disc_number, year, art,
+                    duration_ms, track_number, disc_number, year,
                     album_artist, composer
              FROM tracks {filter_and_order}"
         );
@@ -451,9 +475,8 @@ impl Db {
                 row.get::<_, Option<i64>>(7)?,
                 row.get::<_, Option<i64>>(8)?,
                 row.get::<_, Option<i64>>(9)?,
-                row.get::<_, Option<Vec<u8>>>(10)?,
+                row.get::<_, Option<String>>(10)?,
                 row.get::<_, Option<String>>(11)?,
-                row.get::<_, Option<String>>(12)?,
             ))
         })?;
         rows.map(|r| build_track(r.map_err(DbError::from)?))
@@ -564,10 +587,21 @@ impl Db {
         sort: &AlbumSort,
     ) -> Result<Vec<AlbumSummary>, DbError> {
         let order_by = sort.order_by_clause();
+        // Scalar subquery for art avoids a JOIN that would make `album` and
+        // `album_artist` ambiguous in GROUP BY and ORDER BY (both tables share
+        // those column names). The album_art table is small (one row per album)
+        // so the correlated lookup is cheap.
         let sql = format!(
-            "SELECT album, COALESCE(album_artist, artist) AS album_artist,
-                    MAX(genre) AS album_genre, MAX(year) AS album_year, MAX(art)
-             FROM tracks {where_clause}
+            "SELECT album,
+                    COALESCE(album_artist, artist) AS album_artist,
+                    MAX(genre) AS album_genre,
+                    MAX(year)  AS album_year,
+                    (SELECT aa.data FROM album_art aa
+                     WHERE aa.album        = tracks.album
+                       AND aa.album_artist = COALESCE(tracks.album_artist, tracks.artist)
+                     LIMIT 1)
+             FROM tracks
+             {where_clause}
              GROUP BY album, album_artist
              {order_by}"
         );
@@ -777,7 +811,6 @@ mod tests {
             track_number: TrackNumber::new(0),
             disc_number: DiscNumber::new(0),
             year: Year::new(0),
-            art: None,
         }
     }
 
@@ -795,7 +828,6 @@ mod tests {
             track_number: TrackNumber::new(7),
             disc_number: DiscNumber::new(1),
             year: Year::new(1998),
-            art: None,
         }
     }
 
@@ -1177,14 +1209,6 @@ mod tests {
         assert!(db.distinct_genres().unwrap().is_empty());
     }
 
-    fn track_with_art(path: &str, album: &str, art: &[u8]) -> Track {
-        Track {
-            album: AlbumTitle::new(album),
-            art: Some(AlbumArtData::new(art.to_vec())),
-            ..full_track(path)
-        }
-    }
-
     #[test]
     fn album_summaries_empty_for_fresh_db() {
         let db = Db::open_in_memory().unwrap();
@@ -1499,15 +1523,17 @@ mod tests {
     }
 
     #[test]
-    fn album_summaries_carries_cover_art_from_any_track_in_the_album() {
+    fn album_summaries_carries_cover_art_from_album_art_table() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
             .unwrap();
-        db.upsert_track(&track_with_art(
-            "/music/boc/aquarius.flac",
-            "Music Has the Right to Children",
+        // Art is stored in album_art, not in the track row.
+        Db::upsert_art(
+            &db.conn,
+            &AlbumTitle::new("Music Has the Right to Children"),
+            &Artist::new("Boards of Canada"),
             &[0xFF, 0xD8, 0xFF],
-        ))
+        )
         .unwrap();
 
         let summaries = db.album_summaries().unwrap();
@@ -1516,5 +1542,50 @@ mod tests {
             summaries[0].art.as_ref().map(AlbumArtData::as_bytes),
             Some(&[0xFF, 0xD8, 0xFF][..])
         );
+    }
+
+    #[test]
+    fn art_for_album_returns_stored_bytes() {
+        let db = Db::open_in_memory().unwrap();
+        Db::upsert_art(
+            &db.conn,
+            &AlbumTitle::new("Geogaddi"),
+            &Artist::new("Boards of Canada"),
+            &[0xFF, 0xD8, 0xFF],
+        )
+        .unwrap();
+
+        let art = db
+            .art_for_album(
+                &AlbumTitle::new("Geogaddi"),
+                &Artist::new("Boards of Canada"),
+            )
+            .unwrap();
+        assert_eq!(art.as_ref().map(AlbumArtData::as_bytes), Some(&[0xFF, 0xD8, 0xFF][..]));
+    }
+
+    #[test]
+    fn art_for_album_returns_none_for_unknown_album() {
+        let db = Db::open_in_memory().unwrap();
+        let art = db
+            .art_for_album(
+                &AlbumTitle::new("Missing"),
+                &Artist::new("Nobody"),
+            )
+            .unwrap();
+        assert!(art.is_none());
+    }
+
+    #[test]
+    fn upsert_art_skips_empty_album() {
+        let db = Db::open_in_memory().unwrap();
+        // Empty album means no meaningful key — must not insert a row.
+        Db::upsert_art(&db.conn, &AlbumTitle::new(""), &Artist::new("Boards of Canada"), &[0xFF])
+            .unwrap();
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM album_art", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

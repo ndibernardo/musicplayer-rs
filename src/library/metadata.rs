@@ -30,11 +30,12 @@ pub enum MetadataError {
     },
 }
 
-/// Reads audio metadata from `path`. Returns a `Track` with `id = TrackId(0)`.
+/// Reads audio metadata from `path`. Returns the track and any embedded cover art.
+/// The returned `Track` has `id = TrackId(0)`.
 ///
 /// # Errors
 /// `MetadataError::Lofty` — format unrecognised or parse failure.
-pub fn read(path: &TrackPath) -> Result<Track, MetadataError> {
+pub fn read(path: &TrackPath) -> Result<(Track, Option<AlbumArtData>), MetadataError> {
     let tagged = lofty::read_from_path(path.as_path()).map_err(|source| MetadataError::Lofty {
         path: path.as_path().to_path_buf(),
         source,
@@ -43,7 +44,11 @@ pub fn read(path: &TrackPath) -> Result<Track, MetadataError> {
     let duration = TrackDuration::from_millis(tagged.properties().duration().as_millis() as u64);
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag());
 
-    Ok(Track {
+    let art = tag
+        .and_then(|t| t.pictures().first())
+        .map(|pic| AlbumArtData::new(pic.data().to_vec()));
+
+    let track = Track {
         id: TrackId::new(0),
         path: path.clone(),
         title: Title::new(str_field(tag, |t| t.title())),
@@ -56,11 +61,10 @@ pub fn read(path: &TrackPath) -> Result<Track, MetadataError> {
         disc_number: DiscNumber::new(num_field(tag, |t| t.disk())),
         // `year()` was removed in lofty 0.22+; extract the year from the Timestamp returned by `date()`.
         year: Year::new(tag.and_then(|t| t.date()).map(|ts| ts.year).unwrap_or(0)),
-        art: tag
-            .and_then(|t| t.pictures().first())
-            .map(|pic| AlbumArtData::new(pic.data().to_vec())),
         duration,
-    })
+    };
+
+    Ok((track, art))
 }
 
 fn str_field<F>(tag: Option<&Tag>, f: F) -> String

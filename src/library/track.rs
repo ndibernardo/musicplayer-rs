@@ -234,7 +234,6 @@ pub struct Track {
     pub track_number: TrackNumber,
     pub disc_number: DiscNumber,
     pub year: Year,
-    pub art: Option<AlbumArtData>,
 }
 
 #[cfg(test)]
