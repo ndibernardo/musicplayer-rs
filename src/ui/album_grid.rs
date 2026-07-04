@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use gtk4::Align;
 use gtk4::Box as GtkBox;
+use gtk4::Button;
 use gtk4::GestureClick;
 use gtk4::Image;
 use gtk4::Label;
@@ -230,36 +231,20 @@ impl AlbumGrid {
         cell.append(&album_label);
         cell.append(&artist_label);
 
-        // A single click opens the track drawer; a double click plays the whole
-        // album. Using one gesture on the cell (rather than two `clicked` signals
-        // from a button) avoids the drawer flickering open then shut on a
-        // double-click, since `pressed` fires once per press with a rising count.
+        // Clicking a cover opens its track drawer without playing; the album is
+        // played from the ▶ button in that drawer's header. Only the first press
+        // toggles, so a double-click doesn't flip the drawer shut again.
         let gesture = GestureClick::new();
         let this = self.clone();
-        gesture.connect_pressed(move |_, n_press, _, _| match n_press {
-            1 => this.toggle_drawer(index),
-            2 => this.activate_album(index),
-            _ => {}
+        gesture.connect_pressed(move |_, n_press, _, _| {
+            if n_press == 1 {
+                this.toggle_drawer(index);
+            }
         });
         cell.add_controller(gesture);
 
         self.covers.borrow_mut().push((image, cell.clone()));
         cell
-    }
-
-    /// Enqueues the whole album at `index` by firing the album callback.
-    fn activate_album(&self, index: usize) {
-        let albums = self.albums.borrow();
-        let Some(summary) = albums.get(index) else {
-            return;
-        };
-        let tracks = match self.track_provider.borrow().as_ref() {
-            Some(provide) => provide(summary),
-            None => Vec::new(),
-        };
-        if let Some(callback) = self.on_album_activated.borrow().as_ref() {
-            callback(tracks);
-        }
     }
 
     /// Opens the drawer for `index` beneath its row, or closes it if already open.
@@ -281,7 +266,12 @@ impl AlbumGrid {
                 Some(provide) => provide(summary),
                 None => Vec::new(),
             };
-            build_drawer(summary, tracks, self.on_track_activated.borrow().clone())
+            build_drawer(
+                summary,
+                tracks,
+                self.on_track_activated.borrow().clone(),
+                self.on_album_activated.borrow().clone(),
+            )
         };
 
         let row_boxes = self.row_boxes.borrow();
@@ -294,24 +284,39 @@ impl AlbumGrid {
     }
 }
 
-/// Builds the inline drawer: a heading plus the album's full track list.
+/// Builds the inline drawer: a header (play button plus album heading) and the
+/// album's full track list.
 fn build_drawer(
     summary: &AlbumSummary,
     tracks: Vec<Track>,
     on_track: Option<TrackCallback>,
+    on_album: Option<AlbumCallback>,
 ) -> GtkBox {
     let container = GtkBox::new(Orientation::Vertical, 0);
     container.add_css_class("frame");
     container.set_margin_top(2);
     container.set_margin_bottom(2);
 
+    let play_btn = Button::from_icon_name("media-playback-start-symbolic");
+    play_btn.add_css_class("flat");
+    play_btn.set_tooltip_text(Some("Play album"));
+    play_btn.set_valign(Align::Center);
+    if let Some(callback) = on_album {
+        let album_tracks = tracks.clone();
+        play_btn.connect_clicked(move |_| callback(album_tracks.clone()));
+    }
+
     let heading = Label::new(Some(&drawer_heading(summary)));
     heading.set_xalign(0.0);
-    heading.set_margin_start(8);
-    heading.set_margin_top(6);
-    heading.set_margin_bottom(4);
     heading.add_css_class("heading");
-    container.append(&heading);
+
+    let header = GtkBox::new(Orientation::Horizontal, 4);
+    header.set_margin_start(8);
+    header.set_margin_top(6);
+    header.set_margin_bottom(4);
+    header.append(&play_btn);
+    header.append(&heading);
+    container.append(&header);
 
     let list = ListBox::new();
     list.set_selection_mode(SelectionMode::Single);
