@@ -158,6 +158,7 @@ impl AlbumGrid {
             self.grid_box.remove(&open);
         }
         *self.open_album.borrow_mut() = None;
+        self.highlight(None);
         for cell in self.cells.borrow().iter() {
             cell.unparent();
         }
@@ -257,6 +258,17 @@ impl AlbumGrid {
         cell
     }
 
+    /// Highlights the cover at `index` as selected and clears the others.
+    fn highlight(&self, index: Option<usize>) {
+        for (i, cell) in self.cells.borrow().iter().enumerate() {
+            if Some(i) == index {
+                cell.add_css_class("album-selected");
+            } else {
+                cell.remove_css_class("album-selected");
+            }
+        }
+    }
+
     /// Opens the drawer for `index` beneath its row, or closes it if already open.
     fn toggle_drawer(&self, index: usize) {
         if let Some(open) = self.drawer.borrow_mut().take() {
@@ -264,6 +276,7 @@ impl AlbumGrid {
         }
         if *self.open_album.borrow() == Some(index) {
             *self.open_album.borrow_mut() = None;
+            self.highlight(None);
             return;
         }
 
@@ -291,6 +304,7 @@ impl AlbumGrid {
         self.grid_box.insert_child_after(&drawer, Some(row_box));
         *self.drawer.borrow_mut() = Some(drawer.upcast());
         *self.open_album.borrow_mut() = Some(index);
+        self.highlight(Some(index));
     }
 }
 
@@ -355,7 +369,9 @@ fn build_drawer(
     cover.set_paintable(cover_paintable(summary).as_ref());
 
     let outer = GtkBox::new(Orientation::Horizontal, 8);
-    outer.add_css_class("frame");
+    // Same dark tint as the selected cover, so the open album and its track list
+    // read as one continuous selection.
+    outer.add_css_class("album-drawer");
     outer.set_margin_top(2);
     outer.set_margin_bottom(2);
     outer.append(&cover);

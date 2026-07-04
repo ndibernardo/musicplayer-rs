@@ -98,6 +98,15 @@ const APP_CSS: &str = "\
     border: none;
     box-shadow: none;
 }
+.album-selected {
+    background-color: rgba(0, 0, 0, 0.24);
+    border-radius: 10px;
+    padding: 10px;
+}
+.album-drawer {
+    background-color: rgba(0, 0, 0, 0.24);
+    border-radius: 10px;
+}
 ";
 
 pub fn build(
@@ -110,6 +119,10 @@ pub fn build(
     install_styles();
 
     let header = HeaderBar::new();
+    // Show only the close button. Under a tiling WM (e.g. sway) the minimize and
+    // maximize buttons are unusable and render with a mismatched background on
+    // focus changes; dropping them keeps the titlebar uniform.
+    header.set_decoration_layout(Some(":close"));
 
     let add_btn = Button::from_icon_name("folder-new-symbolic");
     add_btn.set_tooltip_text(Some("Add music folder"));
@@ -133,6 +146,8 @@ pub fn build(
 
     let sort_controls = GtkBox::new(Orientation::Horizontal, 6);
     sort_controls.set_valign(gtk4::Align::Center);
+    // Gap that separates the sort section from the folder buttons beside it.
+    sort_controls.set_margin_start(18);
     sort_controls.append(&sort_icon);
     sort_controls.append(&sort_field);
     sort_controls.append(&sort_dir);
@@ -148,6 +163,8 @@ pub fn build(
     size_scale.set_draw_value(false);
     size_scale.set_tooltip_text(Some("Album art size"));
     size_scale.set_valign(gtk4::Align::Center);
+    // Gap that separates the size slider from the view toggles beside it.
+    size_scale.set_margin_start(18);
 
     let list_toggle = ToggleButton::new();
     list_toggle.set_icon_name("view-list-symbolic");
@@ -159,11 +176,12 @@ pub fn build(
     grid_toggle.set_tooltip_text(Some("Album grid"));
     // One linked group: activating one visually releases the other.
     grid_toggle.set_group(Some(&list_toggle));
-    // Packed end-first, so left to right this reads: sort controls, list, grid, slider.
+    // Sort controls go at the left, next to the folder buttons; the view toggles
+    // and size slider stay at the right (packed end-first: list, grid, slider).
+    header.pack_start(&sort_controls);
     header.pack_end(&size_scale);
     header.pack_end(&grid_toggle);
     header.pack_end(&list_toggle);
-    header.pack_end(&sort_controls);
 
     // Shows or hides both grid-only control groups together.
     let toggle_grid_controls: Rc<dyn Fn(bool)> = {
