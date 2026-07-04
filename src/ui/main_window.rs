@@ -81,7 +81,7 @@ pub fn build(
     scan_btn.set_tooltip_text(Some("Scan library"));
     header.pack_start(&scan_btn);
 
-    // Album-art size slider, sitting next to the scan button.
+    // Album-art size slider, shown beside the view toggles only in grid view.
     let size_scale = Scale::with_range(
         Orientation::Horizontal,
         COVER_SIZE_MIN,
@@ -92,7 +92,6 @@ pub fn build(
     size_scale.set_draw_value(false);
     size_scale.set_tooltip_text(Some("Album art size"));
     size_scale.set_valign(gtk4::Align::Center);
-    header.pack_start(&size_scale);
 
     let list_toggle = ToggleButton::new();
     list_toggle.set_icon_name("view-list-symbolic");
@@ -104,6 +103,8 @@ pub fn build(
     grid_toggle.set_tooltip_text(Some("Album grid"));
     // One linked group: activating one visually releases the other.
     grid_toggle.set_group(Some(&list_toggle));
+    // Packed end-first, so left to right this reads: list, grid, slider.
+    header.pack_end(&size_scale);
     header.pack_end(&grid_toggle);
     header.pack_end(&list_toggle);
 
@@ -159,20 +160,25 @@ pub fn build(
     {
         let content = content.clone();
         let db = Rc::clone(&db);
+        let size_scale = size_scale.clone();
         list_toggle.connect_toggled(move |btn| {
             if btn.is_active() {
                 content.set_visible_child_name(ViewMode::List.child_name());
                 save_view_mode(&db, ViewMode::List);
+                // The cover-size slider is only meaningful for the album grid.
+                size_scale.set_visible(false);
             }
         });
     }
     {
         let content = content.clone();
         let db = Rc::clone(&db);
+        let size_scale = size_scale.clone();
         grid_toggle.connect_toggled(move |btn| {
             if btn.is_active() {
                 content.set_visible_child_name(ViewMode::Grid.child_name());
                 save_view_mode(&db, ViewMode::Grid);
+                size_scale.set_visible(true);
             }
         });
     }
@@ -185,6 +191,7 @@ pub fn build(
             ViewMode::Grid => grid_toggle.set_active(true),
         }
         content.set_visible_child_name(mode.child_name());
+        size_scale.set_visible(matches!(mode, ViewMode::Grid));
     }
 
     // A scanning spinner + count, centred over the content while a scan runs.
