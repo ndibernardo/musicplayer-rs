@@ -309,6 +309,15 @@ impl Db {
         self.query_tracks("ORDER BY artist, album, track_number", [])
     }
 
+    /// Returns the track with `id`, or `None` when no such row exists. Used to
+    /// rebuild a persisted queue from its stored track ids.
+    pub fn track_by_id(&self, id: TrackId) -> Result<Option<Track>, DbError> {
+        Ok(self
+            .query_tracks("WHERE track_id = ?1", [id.value()])?
+            .into_iter()
+            .next())
+    }
+
     /// Returns tracks whose genre equals `genre`, ordered by artist, then album, then track number.
     pub fn tracks_by_genre(&self, genre: &Genre) -> Result<Vec<Track>, DbError> {
         self.query_tracks(
@@ -756,6 +765,22 @@ mod tests {
             .query_row("SELECT title FROM tracks", [], |r| r.get(0))
             .unwrap();
         assert!(title.is_none(), "empty title must be stored as NULL");
+    }
+
+    #[test]
+    fn track_by_id_returns_the_matching_track() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        let found = db.track_by_id(id).unwrap();
+        assert_eq!(found.unwrap().title.as_str(), "Roygbiv");
+    }
+
+    #[test]
+    fn track_by_id_returns_none_for_unknown_id() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.track_by_id(TrackId::new(4242)).unwrap(), None);
     }
 
     #[test]
