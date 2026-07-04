@@ -86,10 +86,17 @@ const COVER_SIZE_MAX: f64 = 500.0;
 /// with visible slider and progress troughs against that darker background.
 const APP_CSS: &str = "\
 .player-bar { background-color: rgba(0, 0, 0, 0.25); }
-.player-bar scale trough,
-.player-bar progressbar trough {
+.player-bar scale trough {
     background-color: alpha(currentColor, 0.22);
     min-height: 6px;
+}
+.player-bar scale.seek slider {
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    background: none;
+    border: none;
+    box-shadow: none;
 }
 ";
 

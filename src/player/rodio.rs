@@ -16,6 +16,10 @@ pub struct RodioAudioBackend {
     // Keeps the OS audio stream alive. Must outlive `player`.
     _device_sink: MixerDeviceSink,
     player: Player,
+    // The current track's path, needed to reload it for a backward seek.
+    current_path: Option<TrackPath>,
+    // Remembered so a fresh player (new track or backward seek) keeps the volume.
+    volume: f32,
 }
 
 impl RodioAudioBackend {
@@ -26,6 +30,8 @@ impl RodioAudioBackend {
         Ok(Self {
             _device_sink: device_sink,
             player,
+            current_path: None,
+            volume: 1.0,
         })
     }
 }
@@ -50,6 +56,8 @@ impl AudioBackend for RodioAudioBackend {
         let decoder = Self::open_decoder(path)?;
         self.fresh_player();
         self.player.append(decoder);
+        self.player.set_volume(self.volume);
+        self.current_path = Some(path.clone());
         Ok(())
     }
 
@@ -60,8 +68,32 @@ impl AudioBackend for RodioAudioBackend {
         // user resumes; then move the play head to where the session ended.
         self.player.pause();
         self.player.append(decoder);
+        self.player.set_volume(self.volume);
         let _ = self.player.try_seek(position);
+        self.current_path = Some(path.clone());
         Ok(())
+    }
+
+    fn seek(&mut self, position: Duration) {
+        // The live decoder only seeks forward; a backward seek returns an error
+        // and leaves the position unchanged. So for a backward target, reload the
+        // track and seek forward from the start, which is supported.
+        if position < self.player.get_pos() {
+            if let Some(path) = self.current_path.clone() {
+                let was_paused = self.player.is_paused();
+                if let Ok(decoder) = Self::open_decoder(&path) {
+                    self.fresh_player();
+                    if was_paused {
+                        self.player.pause();
+                    }
+                    self.player.append(decoder);
+                    self.player.set_volume(self.volume);
+                    let _ = self.player.try_seek(position);
+                }
+            }
+        } else {
+            let _ = self.player.try_seek(position);
+        }
     }
 
     fn pause(&mut self) {
@@ -77,7 +109,8 @@ impl AudioBackend for RodioAudioBackend {
     }
 
     fn set_volume(&mut self, volume: Volume) {
-        self.player.set_volume(volume.value());
+        self.volume = volume.value();
+        self.player.set_volume(self.volume);
     }
 
     fn is_playing(&self) -> bool {

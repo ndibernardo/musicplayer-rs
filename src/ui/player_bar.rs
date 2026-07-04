@@ -4,10 +4,10 @@ use std::rc::Rc;
 use gtk4::Adjustment;
 use gtk4::Box as GtkBox;
 use gtk4::Button;
+use gtk4::GestureClick;
 use gtk4::Image;
 use gtk4::Label;
 use gtk4::Orientation;
-use gtk4::ProgressBar;
 use gtk4::Scale;
 use gtk4::glib::markup_escape_text;
 use gtk4::prelude::*;
@@ -26,12 +26,12 @@ pub struct PlayerBar {
     track_label: Label,
     time_label: Label,
     total_label: Label,
-    progress: ProgressBar,
+    progress: Scale,
     play_pause_btn: Button,
     volume_scale: Scale,
     // Tracks whether the engine is currently playing so the button can toggle correctly.
     is_playing: Rc<Cell<bool>>,
-    // Current track length in milliseconds, for computing the progress fraction.
+    // Current track length in milliseconds, used to set the progress scale range.
     duration_ms: Rc<Cell<u64>>,
 }
 
@@ -73,9 +73,34 @@ impl PlayerBar {
         total_label.set_width_chars(6);
         total_label.set_xalign(0.0);
 
-        let progress = ProgressBar::new();
+        let duration_ms = Rc::new(Cell::new(0u64));
+
+        // A scale for the fill; the knob is hidden by CSS. A click seeks to the
+        // exact clicked fraction of the track, so it jumps both forward and back
+        // (a plain trough click only page-steps, which playback overtakes).
+        let progress = Scale::with_range(Orientation::Horizontal, 0.0, 1.0, 1000.0);
+        progress.add_css_class("seek");
         progress.set_hexpand(true);
+        progress.set_draw_value(false);
         progress.set_valign(gtk4::Align::Center);
+        {
+            let player = player.clone();
+            let duration_ms = Rc::clone(&duration_ms);
+            let scale = progress.clone();
+            let click = GestureClick::new();
+            // Capture phase + claim, so this runs before the scale's own drag
+            // gesture, which would otherwise swallow the click (leaving seeking
+            // dead) or only page-step it.
+            click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            click.connect_pressed(move |gesture, _n_press, x, _y| {
+                let width = scale.width().max(1) as f64;
+                let fraction = (x / width).clamp(0.0, 1.0);
+                let position = (fraction * duration_ms.get() as f64) as u64;
+                player.send(PlayerCommand::Seek(SeekPosition::from_millis(position)));
+                gesture.set_state(gtk4::EventSequenceState::Claimed);
+            });
+            progress.add_controller(click);
+        }
 
         let vol_icon = Image::from_icon_name("audio-volume-medium-symbolic");
         let vol_box = GtkBox::new(Orientation::Horizontal, 4);
@@ -155,7 +180,7 @@ impl PlayerBar {
             play_pause_btn,
             volume_scale,
             is_playing,
-            duration_ms: Rc::new(Cell::new(0)),
+            duration_ms,
         }
     }
 
@@ -170,12 +195,15 @@ impl PlayerBar {
     pub fn set_track(&self, track: &Track) {
         self.track_label.set_markup(&track_markup(track));
 
-        self.duration_ms
-            .set(track.duration.as_duration().as_millis() as u64);
+        let duration_ms = track.duration.as_duration().as_millis() as u64;
+        self.duration_ms.set(duration_ms);
         self.total_label
             .set_text(&format_secs(track.duration.as_secs()));
         self.time_label.set_text("0:00");
-        self.progress.set_fraction(0.0);
+        // At least 1 so the scale has a valid, non-empty range even for a
+        // zero-length or untagged track.
+        self.progress.set_range(0.0, duration_ms.max(1) as f64);
+        self.progress.set_value(0.0);
     }
 
     /// Called on every state change (play/pause/stop) and on position ticks.
@@ -188,7 +216,7 @@ impl PlayerBar {
                 self.track_label.set_text("");
                 self.time_label.set_text("0:00");
                 self.total_label.set_text("0:00");
-                self.progress.set_fraction(0.0);
+                self.progress.set_value(0.0);
             }
             PlaybackState::Playing { position, .. } => {
                 self.is_playing.set(true);
@@ -205,12 +233,12 @@ impl PlayerBar {
         }
     }
 
-    /// Updates the elapsed time label and the progress fraction for `position`.
+    /// Updates the elapsed time label and the progress position. Uses set_value
+    /// (not change-value), so this does not trigger a seek.
     fn show_position(&self, position: SeekPosition) {
         self.time_label.set_text(&format_secs(position.as_secs()));
-        let elapsed_ms = position.as_duration().as_millis() as u64;
         self.progress
-            .set_fraction(fraction(elapsed_ms, self.duration_ms.get()));
+            .set_value(position.as_duration().as_millis() as f64);
     }
 }
 
@@ -240,14 +268,5 @@ fn track_markup(track: &Track) -> String {
         format!(
             "<span size='large' weight='bold'>{title}</span>  <span size='large' alpha='70%'>{artist}</span>"
         )
-    }
-}
-
-/// The played fraction in [0.0, 1.0], or 0.0 when the duration is unknown.
-fn fraction(elapsed_ms: u64, duration_ms: u64) -> f64 {
-    if duration_ms == 0 {
-        0.0
-    } else {
-        (elapsed_ms as f64 / duration_ms as f64).min(1.0)
     }
 }

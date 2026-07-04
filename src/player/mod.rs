@@ -156,6 +156,8 @@ pub trait AudioBackend {
     /// Loads `path` and holds it paused at `position`, with no audible playback,
     /// so a restored session reopens where it left off without resuming.
     fn play_paused(&mut self, path: &TrackPath, position: Duration) -> Result<(), AudioError>;
+    /// Moves the play head of the current track to `position`.
+    fn seek(&mut self, position: Duration);
     fn pause(&mut self);
     fn resume(&mut self);
     fn stop(&mut self);
@@ -290,7 +292,25 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
             Ok(PlayerCommand::SetVolume(v)) => {
                 backend.set_volume(v);
             }
-            Ok(PlayerCommand::Seek(_)) => {}
+            Ok(PlayerCommand::Seek(position)) => {
+                backend.seek(position.as_duration());
+                if let Some(track) = queue.current() {
+                    // Report the new position immediately, keeping the play/pause
+                    // state, rather than waiting for the next tick.
+                    let state = if backend.is_paused() {
+                        PlaybackState::Paused {
+                            track: track.id,
+                            position,
+                        }
+                    } else {
+                        PlaybackState::Playing {
+                            track: track.id,
+                            position,
+                        }
+                    };
+                    on_state(state);
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let Some(current_id) = queue.current().map(|t| t.id) else {
                     continue;
@@ -433,6 +453,7 @@ mod tests {
         playing: bool,
         paused: bool,
         volume: f32,
+        position: Duration,
     }
 
     impl MockAudioBackend {
@@ -441,6 +462,7 @@ mod tests {
                 playing: false,
                 paused: false,
                 volume: 1.0,
+                position: Duration::ZERO,
             }
         }
     }
@@ -449,6 +471,7 @@ mod tests {
         fn play(&mut self, _path: &TrackPath) -> Result<(), AudioError> {
             self.playing = true;
             self.paused = false;
+            self.position = Duration::ZERO;
             Ok(())
         }
         fn play_paused(
@@ -481,8 +504,11 @@ mod tests {
         fn is_paused(&self) -> bool {
             self.paused
         }
+        fn seek(&mut self, position: Duration) {
+            self.position = position;
+        }
         fn position(&self) -> Duration {
-            Duration::ZERO
+            self.position
         }
     }
 
@@ -682,6 +708,7 @@ mod tests {
             self.playing.store(false, Ordering::SeqCst);
         }
         fn set_volume(&mut self, _v: Volume) {}
+        fn seek(&mut self, _position: Duration) {}
         fn is_playing(&self) -> bool {
             self.playing.load(Ordering::SeqCst)
         }
@@ -755,6 +782,18 @@ mod tests {
         let s = recv_matching(&rx, |s| matches!(s, PlaybackState::Paused { .. }));
         assert_eq!(s.current_track(), Some(TrackId::new(20)));
         assert_eq!(s.position(), Some(SeekPosition::from_secs(87)));
+    }
+
+    #[test]
+    fn player_seek_reports_the_new_position_while_playing() {
+        let (handle, rx) = launch_with_channel();
+        handle.send(PlayerCommand::Play(Box::new(julie_and_candy())));
+        recv_matching(&rx, |s| matches!(s, PlaybackState::Playing { .. }));
+
+        handle.send(PlayerCommand::Seek(SeekPosition::from_secs(90)));
+
+        let s = recv_matching(&rx, |s| s.position() == Some(SeekPosition::from_secs(90)));
+        assert!(matches!(s, PlaybackState::Playing { .. }));
     }
 
     #[test]
