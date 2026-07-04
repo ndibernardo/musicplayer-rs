@@ -284,8 +284,11 @@ impl AlbumGrid {
     }
 }
 
-/// Builds the inline drawer: a header (play button plus album heading) and the
-/// album's full track list.
+/// Combined cover-art size shown at the left of a drawer (px).
+const DRAWER_COVER_SIZE: i32 = 160;
+
+/// Builds the inline drawer: the album cover on the left, and on the right a
+/// header (play button plus album heading) above the full track list.
 fn build_drawer(
     summary: &AlbumSummary,
     tracks: Vec<Track>,
@@ -293,9 +296,7 @@ fn build_drawer(
     on_album: Option<AlbumCallback>,
 ) -> GtkBox {
     let container = GtkBox::new(Orientation::Vertical, 0);
-    container.add_css_class("frame");
-    container.set_margin_top(2);
-    container.set_margin_bottom(2);
+    container.set_hexpand(true);
 
     let play_btn = Button::from_icon_name("media-playback-start-symbolic");
     play_btn.add_css_class("flat");
@@ -333,7 +334,23 @@ fn build_drawer(
         });
     }
     container.append(&list);
-    container
+
+    // The album cover, mirrored from the grid, sits to the left of the list.
+    let cover = Image::new();
+    cover.set_pixel_size(DRAWER_COVER_SIZE);
+    cover.set_valign(Align::Start);
+    cover.set_margin_start(8);
+    cover.set_margin_top(8);
+    cover.set_margin_bottom(8);
+    cover.set_paintable(cover_paintable(summary).as_ref());
+
+    let outer = GtkBox::new(Orientation::Horizontal, 8);
+    outer.add_css_class("frame");
+    outer.set_margin_top(2);
+    outer.set_margin_bottom(2);
+    outer.append(&cover);
+    outer.append(&container);
+    outer
 }
 
 fn drawer_heading(summary: &AlbumSummary) -> String {
@@ -347,9 +364,10 @@ fn drawer_heading(summary: &AlbumSummary) -> String {
 
 fn track_row(track: &Track) -> ListBoxRow {
     let number = Label::new(Some(&track_number(track)));
-    number.set_width_chars(3);
+    number.set_width_chars(5);
     number.set_xalign(1.0);
     number.add_css_class("dim-label");
+    number.add_css_class("numeric");
 
     let title = Label::new(Some(track.title.as_str()));
     title.set_xalign(0.0);
@@ -373,11 +391,22 @@ fn track_row(track: &Track) -> ListBoxRow {
     row
 }
 
+/// The track's position label. With a disc number it reads `disc.track` with the
+/// track zero-padded to two digits (so an album sorts and reads as 1.01, 1.10,
+/// 2.01); without one it is just the track number, and it is empty when neither
+/// tag is present.
 fn track_number(track: &Track) -> String {
-    if track.track_number.is_unknown() {
-        String::new()
+    let track_num = track.track_number;
+    if track.disc_number.is_unknown() {
+        if track_num.is_unknown() {
+            String::new()
+        } else {
+            track_num.value().to_string()
+        }
+    } else if track_num.is_unknown() {
+        format!("{}.", track.disc_number.value())
     } else {
-        track.track_number.value().to_string()
+        format!("{}.{:02}", track.disc_number.value(), track_num.value())
     }
 }
 
