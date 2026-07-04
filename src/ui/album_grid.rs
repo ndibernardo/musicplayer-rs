@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gtk4::Align;
@@ -63,6 +64,9 @@ pub struct AlbumGrid {
     cells: Rc<RefCell<Vec<GtkBox>>>,
     // Cover image + its cell box, kept so `set_cover_size` can resize in place.
     covers: Rc<RefCell<Vec<(Image, GtkBox)>>>,
+    // Decoded textures keyed by (album, album_artist). Shared with idle decode
+    // tasks so a cache hit skips the JPEG/PNG decode on repeat set_albums calls.
+    texture_cache: Rc<RefCell<HashMap<(String, String), Texture>>>,
     track_provider: Rc<RefCell<Option<TrackProvider>>>,
     on_track_activated: Rc<RefCell<Option<TrackCallback>>>,
     on_album_activated: Rc<RefCell<Option<AlbumCallback>>>,
@@ -92,6 +96,7 @@ impl AlbumGrid {
             columns: Rc::new(Cell::new(DEFAULT_COLUMNS)),
             cells: Rc::new(RefCell::new(Vec::new())),
             covers: Rc::new(RefCell::new(Vec::new())),
+            texture_cache: Rc::new(RefCell::new(HashMap::new())),
             track_provider: Rc::new(RefCell::new(None)),
             on_track_activated: Rc::new(RefCell::new(None)),
             on_album_activated: Rc::new(RefCell::new(None)),
@@ -212,7 +217,34 @@ impl AlbumGrid {
         let image = Image::new();
         image.set_pixel_size(size);
         image.set_halign(Align::Center);
-        image.set_paintable(cover_paintable(summary).as_ref());
+
+        if let Some(art) = summary.art.clone() {
+            let cache = Rc::clone(&self.texture_cache);
+            let key = (
+                summary.album.as_str().to_owned(),
+                summary.artist.as_str().to_owned(),
+            );
+            if let Some(texture) = cache.borrow().get(&key) {
+                // Already decoded from a prior set_albums call — reuse instantly.
+                image.set_paintable(Some(texture));
+            } else {
+                // Defer the JPEG/PNG decode to an idle iteration so rebuilding the
+                // grid (e.g. on sort change) never stalls the main thread.
+                let img = image.clone();
+                glib::idle_add_local_once(move || {
+                    // Another cell for the same album may have decoded it already.
+                    if let Some(texture) = cache.borrow().get(&key) {
+                        img.set_paintable(Some(texture));
+                        return;
+                    }
+                    let bytes = glib::Bytes::from(art.as_bytes());
+                    if let Ok(texture) = Texture::from_bytes(&bytes) {
+                        img.set_paintable(Some(&texture));
+                        cache.borrow_mut().insert(key, texture);
+                    }
+                });
+            }
+        }
 
         let album_label = Label::new(Some(summary.album.as_str()));
         album_label.set_xalign(0.0);
@@ -289,11 +321,17 @@ impl AlbumGrid {
                 Some(provide) => provide(summary),
                 None => Vec::new(),
             };
+            let key = (
+                summary.album.as_str().to_owned(),
+                summary.artist.as_str().to_owned(),
+            );
+            let cached = self.texture_cache.borrow().get(&key).cloned();
             build_drawer(
                 summary,
                 tracks,
                 self.on_track_activated.borrow().clone(),
                 self.on_album_activated.borrow().clone(),
+                cached.as_ref(),
             )
         };
 
@@ -318,6 +356,7 @@ fn build_drawer(
     tracks: Vec<Track>,
     on_track: Option<TrackCallback>,
     on_album: Option<AlbumCallback>,
+    cached: Option<&Texture>,
 ) -> GtkBox {
     let container = GtkBox::new(Orientation::Vertical, 0);
     container.set_hexpand(true);
@@ -366,7 +405,12 @@ fn build_drawer(
     cover.set_margin_start(8);
     cover.set_margin_top(8);
     cover.set_margin_bottom(8);
-    cover.set_paintable(cover_paintable(summary).as_ref());
+    // Prefer the pre-decoded cached texture; fall back to a synchronous decode
+    // when the user opens the drawer before the idle task has fired for that cell.
+    let drawer_paintable: Option<Paintable> = cached
+        .map(|t| Paintable::from(t.clone()))
+        .or_else(|| cover_paintable(summary));
+    cover.set_paintable(drawer_paintable.as_ref());
 
     let outer = GtkBox::new(Orientation::Horizontal, 8);
     // Same dark tint as the selected cover, so the open album and its track list
