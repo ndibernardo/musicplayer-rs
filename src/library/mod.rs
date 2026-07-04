@@ -1,7 +1,8 @@
 pub mod album;
 pub mod db;
+pub mod filter;
 pub mod metadata;
-pub mod query;
 pub mod scan;
+pub mod settings;
 pub mod track;
 pub mod watch;

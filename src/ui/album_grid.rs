@@ -21,7 +21,7 @@ use gtk4::prelude::*;
 
 use crate::library::album::AlbumSummary;
 use crate::library::track::Track;
-use crate::library::track::TrackDuration;
+use crate::ui::format::format_duration;
 
 /// Column count before the first width-driven reflow. The grid is hand-built
 /// (not a `GridView`) so a full-width track drawer can be inserted between rows;
@@ -486,9 +486,4 @@ fn cover_paintable(summary: &AlbumSummary) -> Option<Paintable> {
     let art = summary.art.as_ref()?;
     let bytes = glib::Bytes::from(art.as_bytes());
     Texture::from_bytes(&bytes).ok().map(Paintable::from)
-}
-
-fn format_duration(d: TrackDuration) -> String {
-    let total_secs = d.as_secs();
-    format!("{}:{:02}", total_secs / 60, total_secs % 60)
 }

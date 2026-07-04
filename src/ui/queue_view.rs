@@ -11,6 +11,7 @@ use gtk4::prelude::*;
 
 use crate::library::track::Track;
 use crate::library::track::TrackId;
+use crate::ui::format::display_title;
 
 type SelectCallback = Rc<dyn Fn(usize)>;
 
@@ -82,18 +83,7 @@ impl QueueView {
 }
 
 fn track_row(track: &Track) -> ListBoxRow {
-    let title = if track.title.is_unknown() {
-        track
-            .path
-            .as_path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Unknown")
-            .to_owned()
-    } else {
-        track.title.as_str().to_owned()
-    };
-
+    let title = display_title(track);
     let title_label = Label::new(Some(&title));
     title_label.set_xalign(0.0);
     title_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);

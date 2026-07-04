@@ -318,9 +318,13 @@ mod tests {
         let folder = LibraryFolder::new(dir.path()).unwrap();
 
         let mut seen = Vec::new();
-        let total =
-            scan_folder_with_progress(&folder, &db, |p| Some((fake_track(p), None)), |n| seen.push(n))
-                .unwrap();
+        let total = scan_folder_with_progress(
+            &folder,
+            &db,
+            |p| Some((fake_track(p), None)),
+            |n| seen.push(n),
+        )
+        .unwrap();
 
         assert_eq!(total, 3);
         assert_eq!(seen, vec![1, 2, 3], "progress is the running indexed count");
@@ -392,6 +396,10 @@ mod tests {
         std::fs::remove_file(&file).unwrap();
 
         scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
-        assert_eq!(db.track_count().unwrap(), 0, "deleted file must be removed from DB");
+        assert_eq!(
+            db.track_count().unwrap(),
+            0,
+            "deleted file must be removed from DB"
+        );
     }
 }

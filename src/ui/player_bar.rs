@@ -18,6 +18,8 @@ use crate::player::PlayerCommand;
 use crate::player::PlayerHandle;
 use crate::player::SeekPosition;
 use crate::player::Volume;
+use crate::ui::format::display_title;
+use crate::ui::format::format_duration_secs;
 
 /// Bar containing transport controls, track info, and volume.
 #[derive(Clone)]
@@ -198,7 +200,7 @@ impl PlayerBar {
         let duration_ms = track.duration.as_duration().as_millis() as u64;
         self.duration_ms.set(duration_ms);
         self.total_label
-            .set_text(&format_secs(track.duration.as_secs()));
+            .set_text(&format_duration_secs(track.duration.as_secs()));
         self.time_label.set_text("0:00");
         // At least 1 so the scale has a valid, non-empty range even for a
         // zero-length or untagged track.
@@ -236,31 +238,19 @@ impl PlayerBar {
     /// Updates the elapsed time label and the progress position. Uses set_value
     /// (not change-value), so this does not trigger a seek.
     fn show_position(&self, position: SeekPosition) {
-        self.time_label.set_text(&format_secs(position.as_secs()));
+        self.time_label
+            .set_text(&format_duration_secs(position.as_secs()));
         self.progress
             .set_value(position.as_duration().as_millis() as f64);
     }
 }
 
-fn format_secs(secs: u64) -> String {
-    format!("{}:{:02}", secs / 60, secs % 60)
-}
-
 /// Pango markup showing the title large and bold with the artist dimmed beside
-/// it, so the now-playing track stands out. Falls back to the file name when the
+/// it, so the now-playing track stands out. Falls back to the filename when the
 /// title tag is absent.
 fn track_markup(track: &Track) -> String {
-    let title = if track.title.is_unknown() {
-        track
-            .path
-            .as_path()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Unknown")
-    } else {
-        track.title.as_str()
-    };
-    let title = markup_escape_text(title);
+    let raw = display_title(track);
+    let title = markup_escape_text(&raw);
     if track.artist.is_unknown() {
         format!("<span size='large' weight='bold'>{title}</span>")
     } else {

@@ -8,6 +8,7 @@ use rusqlite::OptionalExtension;
 
 use crate::library::album::AlbumSort;
 use crate::library::album::AlbumSummary;
+use crate::library::filter::LibraryFilter;
 use crate::library::track::AlbumArtData;
 use crate::library::track::AlbumTitle;
 use crate::library::track::Artist;
@@ -125,7 +126,20 @@ type TrackRow = (
 
 /// Builds a domain `Track` from a raw row, validating the path.
 fn build_track(row: TrackRow) -> Result<Track, DbError> {
-    let (id, path, title, artist, album, genre, duration_ms, track_num, disc_num, year, album_artist, composer) = row;
+    let (
+        id,
+        path,
+        title,
+        artist,
+        album,
+        genre,
+        duration_ms,
+        track_num,
+        disc_num,
+        year,
+        album_artist,
+        composer,
+    ) = row;
     let path = TrackPath::new(path).map_err(|e| DbError::InvalidData(e.to_string()))?;
     Ok(Track {
         id: TrackId::new(id),
@@ -223,19 +237,19 @@ impl Db {
     fn add_missing_track_columns(&self) -> Result<(), DbError> {
         let existing = self.track_columns()?;
         for (name, decl) in [
-            ("title",        "TEXT"),
-            ("artist",       "TEXT"),
-            ("album",        "TEXT"),
-            ("genre",        "TEXT"),
-            ("duration_ms",  "INTEGER"),
+            ("title", "TEXT"),
+            ("artist", "TEXT"),
+            ("album", "TEXT"),
+            ("genre", "TEXT"),
+            ("duration_ms", "INTEGER"),
             ("track_number", "INTEGER"),
-            ("disc_number",  "INTEGER"),
-            ("year",         "INTEGER"),
-            ("art",          "BLOB"),
+            ("disc_number", "INTEGER"),
+            ("year", "INTEGER"),
+            ("art", "BLOB"),
             ("album_artist", "TEXT"),
-            ("composer",     "TEXT"),
-            ("mtime",        "INTEGER"),
-            ("size",         "INTEGER"),
+            ("composer", "TEXT"),
+            ("mtime", "INTEGER"),
+            ("size", "INTEGER"),
         ] {
             if !existing.iter().any(|c| c == name) {
                 self.conn
@@ -283,7 +297,12 @@ impl Db {
     /// `Connection`) and returns the assigned `track_id`. Uses `prepare_cached`
     /// so the statement is compiled once and reused on subsequent calls with the
     /// same connection.
-    pub(crate) fn upsert_one(conn: &Connection, track: &Track, mtime: u64, size: u64) -> Result<TrackId, DbError> {
+    pub(crate) fn upsert_one(
+        conn: &Connection,
+        track: &Track,
+        mtime: u64,
+        size: u64,
+    ) -> Result<TrackId, DbError> {
         let path = track.path.as_path().to_string_lossy();
         let title = (!track.title.is_unknown()).then(|| track.title.as_str().to_owned());
         let artist = (!track.artist.is_unknown()).then(|| track.artist.as_str().to_owned());
@@ -359,7 +378,11 @@ impl Db {
             "INSERT INTO album_art (album, album_artist, data) VALUES (?1, ?2, ?3)
              ON CONFLICT(album, album_artist) DO UPDATE SET data = excluded.data",
         )?;
-        stmt.execute(rusqlite::params![album.as_str(), album_artist.as_str(), data])?;
+        stmt.execute(rusqlite::params![
+            album.as_str(),
+            album_artist.as_str(),
+            data
+        ])?;
         Ok(())
     }
 
@@ -435,9 +458,9 @@ impl Db {
     ) -> Result<u64, DbError> {
         let prefix = format!("{}/", folder.as_path().to_string_lossy());
         let existing: Vec<String> = {
-            let mut stmt = self.conn.prepare_cached(
-                "SELECT path FROM tracks WHERE substr(path, 1, length(?1)) = ?1",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare_cached("SELECT path FROM tracks WHERE substr(path, 1, length(?1)) = ?1")?;
             stmt.query_map([&prefix], |row| row.get::<_, String>(0))?
                 .map(|r| r.map_err(DbError::from))
                 .collect::<Result<_, _>>()?
@@ -554,9 +577,9 @@ impl Db {
 
     /// Distinct non-empty genres present in the library, alphabetically ordered.
     pub fn distinct_genres(&self) -> Result<Vec<Genre>, DbError> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT DISTINCT genre FROM tracks WHERE genre IS NOT NULL ORDER BY genre")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT genre FROM tracks WHERE genre IS NOT NULL ORDER BY genre",
+        )?;
         stmt.query_map([], |row| row.get::<_, String>(0))?
             .map(|r| r.map_err(DbError::from).map(Genre::new))
             .collect()
@@ -574,9 +597,9 @@ impl Db {
 
     /// Distinct non-empty albums present in the library, alphabetically ordered.
     pub fn distinct_albums(&self) -> Result<Vec<AlbumTitle>, DbError> {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT DISTINCT album FROM tracks WHERE album IS NOT NULL ORDER BY album")?;
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT album FROM tracks WHERE album IS NOT NULL ORDER BY album",
+        )?;
         stmt.query_map([], |row| row.get::<_, String>(0))?
             .map(|r| r.map_err(DbError::from).map(AlbumTitle::new))
             .collect()
@@ -642,6 +665,32 @@ impl Db {
         sort: &AlbumSort,
     ) -> Result<Vec<AlbumSummary>, DbError> {
         self.album_summaries_query("WHERE album = ?1", [album.as_str()], sort)
+    }
+
+    /// Returns the tracks matching `filter`. This is the canonical public API;
+    /// the per-filter helpers below are `pub(crate)` and exist for internal use.
+    pub fn tracks_for(&self, filter: &LibraryFilter) -> Result<Vec<Track>, DbError> {
+        match filter {
+            LibraryFilter::All => self.list_tracks(),
+            LibraryFilter::ByGenre(g) => self.tracks_by_genre(g),
+            LibraryFilter::ByArtist(a) => self.tracks_by_artist(a),
+            LibraryFilter::ByAlbum(a) => self.tracks_by_album(a),
+        }
+    }
+
+    /// Returns the album summaries matching `filter`, in `sort` order. This is
+    /// the canonical public API; the per-filter helpers below are `pub(crate)`.
+    pub fn album_summaries_for(
+        &self,
+        filter: &LibraryFilter,
+        sort: &AlbumSort,
+    ) -> Result<Vec<AlbumSummary>, DbError> {
+        match filter {
+            LibraryFilter::All => self.album_summaries_sorted(sort),
+            LibraryFilter::ByGenre(g) => self.album_summaries_by_genre_sorted(g, sort),
+            LibraryFilter::ByArtist(a) => self.album_summaries_by_artist_sorted(a, sort),
+            LibraryFilter::ByAlbum(a) => self.album_summaries_by_album_sorted(a, sort),
+        }
     }
 
     /// Runs the album-summary aggregate with the given `WHERE` clause. Albums are
@@ -1630,17 +1679,17 @@ mod tests {
                 &Artist::new("Boards of Canada"),
             )
             .unwrap();
-        assert_eq!(art.as_ref().map(AlbumArtData::as_bytes), Some(&[0xFF, 0xD8, 0xFF][..]));
+        assert_eq!(
+            art.as_ref().map(AlbumArtData::as_bytes),
+            Some(&[0xFF, 0xD8, 0xFF][..])
+        );
     }
 
     #[test]
     fn art_for_album_returns_none_for_unknown_album() {
         let db = Db::open_in_memory().unwrap();
         let art = db
-            .art_for_album(
-                &AlbumTitle::new("Missing"),
-                &Artist::new("Nobody"),
-            )
+            .art_for_album(&AlbumTitle::new("Missing"), &Artist::new("Nobody"))
             .unwrap();
         assert!(art.is_none());
     }
@@ -1649,8 +1698,13 @@ mod tests {
     fn upsert_art_skips_empty_album() {
         let db = Db::open_in_memory().unwrap();
         // Empty album means no meaningful key — must not insert a row.
-        Db::upsert_art(&db.conn, &AlbumTitle::new(""), &Artist::new("Boards of Canada"), &[0xFF])
-            .unwrap();
+        Db::upsert_art(
+            &db.conn,
+            &AlbumTitle::new(""),
+            &Artist::new("Boards of Canada"),
+            &[0xFF],
+        )
+        .unwrap();
         let count: i64 = db
             .conn
             .query_row("SELECT COUNT(*) FROM album_art", [], |r| r.get(0))
@@ -1689,8 +1743,12 @@ mod tests {
     #[test]
     fn remove_stale_tracks_deletes_paths_absent_from_seen() {
         let db = Db::open_in_memory().unwrap();
-        let id1 = db.upsert_track(&full_track("/music/boc/roygbiv.flac")).unwrap();
-        let id2 = db.upsert_track(&full_track("/music/boc/aquarius.flac")).unwrap();
+        let id1 = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        let id2 = db
+            .upsert_track(&full_track("/music/boc/aquarius.flac"))
+            .unwrap();
 
         let seen: HashSet<PathBuf> = [PathBuf::from("/music/boc/roygbiv.flac")]
             .into_iter()
@@ -1699,14 +1757,21 @@ mod tests {
         let removed = db.remove_stale_tracks(&folder, &seen).unwrap();
 
         assert_eq!(removed, 1);
-        assert!(db.track_by_id(id1).unwrap().is_some(), "seen track must survive");
-        assert!(db.track_by_id(id2).unwrap().is_none(), "unseen track must be removed");
+        assert!(
+            db.track_by_id(id1).unwrap().is_some(),
+            "seen track must survive"
+        );
+        assert!(
+            db.track_by_id(id2).unwrap().is_none(),
+            "unseen track must be removed"
+        );
     }
 
     #[test]
     fn remove_stale_tracks_returns_zero_when_all_paths_are_seen() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&full_track("/music/boc/roygbiv.flac")).unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
 
         let seen: HashSet<PathBuf> = [PathBuf::from("/music/boc/roygbiv.flac")]
             .into_iter()
@@ -1721,7 +1786,8 @@ mod tests {
     #[test]
     fn remove_stale_tracks_spares_paths_outside_the_folder() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&full_track("/music/boc/roygbiv.flac")).unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
         db.upsert_track(&full_track("/other/track.flac")).unwrap();
 
         // Scan only /music/boc; the other track is outside and must not be touched.
@@ -1729,6 +1795,117 @@ mod tests {
         let folder = LibraryFolder::new("/music/boc").unwrap();
         db.remove_stale_tracks(&folder, &seen).unwrap();
 
-        assert_eq!(db.track_count().unwrap(), 1, "/other/track.flac must survive");
+        assert_eq!(
+            db.track_count().unwrap(),
+            1,
+            "/other/track.flac must survive"
+        );
+    }
+
+    fn two_artist_library() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/roygbiv.flac",
+            "Boards of Canada",
+            "Music Has the Right to Children",
+            "Electronic",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/aphex/xtal.flac",
+            "Aphex Twin",
+            "Selected Ambient Works 85-92",
+            "Ambient",
+        ))
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn tracks_for_all_returns_every_track() {
+        let db = two_artist_library();
+        assert_eq!(db.tracks_for(&LibraryFilter::All).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn tracks_for_by_genre_returns_only_that_genre() {
+        let db = two_artist_library();
+        let tracks = db
+            .tracks_for(&LibraryFilter::ByGenre(Genre::new("Ambient")))
+            .unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].artist.as_str(), "Aphex Twin");
+    }
+
+    #[test]
+    fn tracks_for_by_artist_returns_only_that_artist() {
+        let db = two_artist_library();
+        let tracks = db
+            .tracks_for(&LibraryFilter::ByArtist(Artist::new("Boards of Canada")))
+            .unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].album.as_str(), "Music Has the Right to Children");
+    }
+
+    #[test]
+    fn tracks_for_by_album_returns_only_that_album() {
+        let db = two_artist_library();
+        let tracks = db
+            .tracks_for(&LibraryFilter::ByAlbum(AlbumTitle::new(
+                "Selected Ambient Works 85-92",
+            )))
+            .unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].genre.as_str(), "Ambient");
+    }
+
+    #[test]
+    fn album_summaries_for_all_returns_every_album() {
+        let db = two_artist_library();
+        assert_eq!(
+            db.album_summaries_for(&LibraryFilter::All, &AlbumSort::default())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn album_summaries_for_by_genre_returns_only_that_genre() {
+        let db = two_artist_library();
+        let albums = db
+            .album_summaries_for(
+                &LibraryFilter::ByGenre(Genre::new("Ambient")),
+                &AlbumSort::default(),
+            )
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].artist.as_str(), "Aphex Twin");
+    }
+
+    #[test]
+    fn album_summaries_for_by_artist_returns_only_that_artist() {
+        let db = two_artist_library();
+        let albums = db
+            .album_summaries_for(
+                &LibraryFilter::ByArtist(Artist::new("Boards of Canada")),
+                &AlbumSort::default(),
+            )
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].album.as_str(), "Music Has the Right to Children");
+    }
+
+    #[test]
+    fn album_summaries_for_by_album_returns_only_that_album() {
+        let db = two_artist_library();
+        let albums = db
+            .album_summaries_for(
+                &LibraryFilter::ByAlbum(AlbumTitle::new("Selected Ambient Works 85-92")),
+                &AlbumSort::default(),
+            )
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].genre.as_str(), "Ambient");
     }
 }

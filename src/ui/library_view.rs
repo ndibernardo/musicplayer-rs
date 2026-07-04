@@ -10,7 +10,7 @@ use gtk4::gio::ListStore;
 use gtk4::prelude::*;
 
 use crate::library::track::Track;
-use crate::library::track::TrackDuration;
+use crate::ui::format::format_duration;
 
 #[derive(Clone)]
 pub struct LibraryView {
@@ -116,9 +116,4 @@ where
         label.set_text(&extract(&track));
     });
     ColumnViewColumn::new(Some(title), Some(factory))
-}
-
-fn format_duration(d: TrackDuration) -> String {
-    let total_secs = d.as_secs();
-    format!("{}:{:02}", total_secs / 60, total_secs % 60)
 }

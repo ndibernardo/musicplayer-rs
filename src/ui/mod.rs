@@ -1,5 +1,6 @@
 mod album_grid;
 mod app;
+mod format;
 mod library_view;
 mod main_window;
 mod player_bar;

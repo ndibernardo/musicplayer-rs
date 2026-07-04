@@ -11,7 +11,7 @@ use gtk4::Orientation;
 use gtk4::ScrolledWindow;
 use gtk4::prelude::*;
 
-use crate::library::query::LibraryFilter;
+use crate::library::filter::LibraryFilter;
 use crate::library::track::Artist;
 use crate::library::track::Genre;
 
