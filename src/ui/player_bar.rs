@@ -7,6 +7,7 @@ use gtk4::Button;
 use gtk4::Image;
 use gtk4::Label;
 use gtk4::Orientation;
+use gtk4::ProgressBar;
 use gtk4::Scale;
 use gtk4::prelude::*;
 
@@ -14,6 +15,7 @@ use crate::library::track::Track;
 use crate::player::PlaybackState;
 use crate::player::PlayerCommand;
 use crate::player::PlayerHandle;
+use crate::player::SeekPosition;
 use crate::player::Volume;
 
 /// Bar containing transport controls, track info, and volume.
@@ -22,10 +24,14 @@ pub struct PlayerBar {
     pub widget: GtkBox,
     track_label: Label,
     time_label: Label,
+    total_label: Label,
+    progress: ProgressBar,
     play_pause_btn: Button,
     volume_scale: Scale,
     // Tracks whether the engine is currently playing so the button can toggle correctly.
     is_playing: Rc<Cell<bool>>,
+    // Current track length in milliseconds, for computing the progress fraction.
+    duration_ms: Rc<Cell<u64>>,
 }
 
 impl PlayerBar {
@@ -63,12 +69,27 @@ impl PlayerBar {
         controls.append(&stop_btn);
         controls.append(&next_btn);
 
-        let info = GtkBox::new(Orientation::Horizontal, 8);
+        let total_label = Label::new(Some("0:00"));
+        total_label.add_css_class("numeric");
+        total_label.set_width_chars(6);
+        total_label.set_xalign(0.0);
+
+        let progress = ProgressBar::new();
+        progress.set_hexpand(true);
+        progress.set_valign(gtk4::Align::Center);
+
+        let progress_row = GtkBox::new(Orientation::Horizontal, 6);
+        progress_row.append(&time_label);
+        progress_row.append(&progress);
+        progress_row.append(&total_label);
+
+        let info = GtkBox::new(Orientation::Vertical, 4);
         info.set_hexpand(true);
-        info.set_halign(gtk4::Align::Center);
         info.set_valign(gtk4::Align::Center);
+        info.set_margin_start(8);
+        info.set_margin_end(8);
         info.append(&track_label);
-        info.append(&time_label);
+        info.append(&progress_row);
 
         let vol_box = GtkBox::new(Orientation::Horizontal, 4);
         vol_box.set_margin_end(12);
@@ -78,7 +99,7 @@ impl PlayerBar {
         vol_box.append(&volume_scale);
 
         let widget = GtkBox::new(Orientation::Horizontal, 0);
-        widget.set_height_request(56);
+        widget.set_height_request(88);
         widget.add_css_class("toolbar");
         widget.append(&controls);
         widget.append(&info);
@@ -129,9 +150,12 @@ impl PlayerBar {
             widget,
             track_label,
             time_label,
+            total_label,
+            progress,
             play_pause_btn,
             volume_scale,
             is_playing,
+            duration_ms: Rc::new(Cell::new(0)),
         }
     }
 
@@ -160,6 +184,13 @@ impl PlayerBar {
             format!("{} — {}", track.artist.as_str(), track.title.as_str())
         };
         self.track_label.set_text(&text);
+
+        self.duration_ms
+            .set(track.duration.as_duration().as_millis() as u64);
+        self.total_label
+            .set_text(&format_secs(track.duration.as_secs()));
+        self.time_label.set_text("0:00");
+        self.progress.set_fraction(0.0);
     }
 
     /// Called on every state change (play/pause/stop) and on position ticks.
@@ -171,23 +202,42 @@ impl PlayerBar {
                     .set_icon_name("media-playback-start-symbolic");
                 self.track_label.set_text("");
                 self.time_label.set_text("0:00");
+                self.total_label.set_text("0:00");
+                self.progress.set_fraction(0.0);
             }
             PlaybackState::Playing { position, .. } => {
                 self.is_playing.set(true);
                 self.play_pause_btn
                     .set_icon_name("media-playback-pause-symbolic");
-                self.time_label.set_text(&format_secs(position.as_secs()));
+                self.show_position(*position);
             }
             PlaybackState::Paused { position, .. } => {
                 self.is_playing.set(false);
                 self.play_pause_btn
                     .set_icon_name("media-playback-start-symbolic");
-                self.time_label.set_text(&format_secs(position.as_secs()));
+                self.show_position(*position);
             }
         }
+    }
+
+    /// Updates the elapsed time label and the progress fraction for `position`.
+    fn show_position(&self, position: SeekPosition) {
+        self.time_label.set_text(&format_secs(position.as_secs()));
+        let elapsed_ms = position.as_duration().as_millis() as u64;
+        self.progress
+            .set_fraction(fraction(elapsed_ms, self.duration_ms.get()));
     }
 }
 
 fn format_secs(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// The played fraction in [0.0, 1.0], or 0.0 when the duration is unknown.
+fn fraction(elapsed_ms: u64, duration_ms: u64) -> f64 {
+    if duration_ms == 0 {
+        0.0
+    } else {
+        (elapsed_ms as f64 / duration_ms as f64).min(1.0)
+    }
 }

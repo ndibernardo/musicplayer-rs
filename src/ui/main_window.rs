@@ -577,7 +577,9 @@ pub fn build(
         let mut last_saved_secs: Option<u64> = None;
         glib::timeout_add_local(Duration::from_millis(250), move || {
             while let Ok(state) = state_rx.try_recv() {
-                player_bar.update_state(&state);
+                // Apply a track change before update_state: set_track resets the
+                // progress bar, so it must run first or it would wipe the position
+                // that update_state is about to show (notably on a restored track).
                 let track_id = state.current_track();
                 if track_id != last_shown {
                     last_shown = track_id;
@@ -594,6 +596,7 @@ pub fn build(
                         None => queue_view.set_current(None),
                     }
                 }
+                player_bar.update_state(&state);
                 // Persist the position at most once per whole second, so reopening
                 // resumes near where the session was closed.
                 if let Some(position) = state.position()
