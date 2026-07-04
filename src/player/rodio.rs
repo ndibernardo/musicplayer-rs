@@ -30,17 +30,37 @@ impl RodioAudioBackend {
     }
 }
 
-impl AudioBackend for RodioAudioBackend {
-    fn play(&mut self, path: &TrackPath) -> Result<(), AudioError> {
+impl RodioAudioBackend {
+    /// Opens and decodes `path`, mapping failures to `AudioError::Decode`.
+    fn open_decoder(path: &TrackPath) -> Result<Decoder<BufReader<File>>, AudioError> {
         let path_str = path.as_path().to_string_lossy().into_owned();
         let file = File::open(path.as_path())
             .map_err(|e| AudioError::Decode(path_str.clone(), e.to_string()))?;
-        let decoder = Decoder::new(BufReader::new(file))
-            .map_err(|e| AudioError::Decode(path_str, e.to_string()))?;
-        // Replace player to stop the previous track cleanly.
-        let new_player = Player::connect_new(self._device_sink.mixer());
-        self.player = new_player;
+        Decoder::new(BufReader::new(file)).map_err(|e| AudioError::Decode(path_str, e.to_string()))
+    }
+
+    /// Replaces the player with a fresh one, stopping the previous track cleanly.
+    fn fresh_player(&mut self) {
+        self.player = Player::connect_new(self._device_sink.mixer());
+    }
+}
+
+impl AudioBackend for RodioAudioBackend {
+    fn play(&mut self, path: &TrackPath) -> Result<(), AudioError> {
+        let decoder = Self::open_decoder(path)?;
+        self.fresh_player();
         self.player.append(decoder);
+        Ok(())
+    }
+
+    fn play_paused(&mut self, path: &TrackPath, position: Duration) -> Result<(), AudioError> {
+        let decoder = Self::open_decoder(path)?;
+        self.fresh_player();
+        // Pause before appending so the restored track makes no sound until the
+        // user resumes; then move the play head to where the session ended.
+        self.player.pause();
+        self.player.append(decoder);
+        let _ = self.player.try_seek(position);
         Ok(())
     }
 

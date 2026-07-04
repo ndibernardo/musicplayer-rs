@@ -101,6 +101,15 @@ impl PlaybackState {
             Self::Paused { track, .. } => Some(*track),
         }
     }
+
+    /// The playback position, or `None` when stopped.
+    pub fn position(&self) -> Option<SeekPosition> {
+        match self {
+            Self::Stopped => None,
+            Self::Playing { position, .. } => Some(*position),
+            Self::Paused { position, .. } => Some(*position),
+        }
+    }
 }
 
 /// Commands sent to the audio engine thread.
@@ -113,6 +122,13 @@ pub enum PlayerCommand {
     PlayQueue {
         tracks: Vec<Track>,
         start: usize,
+    },
+    /// Restores `tracks` at `start`, loaded paused at `position` — used on
+    /// startup to reopen where the previous session left off, without resuming.
+    RestorePaused {
+        tracks: Vec<Track>,
+        start: usize,
+        position: SeekPosition,
     },
     Pause,
     Resume,
@@ -137,6 +153,9 @@ pub enum AudioError {
 /// to the thread that created them. The player thread creates its own instance.
 pub trait AudioBackend {
     fn play(&mut self, path: &TrackPath) -> Result<(), AudioError>;
+    /// Loads `path` and holds it paused at `position`, with no audible playback,
+    /// so a restored session reopens where it left off without resuming.
+    fn play_paused(&mut self, path: &TrackPath, position: Duration) -> Result<(), AudioError>;
     fn pause(&mut self);
     fn resume(&mut self);
     fn stop(&mut self);
@@ -218,6 +237,22 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
             Ok(PlayerCommand::PlayQueue { tracks, start }) => {
                 queue = Queue::new(tracks, start);
                 play_current(backend, &queue, &on_state);
+            }
+            Ok(PlayerCommand::RestorePaused {
+                tracks,
+                start,
+                position,
+            }) => {
+                queue = Queue::new(tracks, start);
+                if let Some(track) = queue.current() {
+                    match backend.play_paused(&track.path, position.as_duration()) {
+                        Ok(()) => on_state(PlaybackState::Paused {
+                            track: track.id,
+                            position,
+                        }),
+                        Err(e) => eprintln!("restore error: {e}"),
+                    }
+                }
             }
             Ok(PlayerCommand::Next) => {
                 if queue.advance().is_some() {
@@ -414,6 +449,15 @@ mod tests {
         fn play(&mut self, _path: &TrackPath) -> Result<(), AudioError> {
             self.playing = true;
             self.paused = false;
+            Ok(())
+        }
+        fn play_paused(
+            &mut self,
+            _path: &TrackPath,
+            _position: Duration,
+        ) -> Result<(), AudioError> {
+            self.playing = false;
+            self.paused = true;
             Ok(())
         }
         fn pause(&mut self) {
@@ -620,6 +664,14 @@ mod tests {
             self.playing.store(true, Ordering::SeqCst);
             Ok(())
         }
+        fn play_paused(
+            &mut self,
+            _path: &TrackPath,
+            _position: Duration,
+        ) -> Result<(), AudioError> {
+            self.playing.store(false, Ordering::SeqCst);
+            Ok(())
+        }
         fn pause(&mut self) {
             self.playing.store(false, Ordering::SeqCst);
         }
@@ -690,5 +742,41 @@ mod tests {
 
         let s = recv_matching(&rx, |s| s == &PlaybackState::Stopped);
         assert_eq!(s, PlaybackState::Stopped);
+    }
+
+    #[test]
+    fn player_restore_paused_reports_paused_at_position() {
+        let (handle, rx) = launch_with_channel();
+        handle.send(PlayerCommand::RestorePaused {
+            tracks: geogaddi_pair(),
+            start: 1,
+            position: SeekPosition::from_secs(87),
+        });
+        let s = recv_matching(&rx, |s| matches!(s, PlaybackState::Paused { .. }));
+        assert_eq!(s.current_track(), Some(TrackId::new(20)));
+        assert_eq!(s.position(), Some(SeekPosition::from_secs(87)));
+    }
+
+    #[test]
+    fn playback_state_stopped_has_no_position() {
+        assert_eq!(PlaybackState::Stopped.position(), None);
+    }
+
+    #[test]
+    fn playback_state_playing_exposes_position() {
+        let state = PlaybackState::Playing {
+            track: TrackId::new(1),
+            position: SeekPosition::from_secs(12),
+        };
+        assert_eq!(state.position(), Some(SeekPosition::from_secs(12)));
+    }
+
+    #[test]
+    fn playback_state_paused_exposes_position() {
+        let state = PlaybackState::Paused {
+            track: TrackId::new(3),
+            position: SeekPosition::from_secs(30),
+        };
+        assert_eq!(state.position(), Some(SeekPosition::from_secs(30)));
     }
 }
