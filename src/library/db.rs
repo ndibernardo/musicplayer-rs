@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 
+use crate::library::album::AlbumSort;
 use crate::library::album::AlbumSummary;
 use crate::library::track::AlbumArtData;
 use crate::library::track::AlbumTitle;
@@ -415,17 +416,40 @@ impl Db {
     /// NULLs — so a summary carries art from any track in the group that has it,
     /// even when others don't.
     pub fn album_summaries(&self) -> Result<Vec<AlbumSummary>, DbError> {
-        self.album_summaries_query("", [])
+        self.album_summaries_sorted(&AlbumSort::default())
+    }
+
+    /// Album summaries in `sort` order.
+    pub fn album_summaries_sorted(&self, sort: &AlbumSort) -> Result<Vec<AlbumSummary>, DbError> {
+        self.album_summaries_query("", [], sort)
     }
 
     /// Album summaries whose genre equals `genre`.
     pub fn album_summaries_by_genre(&self, genre: &Genre) -> Result<Vec<AlbumSummary>, DbError> {
-        self.album_summaries_query("WHERE genre = ?1", [genre.as_str()])
+        self.album_summaries_by_genre_sorted(genre, &AlbumSort::default())
+    }
+
+    /// Album summaries whose genre equals `genre`, in `sort` order.
+    pub fn album_summaries_by_genre_sorted(
+        &self,
+        genre: &Genre,
+        sort: &AlbumSort,
+    ) -> Result<Vec<AlbumSummary>, DbError> {
+        self.album_summaries_query("WHERE genre = ?1", [genre.as_str()], sort)
     }
 
     /// Album summaries by `artist`.
     pub fn album_summaries_by_artist(&self, artist: &Artist) -> Result<Vec<AlbumSummary>, DbError> {
-        self.album_summaries_query("WHERE artist = ?1", [artist.as_str()])
+        self.album_summaries_by_artist_sorted(artist, &AlbumSort::default())
+    }
+
+    /// Album summaries by `artist`, in `sort` order.
+    pub fn album_summaries_by_artist_sorted(
+        &self,
+        artist: &Artist,
+        sort: &AlbumSort,
+    ) -> Result<Vec<AlbumSummary>, DbError> {
+        self.album_summaries_query("WHERE artist = ?1", [artist.as_str()], sort)
     }
 
     /// Album summaries whose album title equals `album`.
@@ -433,7 +457,16 @@ impl Db {
         &self,
         album: &AlbumTitle,
     ) -> Result<Vec<AlbumSummary>, DbError> {
-        self.album_summaries_query("WHERE album = ?1", [album.as_str()])
+        self.album_summaries_by_album_sorted(album, &AlbumSort::default())
+    }
+
+    /// Album summaries whose album title equals `album`, in `sort` order.
+    pub fn album_summaries_by_album_sorted(
+        &self,
+        album: &AlbumTitle,
+        sort: &AlbumSort,
+    ) -> Result<Vec<AlbumSummary>, DbError> {
+        self.album_summaries_query("WHERE album = ?1", [album.as_str()], sort)
     }
 
     /// Runs the album-summary aggregate with the given `WHERE` clause. Albums are
@@ -445,13 +478,15 @@ impl Db {
         &self,
         where_clause: &str,
         params: impl rusqlite::Params,
+        sort: &AlbumSort,
     ) -> Result<Vec<AlbumSummary>, DbError> {
+        let order_by = sort.order_by_clause();
         let sql = format!(
             "SELECT album, COALESCE(album_artist, artist) AS album_artist,
-                    MAX(genre), MAX(year), MAX(art)
+                    MAX(genre) AS album_genre, MAX(year) AS album_year, MAX(art)
              FROM tracks {where_clause}
              GROUP BY album, album_artist
-             ORDER BY album_artist, album"
+             {order_by}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
         stmt.query_map(params, |row| {
@@ -516,6 +551,8 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::library::album::AlbumSortField;
+    use crate::library::album::SortDirection;
     use crate::library::track::AlbumTitle;
     use crate::library::track::Artist;
     use crate::library::track::DiscNumber;
@@ -1262,6 +1299,39 @@ mod tests {
             .unwrap();
         assert_eq!(geogaddi.len(), 1);
         assert_eq!(geogaddi[0].album.as_str(), "Geogaddi");
+    }
+
+    #[test]
+    fn album_summaries_sorted_by_year_descending_orders_newest_first() {
+        let db = Db::open_in_memory().unwrap();
+        let older = Track {
+            year: Year::new(1998),
+            ..track_tagged(
+                "/music/boc/mhtrtc.flac",
+                "Boards of Canada",
+                "Music Has the Right to Children",
+                "Electronic",
+            )
+        };
+        let newer = Track {
+            year: Year::new(2002),
+            ..track_tagged(
+                "/music/boc/geogaddi.flac",
+                "Boards of Canada",
+                "Geogaddi",
+                "Electronic",
+            )
+        };
+        db.upsert_track(&older).unwrap();
+        db.upsert_track(&newer).unwrap();
+
+        let sort = AlbumSort::new(AlbumSortField::Year, SortDirection::Descending);
+        let summaries = db.album_summaries_sorted(&sort).unwrap();
+        assert_eq!(summaries[0].album.as_str(), "Geogaddi");
+        assert_eq!(
+            summaries[1].album.as_str(),
+            "Music Has the Right to Children"
+        );
     }
 
     #[test]
