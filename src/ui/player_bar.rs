@@ -9,6 +9,7 @@ use gtk4::Label;
 use gtk4::Orientation;
 use gtk4::ProgressBar;
 use gtk4::Scale;
+use gtk4::glib::markup_escape_text;
 use gtk4::prelude::*;
 
 use crate::library::track::Track;
@@ -61,8 +62,6 @@ impl PlayerBar {
         volume_scale.set_draw_value(false);
 
         let controls = GtkBox::new(Orientation::Horizontal, 4);
-        controls.set_margin_start(8);
-        controls.set_margin_end(8);
         controls.set_valign(gtk4::Align::Center);
         controls.append(&prev_btn);
         controls.append(&play_pause_btn);
@@ -78,32 +77,33 @@ impl PlayerBar {
         progress.set_hexpand(true);
         progress.set_valign(gtk4::Align::Center);
 
-        let progress_row = GtkBox::new(Orientation::Horizontal, 6);
-        progress_row.append(&time_label);
-        progress_row.append(&progress);
-        progress_row.append(&total_label);
-
-        let info = GtkBox::new(Orientation::Vertical, 4);
-        info.set_hexpand(true);
-        info.set_valign(gtk4::Align::Center);
-        info.set_margin_start(8);
-        info.set_margin_end(8);
-        info.append(&track_label);
-        info.append(&progress_row);
-
-        let vol_box = GtkBox::new(Orientation::Horizontal, 4);
-        vol_box.set_margin_end(12);
-        vol_box.set_valign(gtk4::Align::Center);
         let vol_icon = Image::from_icon_name("audio-volume-medium-symbolic");
+        let vol_box = GtkBox::new(Orientation::Horizontal, 4);
+        vol_box.set_valign(gtk4::Align::Center);
         vol_box.append(&vol_icon);
         vol_box.append(&volume_scale);
 
-        let widget = GtkBox::new(Orientation::Horizontal, 0);
-        widget.set_height_request(88);
+        // Transport, times, progress, and volume share one row so the control
+        // icons line up with the progress bar.
+        let bottom = GtkBox::new(Orientation::Horizontal, 8);
+        bottom.set_valign(gtk4::Align::Center);
+        bottom.set_margin_start(8);
+        bottom.set_margin_end(12);
+        bottom.set_margin_bottom(12);
+        bottom.append(&controls);
+        bottom.append(&time_label);
+        bottom.append(&progress);
+        bottom.append(&total_label);
+        bottom.append(&vol_box);
+
+        track_label.set_margin_top(8);
+
+        let widget = GtkBox::new(Orientation::Vertical, 4);
+        widget.set_height_request(112);
         widget.add_css_class("toolbar");
-        widget.append(&controls);
-        widget.append(&info);
-        widget.append(&vol_box);
+        widget.add_css_class("player-bar");
+        widget.append(&track_label);
+        widget.append(&bottom);
 
         let is_playing = Rc::new(Cell::new(false));
 
@@ -168,22 +168,7 @@ impl PlayerBar {
 
     /// Called when a new track starts (from double-click or auto-advance).
     pub fn set_track(&self, track: &Track) {
-        let text = if track.artist.is_unknown() {
-            if track.title.is_unknown() {
-                track
-                    .path
-                    .as_path()
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("Unknown")
-                    .to_owned()
-            } else {
-                track.title.as_str().to_owned()
-            }
-        } else {
-            format!("{} — {}", track.artist.as_str(), track.title.as_str())
-        };
-        self.track_label.set_text(&text);
+        self.track_label.set_markup(&track_markup(track));
 
         self.duration_ms
             .set(track.duration.as_duration().as_millis() as u64);
@@ -231,6 +216,31 @@ impl PlayerBar {
 
 fn format_secs(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Pango markup showing the title large and bold with the artist dimmed beside
+/// it, so the now-playing track stands out. Falls back to the file name when the
+/// title tag is absent.
+fn track_markup(track: &Track) -> String {
+    let title = if track.title.is_unknown() {
+        track
+            .path
+            .as_path()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Unknown")
+    } else {
+        track.title.as_str()
+    };
+    let title = markup_escape_text(title);
+    if track.artist.is_unknown() {
+        format!("<span size='large' weight='bold'>{title}</span>")
+    } else {
+        let artist = markup_escape_text(track.artist.as_str());
+        format!(
+            "<span size='large' weight='bold'>{title}</span>  <span size='large' alpha='70%'>{artist}</span>"
+        )
+    }
 }
 
 /// The played fraction in [0.0, 1.0], or 0.0 when the duration is unknown.

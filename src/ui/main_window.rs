@@ -82,6 +82,17 @@ const SORT_FIELD_LABELS: [&str; 4] = ["Album Artist", "Year", "Genre", "Album"];
 const COVER_SIZE_MIN: f64 = 200.0;
 const COVER_SIZE_MAX: f64 = 500.0;
 
+/// Application-wide styling: a darker player bar than the surrounding window,
+/// with visible slider and progress troughs against that darker background.
+const APP_CSS: &str = "\
+.player-bar { background-color: rgba(0, 0, 0, 0.25); }
+.player-bar scale trough,
+.player-bar progressbar trough {
+    background-color: alpha(currentColor, 0.22);
+    min-height: 6px;
+}
+";
+
 pub fn build(
     app: &Application,
     db: Rc<Db>,
@@ -89,6 +100,8 @@ pub fn build(
     player: PlayerHandle,
     state_rx: mpsc::Receiver<PlaybackState>,
 ) -> ApplicationWindow {
+    install_styles();
+
     let header = HeaderBar::new();
 
     let add_btn = Button::from_icon_name("folder-new-symbolic");
@@ -721,6 +734,19 @@ pub fn build(
     }
 
     window
+}
+
+/// Registers the application CSS on the default display, once at window build.
+fn install_styles() {
+    let provider = gtk4::CssProvider::new();
+    provider.load_from_string(APP_CSS);
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
 }
 
 fn refresh_sidebar(sidebar: &Sidebar, db: &Rc<Db>) {
