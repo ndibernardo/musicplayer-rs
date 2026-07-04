@@ -130,6 +130,10 @@ pub enum PlayerCommand {
         tracks: Vec<Track>,
         start: usize,
     },
+    /// Appends `tracks` to the end of the current queue without disturbing
+    /// what's already playing. If the queue was empty, playback starts from
+    /// the first appended track.
+    Enqueue(Vec<Track>),
     /// Restores `tracks` at `start`, loaded paused at `position` — used on
     /// startup to reopen where the previous session left off, without resuming.
     RestorePaused {
@@ -293,6 +297,14 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                 queue = Queue::new(tracks, start);
                 play_current(backend, &queue, &on_state);
                 ticking = backend.is_playing();
+            }
+            Some(PlayerCommand::Enqueue(tracks)) => {
+                let was_empty = queue.is_empty();
+                queue.append(tracks);
+                if was_empty {
+                    play_current(backend, &queue, &on_state);
+                    ticking = backend.is_playing();
+                }
             }
             Some(PlayerCommand::RestorePaused {
                 tracks,
@@ -715,6 +727,35 @@ mod tests {
         });
         recv_matching(&rx, |s| s.current_track() == Some(TrackId::new(20)));
         handle.send(PlayerCommand::Previous);
+        let s = recv_matching(&rx, |s| s.current_track() == Some(TrackId::new(10)));
+        assert_eq!(s.current_track(), Some(TrackId::new(10)));
+    }
+
+    #[test]
+    fn player_enqueue_on_empty_queue_starts_playing_the_first_track() {
+        let (handle, rx) = launch_with_channel();
+        handle.send(PlayerCommand::Enqueue(geogaddi_pair()));
+        let s = recv_matching(&rx, |s| s.current_track() == Some(TrackId::new(10)));
+        assert_eq!(s.current_track(), Some(TrackId::new(10)));
+    }
+
+    #[test]
+    fn player_enqueue_while_playing_does_not_disturb_the_current_track() {
+        let (handle, rx) = launch_with_channel();
+        handle.send(PlayerCommand::Play(Box::new(julie_and_candy())));
+        recv_matching(&rx, |s| matches!(s, PlaybackState::Playing { .. }));
+        handle.send(PlayerCommand::Enqueue(geogaddi_pair()));
+        let s = recv_matching(&rx, |s| matches!(s, PlaybackState::Playing { .. }));
+        assert_eq!(s.current_track(), Some(julie_and_candy().id));
+    }
+
+    #[test]
+    fn player_next_reaches_a_track_appended_via_enqueue() {
+        let (handle, rx) = launch_with_channel();
+        handle.send(PlayerCommand::Play(Box::new(julie_and_candy())));
+        recv_matching(&rx, |s| matches!(s, PlaybackState::Playing { .. }));
+        handle.send(PlayerCommand::Enqueue(geogaddi_pair()));
+        handle.send(PlayerCommand::Next);
         let s = recv_matching(&rx, |s| s.current_track() == Some(TrackId::new(10)));
         assert_eq!(s.current_track(), Some(TrackId::new(10)));
     }

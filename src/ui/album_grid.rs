@@ -21,6 +21,7 @@ use gtk4::prelude::*;
 
 use crate::library::album::AlbumSummary;
 use crate::library::track::Track;
+use crate::ui::context_menu::show_add_to_queue_menu;
 use crate::ui::format::format_duration;
 
 /// Column count before the first width-driven reflow. The grid is hand-built
@@ -45,6 +46,8 @@ type TrackProvider = Rc<dyn Fn(&AlbumSummary) -> Vec<Track>>;
 type TrackCallback = Rc<dyn Fn(Vec<Track>, usize)>;
 /// Invoked with an album's full track list when its cover is opened.
 type AlbumCallback = Rc<dyn Fn(Vec<Track>)>;
+/// Invoked with a single track chosen from a "add to queue" context menu.
+type SingleTrackCallback = Rc<dyn Fn(Track)>;
 
 /// Album-art browser: a grid of cover cells. Activating a cover opens a
 /// full-width drawer with that album's full track list, inline on its own row
@@ -70,6 +73,8 @@ pub struct AlbumGrid {
     track_provider: Rc<RefCell<Option<TrackProvider>>>,
     on_track_activated: Rc<RefCell<Option<TrackCallback>>>,
     on_album_activated: Rc<RefCell<Option<AlbumCallback>>>,
+    on_album_enqueue: Rc<RefCell<Option<AlbumCallback>>>,
+    on_track_enqueue: Rc<RefCell<Option<SingleTrackCallback>>>,
 }
 
 impl AlbumGrid {
@@ -100,6 +105,8 @@ impl AlbumGrid {
             track_provider: Rc::new(RefCell::new(None)),
             on_track_activated: Rc::new(RefCell::new(None)),
             on_album_activated: Rc::new(RefCell::new(None)),
+            on_album_enqueue: Rc::new(RefCell::new(None)),
+            on_track_enqueue: Rc::new(RefCell::new(None)),
         };
         grid.install_reflow_handler();
         grid
@@ -198,6 +205,18 @@ impl AlbumGrid {
         *self.on_album_activated.borrow_mut() = Some(Rc::new(f));
     }
 
+    /// Registers the callback invoked with an album's tracks when "Add to
+    /// Queue" is chosen from a cover's right-click menu.
+    pub fn connect_album_enqueue<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
+        *self.on_album_enqueue.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Registers the callback invoked with a single track when "Add to Queue"
+    /// is chosen from a drawer row's right-click menu.
+    pub fn connect_track_enqueue<F: Fn(Track) + 'static>(&self, f: F) {
+        *self.on_track_enqueue.borrow_mut() = Some(Rc::new(f));
+    }
+
     /// Resizes every cover in place to `size` px, then reflows since a different
     /// cover size changes how many fit per row. No texture re-decode.
     pub fn set_cover_size(&self, size: i32) {
@@ -290,6 +309,30 @@ impl AlbumGrid {
         });
         cell.add_controller(gesture);
 
+        // Right-click offers "Add to Queue" for the whole album, fetched the
+        // same way the drawer does, without opening or closing it.
+        let context_gesture = GestureClick::new();
+        context_gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
+        let this = self.clone();
+        let summary = summary.clone();
+        let cell_widget = cell.clone().upcast::<Widget>();
+        context_gesture.connect_pressed(move |_, _, x, y| {
+            let tracks = match this.track_provider.borrow().as_ref() {
+                Some(provide) => provide(&summary),
+                None => Vec::new(),
+            };
+            if tracks.is_empty() {
+                return;
+            }
+            let on_enqueue = this.on_album_enqueue.borrow().clone();
+            show_add_to_queue_menu(&cell_widget, x, y, move || {
+                if let Some(callback) = on_enqueue.as_ref() {
+                    callback(tracks.clone());
+                }
+            });
+        });
+        cell.add_controller(context_gesture);
+
         self.covers.borrow_mut().push((image, cell.clone()));
         cell
     }
@@ -335,6 +378,7 @@ impl AlbumGrid {
                 tracks,
                 self.on_track_activated.borrow().clone(),
                 self.on_album_activated.borrow().clone(),
+                self.on_track_enqueue.borrow().clone(),
                 cached.as_ref(),
             )
         };
@@ -360,6 +404,7 @@ fn build_drawer(
     tracks: Vec<Track>,
     on_track: Option<TrackCallback>,
     on_album: Option<AlbumCallback>,
+    on_track_enqueue: Option<SingleTrackCallback>,
     cached: Option<&Texture>,
 ) -> GtkBox {
     let container = GtkBox::new(Orientation::Vertical, 0);
@@ -390,7 +435,20 @@ fn build_drawer(
     list.set_selection_mode(SelectionMode::Single);
     list.set_activate_on_single_click(false);
     for track in &tracks {
-        list.append(&track_row(track));
+        let row = track_row(track);
+        if let Some(callback) = on_track_enqueue.clone() {
+            let context_gesture = GestureClick::new();
+            context_gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
+            let track = track.clone();
+            let row_widget = row.clone().upcast::<Widget>();
+            context_gesture.connect_pressed(move |_, _, x, y| {
+                let track = track.clone();
+                let callback = callback.clone();
+                show_add_to_queue_menu(&row_widget, x, y, move || callback(track.clone()));
+            });
+            row.add_controller(context_gesture);
+        }
+        list.append(&row);
     }
     if let Some(callback) = on_track {
         list.connect_row_activated(move |_, row| {

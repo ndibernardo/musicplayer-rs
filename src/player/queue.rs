@@ -71,6 +71,13 @@ impl Queue {
     pub fn position(&self) -> usize {
         self.cursor
     }
+
+    /// Appends `tracks` to the end of the queue. The cursor (and hence the
+    /// currently playing track) is untouched; on a previously empty queue it
+    /// stays at 0, pointing at the first appended track.
+    pub fn append(&mut self, tracks: Vec<Track>) {
+        self.tracks.extend(tracks);
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +215,29 @@ mod tests {
     #[test]
     fn is_empty_is_false_for_a_populated_queue() {
         assert!(!three_tracks().is_empty());
+    }
+
+    #[test]
+    fn append_to_empty_queue_positions_cursor_at_first_appended() {
+        let mut queue = Queue::empty();
+        queue.append(vec![geogaddi(1, "Music Is Math")]);
+        assert_eq!(queue.current().unwrap().title.as_str(), "Music Is Math");
+        assert_eq!(queue.position(), 0);
+    }
+
+    #[test]
+    fn append_to_non_empty_queue_keeps_the_cursor_on_the_playing_track() {
+        let mut queue = three_tracks();
+        queue.advance();
+        queue.append(vec![geogaddi(4, "In a Beautiful Place Out in the Country")]);
+        assert_eq!(queue.current().unwrap().title.as_str(), "Gyroscope");
+        assert_eq!(queue.position(), 1);
+    }
+
+    #[test]
+    fn append_extends_the_track_count() {
+        let mut queue = three_tracks();
+        queue.append(vec![geogaddi(4, "In a Beautiful Place Out in the Country")]);
+        assert_eq!(queue.len(), 4);
     }
 }

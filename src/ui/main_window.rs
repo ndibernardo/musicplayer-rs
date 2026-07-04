@@ -141,6 +141,40 @@ impl MainWindow {
         self.player.send(PlayerCommand::PlayQueue { tracks, start });
     }
 
+    /// Appends `tracks` to the end of the play queue without disturbing
+    /// what's already playing. Starts playback from the first appended track
+    /// if the queue was empty.
+    fn append_to_queue(&self, tracks: Vec<Track>) {
+        if tracks.is_empty() {
+            return;
+        }
+        let mut queue = self.current_queue.borrow_mut();
+        let was_empty = queue.is_empty();
+        queue.extend(tracks.clone());
+        let updated = queue.clone();
+        drop(queue);
+
+        self.queue_view.set_tracks(updated.clone());
+        let s = self.settings();
+        s.set_queue(&updated.iter().map(|t| t.id).collect::<Vec<_>>());
+
+        if was_empty {
+            let first = &tracks[0];
+            self.player_bar.set_track(first);
+            s.set_queue_current(first.id);
+            self.queue_view.set_current(Some(first.id));
+        } else {
+            // `set_tracks` rebuilds every row, dropping the highlight — restore it.
+            let current = s
+                .queue_current_id()
+                .map(TrackId::new)
+                .filter(|id| updated.iter().any(|t| t.id == *id));
+            self.queue_view.set_current(current);
+        }
+
+        self.player.send(PlayerCommand::Enqueue(tracks));
+    }
+
     /// Reloads the tracks/sidebar/grid after the library changes, keeping the
     /// active filter applied.
     fn refresh_views(&self) {
@@ -698,6 +732,27 @@ pub fn build(
                     this.enqueue(vec![track.clone()], 0);
                 }
             });
+    }
+
+    // Right-click "Add to Queue" on a cover appends the whole album.
+    {
+        let this = mw.clone();
+        mw.album_grid
+            .connect_album_enqueue(move |tracks| this.append_to_queue(tracks));
+    }
+
+    // Right-click "Add to Queue" on a drawer row appends just that track.
+    {
+        let this = mw.clone();
+        mw.album_grid
+            .connect_track_enqueue(move |track| this.append_to_queue(vec![track]));
+    }
+
+    // Right-click "Add to Queue" on a library row appends just that track.
+    {
+        let this = mw.clone();
+        mw.library_view
+            .connect_track_enqueue(move |track| this.append_to_queue(vec![track]));
     }
 
     // Queue row click jumps to that position in the current queue.

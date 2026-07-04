@@ -1,22 +1,32 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use glib::BoxedAnyObject;
 use gtk4::ColumnView;
 use gtk4::ColumnViewColumn;
+use gtk4::GestureClick;
 use gtk4::Label;
 use gtk4::ListItem;
 use gtk4::NoSelection;
 use gtk4::ScrolledWindow;
 use gtk4::SignalListItemFactory;
+use gtk4::Widget;
 use gtk4::gio::ListStore;
 use gtk4::prelude::*;
 
 use crate::library::track::Track;
+use crate::ui::context_menu::show_add_to_queue_menu;
 use crate::ui::format::format_duration;
+
+/// Invoked with a single track chosen from a row's "add to queue" context menu.
+type SingleTrackCallback = Rc<dyn Fn(Track)>;
 
 #[derive(Clone)]
 pub struct LibraryView {
     pub widget: ScrolledWindow,
     column_view: ColumnView,
     store: ListStore,
+    on_track_enqueue: Rc<RefCell<Option<SingleTrackCallback>>>,
 }
 
 impl LibraryView {
@@ -28,27 +38,54 @@ impl LibraryView {
         column_view.set_hexpand(true);
         column_view.set_vexpand(true);
 
-        let title_col = text_column("Title", |t| t.title.as_str().to_owned());
+        let on_track_enqueue: Rc<RefCell<Option<SingleTrackCallback>>> =
+            Rc::new(RefCell::new(None));
+
+        let title_col = text_column(
+            "Title",
+            |t| t.title.as_str().to_owned(),
+            Rc::clone(&on_track_enqueue),
+        );
         title_col.set_expand(true);
         column_view.append_column(&title_col);
 
-        let artist_col = text_column("Artist", |t| t.artist.as_str().to_owned());
+        let artist_col = text_column(
+            "Artist",
+            |t| t.artist.as_str().to_owned(),
+            Rc::clone(&on_track_enqueue),
+        );
         artist_col.set_expand(true);
         column_view.append_column(&artist_col);
 
-        let album_col = text_column("Album", |t| t.album.as_str().to_owned());
+        let album_col = text_column(
+            "Album",
+            |t| t.album.as_str().to_owned(),
+            Rc::clone(&on_track_enqueue),
+        );
         album_col.set_expand(true);
         column_view.append_column(&album_col);
 
-        column_view.append_column(&text_column("Genre", |t| t.genre.as_str().to_owned()));
-        column_view.append_column(&text_column("Year", |t| {
-            if t.year.is_unknown() {
-                String::new()
-            } else {
-                t.year.value().to_string()
-            }
-        }));
-        column_view.append_column(&text_column("Duration", |t| format_duration(t.duration)));
+        column_view.append_column(&text_column(
+            "Genre",
+            |t| t.genre.as_str().to_owned(),
+            Rc::clone(&on_track_enqueue),
+        ));
+        column_view.append_column(&text_column(
+            "Year",
+            |t| {
+                if t.year.is_unknown() {
+                    String::new()
+                } else {
+                    t.year.value().to_string()
+                }
+            },
+            Rc::clone(&on_track_enqueue),
+        ));
+        column_view.append_column(&text_column(
+            "Duration",
+            |t| format_duration(t.duration),
+            Rc::clone(&on_track_enqueue),
+        ));
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_hexpand(true);
@@ -59,6 +96,7 @@ impl LibraryView {
             widget: scrolled,
             column_view,
             store,
+            on_track_enqueue,
         }
     }
 
@@ -77,6 +115,12 @@ impl LibraryView {
             f(collect_tracks(&store), position as usize);
         });
     }
+
+    /// Registers the callback invoked with a single track when "Add to Queue"
+    /// is chosen from a row's right-click menu.
+    pub fn connect_track_enqueue<F: Fn(Track) + 'static>(&self, f: F) {
+        *self.on_track_enqueue.borrow_mut() = Some(Rc::new(f));
+    }
 }
 
 /// Snapshots the store's tracks in display order.
@@ -87,12 +131,16 @@ fn collect_tracks(store: &ListStore) -> Vec<Track> {
         .collect()
 }
 
-fn text_column<F>(title: &str, extract: F) -> ColumnViewColumn
+fn text_column<F>(
+    title: &str,
+    extract: F,
+    on_enqueue: Rc<RefCell<Option<SingleTrackCallback>>>,
+) -> ColumnViewColumn
 where
     F: Fn(&Track) -> String + 'static,
 {
     let factory = SignalListItemFactory::new();
-    factory.connect_setup(|_, obj| {
+    factory.connect_setup(move |_, obj| {
         let Some(item) = obj.downcast_ref::<ListItem>() else {
             return;
         };
@@ -100,6 +148,30 @@ where
         label.set_xalign(0.0);
         label.set_margin_start(6);
         label.set_margin_end(6);
+
+        // Right-click offers "Add to Queue" for whichever track is currently
+        // bound to this row; `item` is weakly held since it strongly owns
+        // `label` as its child, which would otherwise cycle.
+        let gesture = GestureClick::new();
+        gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
+        let item_weak = item.downgrade();
+        let on_enqueue = Rc::clone(&on_enqueue);
+        let label_widget = label.clone().upcast::<Widget>();
+        gesture.connect_pressed(move |_, _, x, y| {
+            let Some(item) = item_weak.upgrade() else {
+                return;
+            };
+            let Some(data) = item.item().and_downcast::<BoxedAnyObject>() else {
+                return;
+            };
+            let track = data.borrow::<Track>().clone();
+            let Some(callback) = on_enqueue.borrow().clone() else {
+                return;
+            };
+            show_add_to_queue_menu(&label_widget, x, y, move || callback(track.clone()));
+        });
+        label.add_controller(gesture);
+
         item.set_child(Some(&label));
     });
     factory.connect_bind(move |_, obj| {
