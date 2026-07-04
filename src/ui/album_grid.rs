@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use gtk4::Align;
 use gtk4::Box as GtkBox;
-use gtk4::Button;
+use gtk4::GestureClick;
 use gtk4::Image;
 use gtk4::Label;
 use gtk4::ListBox;
@@ -41,6 +41,8 @@ type TrackProvider = Rc<dyn Fn(&AlbumSummary) -> Vec<Track>>;
 /// Invoked with the album's full track list and the index of the activated one,
 /// so the caller can enqueue the whole album starting at that track.
 type TrackCallback = Rc<dyn Fn(Vec<Track>, usize)>;
+/// Invoked with an album's full track list when its cover is opened.
+type AlbumCallback = Rc<dyn Fn(Vec<Track>)>;
 
 /// Album-art browser: a grid of cover cells. Activating a cover opens a
 /// full-width drawer with that album's full track list, inline on its own row
@@ -56,12 +58,13 @@ pub struct AlbumGrid {
     cover_size: Rc<Cell<i32>>,
     // Current column count, recomputed from the viewport width.
     columns: Rc<Cell<usize>>,
-    // Cover buttons in album order, reused when the grid reflows (no re-decode).
-    buttons: Rc<RefCell<Vec<Button>>>,
+    // Cover cells in album order, reused when the grid reflows (no re-decode).
+    cells: Rc<RefCell<Vec<GtkBox>>>,
     // Cover image + its cell box, kept so `set_cover_size` can resize in place.
     covers: Rc<RefCell<Vec<(Image, GtkBox)>>>,
     track_provider: Rc<RefCell<Option<TrackProvider>>>,
     on_track_activated: Rc<RefCell<Option<TrackCallback>>>,
+    on_album_activated: Rc<RefCell<Option<AlbumCallback>>>,
 }
 
 impl AlbumGrid {
@@ -86,10 +89,11 @@ impl AlbumGrid {
             drawer: Rc::new(RefCell::new(None)),
             cover_size: Rc::new(Cell::new(DEFAULT_COVER_SIZE)),
             columns: Rc::new(Cell::new(DEFAULT_COLUMNS)),
-            buttons: Rc::new(RefCell::new(Vec::new())),
+            cells: Rc::new(RefCell::new(Vec::new())),
             covers: Rc::new(RefCell::new(Vec::new())),
             track_provider: Rc::new(RefCell::new(None)),
             on_track_activated: Rc::new(RefCell::new(None)),
+            on_album_activated: Rc::new(RefCell::new(None)),
         };
         grid.install_reflow_handler();
         grid
@@ -112,12 +116,12 @@ impl AlbumGrid {
         *self.drawer.borrow_mut() = None;
         self.covers.borrow_mut().clear();
 
-        let buttons: Vec<Button> = albums
+        let cells: Vec<GtkBox> = albums
             .iter()
             .enumerate()
-            .map(|(index, summary)| self.cover_button(index, summary))
+            .map(|(index, summary)| self.cover_cell(index, summary))
             .collect();
-        *self.buttons.borrow_mut() = buttons;
+        *self.cells.borrow_mut() = cells;
         *self.albums.borrow_mut() = albums;
 
         self.lay_out(self.columns_for_current_width());
@@ -126,12 +130,12 @@ impl AlbumGrid {
     /// Arranges the existing cover buttons into rows of `columns`.
     fn lay_out(&self, columns: usize) {
         self.columns.set(columns);
-        let buttons = self.buttons.borrow();
+        let cells = self.cells.borrow();
         let mut row_boxes = Vec::new();
-        for chunk in buttons.chunks(columns) {
+        for chunk in cells.chunks(columns) {
             let row_box = GtkBox::new(Orientation::Horizontal, 6);
-            for button in chunk {
-                row_box.append(button);
+            for cell in chunk {
+                row_box.append(cell);
             }
             self.grid_box.append(&row_box);
             row_boxes.push(row_box);
@@ -140,7 +144,7 @@ impl AlbumGrid {
     }
 
     /// Re-lays the covers when the column count changes (window resize or a new
-    /// cover size). Reuses the built buttons — no texture re-decode.
+    /// cover size). Reuses the built cells — no texture re-decode.
     fn reflow(&self) {
         let columns = self.columns_for_current_width();
         if columns == self.columns.get() {
@@ -150,8 +154,8 @@ impl AlbumGrid {
             self.grid_box.remove(&open);
         }
         *self.open_album.borrow_mut() = None;
-        for button in self.buttons.borrow().iter() {
-            button.unparent();
+        for cell in self.cells.borrow().iter() {
+            cell.unparent();
         }
         while let Some(child) = self.grid_box.first_child() {
             self.grid_box.remove(&child);
@@ -177,6 +181,12 @@ impl AlbumGrid {
         *self.on_track_activated.borrow_mut() = Some(Rc::new(f));
     }
 
+    /// Registers the callback invoked with an album's tracks when its cover is
+    /// opened, so the caller can enqueue the whole album.
+    pub fn connect_album_activated<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
+        *self.on_album_activated.borrow_mut() = Some(Rc::new(f));
+    }
+
     /// Resizes every cover in place to `size` px, then reflows since a different
     /// cover size changes how many fit per row. No texture re-decode.
     pub fn set_cover_size(&self, size: i32) {
@@ -188,7 +198,7 @@ impl AlbumGrid {
         self.reflow();
     }
 
-    fn cover_button(&self, index: usize, summary: &AlbumSummary) -> Button {
+    fn cover_cell(&self, index: usize, summary: &AlbumSummary) -> GtkBox {
         let size = self.cover_size.get();
 
         // GtkImage renders at a fixed pixel size; GtkPicture instead grows to the
@@ -212,6 +222,7 @@ impl AlbumGrid {
         artist_label.add_css_class("dim-label");
 
         let cell = GtkBox::new(Orientation::Vertical, 4);
+        cell.add_css_class("activatable");
         // Pin the cell to the cover width so labels ellipsize instead of widening it.
         cell.set_width_request(size);
         cell.set_halign(Align::Start);
@@ -219,15 +230,36 @@ impl AlbumGrid {
         cell.append(&album_label);
         cell.append(&artist_label);
 
-        let button = Button::new();
-        button.add_css_class("flat");
-        button.set_child(Some(&cell));
-
+        // A single click opens the track drawer; a double click plays the whole
+        // album. Using one gesture on the cell (rather than two `clicked` signals
+        // from a button) avoids the drawer flickering open then shut on a
+        // double-click, since `pressed` fires once per press with a rising count.
+        let gesture = GestureClick::new();
         let this = self.clone();
-        button.connect_clicked(move |_| this.toggle_drawer(index));
+        gesture.connect_pressed(move |_, n_press, _, _| match n_press {
+            1 => this.toggle_drawer(index),
+            2 => this.activate_album(index),
+            _ => {}
+        });
+        cell.add_controller(gesture);
 
-        self.covers.borrow_mut().push((image, cell));
-        button
+        self.covers.borrow_mut().push((image, cell.clone()));
+        cell
+    }
+
+    /// Enqueues the whole album at `index` by firing the album callback.
+    fn activate_album(&self, index: usize) {
+        let albums = self.albums.borrow();
+        let Some(summary) = albums.get(index) else {
+            return;
+        };
+        let tracks = match self.track_provider.borrow().as_ref() {
+            Some(provide) => provide(summary),
+            None => Vec::new(),
+        };
+        if let Some(callback) = self.on_album_activated.borrow().as_ref() {
+            callback(tracks);
+        }
     }
 
     /// Opens the drawer for `index` beneath its row, or closes it if already open.

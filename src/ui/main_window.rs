@@ -32,14 +32,18 @@ use crate::library::query::album_summaries_for;
 use crate::library::query::tracks_for;
 use crate::library::scan::ScanEvent;
 use crate::library::scan::spawn_scan;
+use crate::library::track::Track;
+use crate::library::track::TrackId;
 use crate::library::watch::FolderWatcher;
 use crate::library::watch::watch_folders;
 use crate::player::PlaybackState;
 use crate::player::PlayerCommand;
 use crate::player::PlayerHandle;
+use crate::player::SeekPosition;
 use crate::ui::album_grid::AlbumGrid;
 use crate::ui::library_view::LibraryView;
 use crate::ui::player_bar::PlayerBar;
+use crate::ui::queue_view::QueueView;
 use crate::ui::sidebar::Sidebar;
 use crate::ui::view_mode::ViewMode;
 
@@ -49,6 +53,12 @@ const VIEW_MODE_KEY: &str = "view_mode";
 const COVER_SIZE_KEY: &str = "cover_size";
 /// Settings key for the persisted playback volume (0–100).
 const VOLUME_KEY: &str = "volume";
+/// Settings key for the persisted queue, a comma-separated list of track ids.
+const QUEUE_KEY: &str = "queue";
+/// Settings key for the persisted current track id within the queue.
+const QUEUE_CURRENT_KEY: &str = "queue_current";
+/// Settings key for the persisted playback position (milliseconds).
+const QUEUE_POSITION_KEY: &str = "queue_position";
 
 /// Album-cover size slider bounds (px).
 const COVER_SIZE_MIN: f64 = 200.0;
@@ -109,6 +119,12 @@ pub fn build(
 
     let filter_sidebar = Sidebar::new();
 
+    let queue_view = QueueView::new();
+    let queue_expander = Expander::new(Some("Queue"));
+    queue_expander.set_expanded(true);
+    queue_expander.set_margin_start(4);
+    queue_expander.set_child(Some(&queue_view.widget));
+
     let folders_scrolled = ScrolledWindow::new();
     folders_scrolled.set_min_content_height(120);
     folders_scrolled.set_child(Some(&folder_list));
@@ -120,6 +136,7 @@ pub fn build(
     let sidebar = GtkBox::new(Orientation::Vertical, 0);
     sidebar.set_width_request(220);
     sidebar.append(&filter_sidebar.widget);
+    sidebar.append(&queue_expander);
     sidebar.append(&folders_expander);
     sidebar.append(&status_label);
 
@@ -128,6 +145,9 @@ pub fn build(
 
     // The album grid mirrors the active sidebar filter (all albums when unfiltered).
     let current_filter = Rc::new(RefCell::new(LibraryFilter::All));
+
+    // The tracks currently in the play queue, mirrored to the sidebar queue view.
+    let current_queue: Rc<RefCell<Vec<Track>>> = Rc::new(RefCell::new(Vec::new()));
 
     let content = Stack::new();
     content.set_hexpand(true);
@@ -203,6 +223,30 @@ pub fn build(
             save_setting(&db, VOLUME_KEY, &(percent as i64).to_string());
         });
     }
+
+    // Replaces the queue with `tracks` at `start`: mirrors it to the sidebar,
+    // shows the starting track, persists it, and plays it.
+    let enqueue: Rc<dyn Fn(Vec<Track>, usize)> = {
+        let player = player.clone();
+        let player_bar = player_bar.clone();
+        let queue_view = queue_view.clone();
+        let current_queue = Rc::clone(&current_queue);
+        let db = Rc::clone(&db);
+        Rc::new(move |tracks: Vec<Track>, start: usize| {
+            if tracks.is_empty() {
+                return;
+            }
+            let start = start.min(tracks.len() - 1);
+            let current_id = tracks[start].id;
+            *current_queue.borrow_mut() = tracks.clone();
+            queue_view.set_tracks(tracks.clone());
+            queue_view.set_current(Some(current_id));
+            player_bar.set_track(&tracks[start]);
+            save_queue(&db, &tracks);
+            save_current(&db, current_id);
+            player.send(PlayerCommand::PlayQueue { tracks, start });
+        })
+    };
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.append(&paned);
@@ -292,6 +336,30 @@ pub fn build(
         library_view.set_tracks(tracks);
     }
 
+    // Restore the queue from the previous session and reopen the last track
+    // paused at exactly where it was closed (RestorePaused does not resume).
+    {
+        let restored = load_queue(&db);
+        if !restored.is_empty() {
+            let current_id = load_current(&db);
+            let start = current_id
+                .and_then(|id| restored.iter().position(|t| t.id.value() == id))
+                .unwrap_or(0);
+            let position = load_position(&db);
+            queue_view.set_tracks(restored.clone());
+            queue_view.set_current(restored.get(start).map(|t| t.id));
+            if let Some(track) = restored.get(start) {
+                player_bar.set_track(track);
+            }
+            player.send(PlayerCommand::RestorePaused {
+                tracks: restored.clone(),
+                start,
+                position,
+            });
+            *current_queue.borrow_mut() = restored;
+        }
+    }
+
     // A sidebar selection filters both the track list and the album grid.
     {
         let db = Rc::clone(&db);
@@ -319,33 +387,39 @@ pub fn build(
         });
     }
 
-    // Double-clicking a track inside an album drawer plays the album from there.
+    // Opening an album cover enqueues the whole album (clearing the queue).
     {
-        let player = player.clone();
-        let player_bar = player_bar.clone();
+        let enqueue = Rc::clone(&enqueue);
+        album_grid.connect_album_activated(move |tracks| enqueue(tracks, 0));
+    }
+
+    // Activating a single track in an album drawer replaces the queue with it.
+    {
+        let enqueue = Rc::clone(&enqueue);
         album_grid.connect_track_activated(move |tracks, index| {
             if let Some(track) = tracks.get(index) {
-                player_bar.set_track(track);
+                enqueue(vec![track.clone()], 0);
             }
-            player.send(PlayerCommand::PlayQueue {
-                tracks,
-                start: index,
-            });
         });
     }
 
-    // Double-clicking a track plays the visible list from that track.
+    // Activating a track in the list replaces the queue with just that track.
     {
-        let player = player.clone();
-        let player_bar = player_bar.clone();
+        let enqueue = Rc::clone(&enqueue);
         library_view.connect_track_activated(move |tracks, index| {
             if let Some(track) = tracks.get(index) {
-                player_bar.set_track(track);
+                enqueue(vec![track.clone()], 0);
             }
-            player.send(PlayerCommand::PlayQueue {
-                tracks,
-                start: index,
-            });
+        });
+    }
+
+    // Clicking a queue entry jumps playback to it within the current queue.
+    {
+        let enqueue = Rc::clone(&enqueue);
+        let current_queue = Rc::clone(&current_queue);
+        queue_view.connect_track_selected(move |index| {
+            let tracks = current_queue.borrow().clone();
+            enqueue(tracks, index);
         });
     }
 
@@ -491,12 +565,43 @@ pub fn build(
         });
     }
 
-    // Poll player state every 250 ms and update the player bar
+    // Poll player state every 250 ms and update the player bar. When the playing
+    // track changes (Next/Previous/auto-advance), resolve it against the queue to
+    // refresh the title and the queue highlight.
     {
         let player_bar = player_bar.clone();
+        let queue_view = queue_view.clone();
+        let current_queue = Rc::clone(&current_queue);
+        let db = Rc::clone(&db);
+        let mut last_shown: Option<TrackId> = None;
+        let mut last_saved_secs: Option<u64> = None;
         glib::timeout_add_local(Duration::from_millis(250), move || {
             while let Ok(state) = state_rx.try_recv() {
                 player_bar.update_state(&state);
+                let track_id = state.current_track();
+                if track_id != last_shown {
+                    last_shown = track_id;
+                    match track_id {
+                        Some(id) => {
+                            if let Some(track) =
+                                current_queue.borrow().iter().find(|t| t.id == id).cloned()
+                            {
+                                player_bar.set_track(&track);
+                            }
+                            queue_view.set_current(Some(id));
+                            save_current(&db, id);
+                        }
+                        None => queue_view.set_current(None),
+                    }
+                }
+                // Persist the position at most once per whole second, so reopening
+                // resumes near where the session was closed.
+                if let Some(position) = state.position()
+                    && last_saved_secs != Some(position.as_secs())
+                {
+                    last_saved_secs = Some(position.as_secs());
+                    save_position(&db, position);
+                }
             }
             glib::ControlFlow::Continue
         });
@@ -545,6 +650,57 @@ fn load_cover_size(db: &Rc<Db>) -> i32 {
         .and_then(|s| s.parse::<i32>().ok())
         .map(|n| n.clamp(COVER_SIZE_MIN as i32, COVER_SIZE_MAX as i32))
         .unwrap_or(COVER_SIZE_MIN as i32)
+}
+
+/// Persists the queue as a comma-separated list of track ids.
+fn save_queue(db: &Rc<Db>, tracks: &[Track]) {
+    let ids = tracks
+        .iter()
+        .map(|t| t.id.value().to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    save_setting(db, QUEUE_KEY, &ids);
+}
+
+/// Persists the current track id within the queue.
+fn save_current(db: &Rc<Db>, id: TrackId) {
+    save_setting(db, QUEUE_CURRENT_KEY, &id.value().to_string());
+}
+
+/// Persists the playback position in milliseconds.
+fn save_position(db: &Rc<Db>, position: SeekPosition) {
+    let millis = position.as_duration().as_millis() as u64;
+    save_setting(db, QUEUE_POSITION_KEY, &millis.to_string());
+}
+
+/// Loads the persisted playback position, defaulting to the start when unset.
+fn load_position(db: &Rc<Db>) -> SeekPosition {
+    db.get_setting(QUEUE_POSITION_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(SeekPosition::from_millis)
+        .unwrap_or_else(SeekPosition::zero)
+}
+
+/// Rebuilds the persisted queue from its stored track ids, skipping any ids no
+/// longer present in the library.
+fn load_queue(db: &Rc<Db>) -> Vec<Track> {
+    let Some(raw) = db.get_setting(QUEUE_KEY).ok().flatten() else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter_map(|s| s.parse::<i64>().ok())
+        .filter_map(|id| db.track_by_id(TrackId::new(id)).ok().flatten())
+        .collect()
+}
+
+/// Loads the persisted current track id, or `None` when unset or invalid.
+fn load_current(db: &Rc<Db>) -> Option<i64> {
+    db.get_setting(QUEUE_CURRENT_KEY)
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i64>().ok())
 }
 
 /// Loads the persisted volume (0–100), defaulting to 70 when unset or invalid.
