@@ -52,6 +52,10 @@ impl PlayerBar {
         track_label.set_halign(gtk4::Align::Center);
         track_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         track_label.set_max_width_chars(50);
+        // The playing markup uses a `large` span, which is taller than the
+        // plain empty label shown at Stop; fix the height so the bar's
+        // overall size never depends on which one is set.
+        track_label.set_height_request(28);
 
         let time_label = Label::new(Some("0:00"));
         time_label.add_css_class("numeric");

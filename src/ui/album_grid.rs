@@ -140,9 +140,10 @@ impl AlbumGrid {
         let mut row_boxes = Vec::new();
         for chunk in cells.chunks(columns) {
             let row_box = GtkBox::new(Orientation::Horizontal, 16);
-            // Centre the row so the leftover width splits evenly on both sides
-            // instead of pooling on the right.
-            row_box.set_halign(Align::Center);
+            // Left-align every row, including a partial last row, so covers
+            // always start at the same edge instead of the last row floating
+            // to the middle.
+            row_box.set_halign(Align::Start);
             for cell in chunk {
                 row_box.append(cell);
             }
@@ -260,6 +261,9 @@ impl AlbumGrid {
 
         let cell = GtkBox::new(Orientation::Vertical, 4);
         cell.add_css_class("activatable");
+        // Padding is reserved unconditionally so toggling `album-selected` only
+        // repaints the background — it never resizes the cell and shifts the grid.
+        cell.add_css_class("album-cell");
         // Pin the cell to the cover width so labels ellipsize instead of widening it.
         cell.set_width_request(size);
         cell.set_halign(Align::Start);

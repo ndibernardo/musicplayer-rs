@@ -24,6 +24,8 @@ pub struct Sidebar {
     pub widget: GtkBox,
     genres: ListBox,
     artists: ListBox,
+    genres_section: Expander,
+    artists_section: Expander,
     genre_values: Rc<RefCell<Vec<Genre>>>,
     artist_values: Rc<RefCell<Vec<Artist>>>,
     on_select: Rc<RefCell<Option<FilterCallback>>>,
@@ -77,10 +79,13 @@ impl Sidebar {
             });
         }
 
+        let genres_section = section("Genres", &genres, true);
+        let artists_section = section("Artists", &artists, false);
+
         let inner = GtkBox::new(Orientation::Vertical, 0);
         inner.append(&all_btn);
-        inner.append(&section("Genres", &genres, true));
-        inner.append(&section("Artists", &artists, false));
+        inner.append(&genres_section);
+        inner.append(&artists_section);
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_vexpand(true);
@@ -94,6 +99,8 @@ impl Sidebar {
             widget,
             genres,
             artists,
+            genres_section,
+            artists_section,
             genre_values,
             artist_values,
             on_select,
@@ -106,9 +113,17 @@ impl Sidebar {
     }
 
     /// Replaces every section's entries with the given distinct values.
+    /// A section with no entries collapses itself, since there is nothing
+    /// left inside it to expand into.
     pub fn populate(&self, genres: Vec<Genre>, artists: Vec<Artist>) {
         fill(&self.genres, genres.iter().map(Genre::as_str));
         fill(&self.artists, artists.iter().map(Artist::as_str));
+        if genres.is_empty() {
+            self.genres_section.set_expanded(false);
+        }
+        if artists.is_empty() {
+            self.artists_section.set_expanded(false);
+        }
         *self.genre_values.borrow_mut() = genres;
         *self.artist_values.borrow_mut() = artists;
     }

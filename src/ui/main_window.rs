@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -76,10 +77,12 @@ const APP_CSS: &str = "\
     border: none;
     box-shadow: none;
 }
+.album-cell {
+    padding: 10px;
+    border-radius: 10px;
+}
 .album-selected {
     background-color: rgba(0, 0, 0, 0.24);
-    border-radius: 10px;
-    padding: 10px;
 }
 .album-drawer {
     background-color: rgba(0, 0, 0, 0.24);
@@ -185,6 +188,41 @@ impl MainWindow {
     fn on_folders_changed(&self) {
         self.refresh_views();
         self.rewatch();
+        self.prune_queue();
+    }
+
+    /// Drops queue entries whose track no longer exists in the db (e.g. its
+    /// watched folder was just removed), keeping the queue in sync with the
+    /// library.
+    fn prune_queue(&self) {
+        let surviving = match self.db.list_tracks() {
+            Ok(tracks) => tracks.into_iter().map(|t| t.id).collect::<HashSet<_>>(),
+            Err(e) => {
+                tracing::error!("Failed to check queue against library: {e}");
+                return;
+            }
+        };
+        let mut queue = self.current_queue.borrow_mut();
+        let before = queue.len();
+        queue.retain(|track| surviving.contains(&track.id));
+        if queue.len() == before {
+            return;
+        }
+        let remaining = queue.clone();
+        drop(queue);
+
+        self.queue_view.set_tracks(remaining.clone());
+        self.settings()
+            .set_queue(&remaining.iter().map(|t| t.id).collect::<Vec<_>>());
+
+        // `set_tracks` rebuilds every row, dropping the highlight — restore it
+        // if the currently playing track survived the prune.
+        let current = self
+            .settings()
+            .queue_current_id()
+            .map(TrackId::new)
+            .filter(|id| remaining.iter().any(|t| t.id == *id));
+        self.queue_view.set_current(current);
     }
 
     /// Starts a background scan of every watched folder, showing a spinner
@@ -396,10 +434,6 @@ pub fn build(
     let filter_sidebar = Sidebar::new();
 
     let queue_view = QueueView::new();
-    let queue_expander = Expander::new(Some("Queue"));
-    queue_expander.set_expanded(true);
-    queue_expander.set_margin_start(4);
-    queue_expander.set_child(Some(&queue_view.widget));
 
     let folders_scrolled = ScrolledWindow::new();
     folders_scrolled.set_min_content_height(120);
@@ -411,7 +445,7 @@ pub fn build(
     let sidebar = GtkBox::new(Orientation::Vertical, 0);
     sidebar.set_width_request(220);
     sidebar.append(&filter_sidebar.widget);
-    sidebar.append(&queue_expander);
+    sidebar.append(&queue_view.widget);
     sidebar.append(&folders_expander);
     sidebar.append(&status_label);
 

@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gtk4::Box as GtkBox;
+use gtk4::Expander;
 use gtk4::Label;
 use gtk4::ListBox;
 use gtk4::ListBoxRow;
@@ -16,10 +17,12 @@ use crate::ui::format::display_title;
 type SelectCallback = Rc<dyn Fn(usize)>;
 
 /// The play queue as a selectable list. The currently playing track is
-/// highlighted; activating a row jumps playback to it.
+/// highlighted; activating a row jumps playback to it. Wrapped in its own
+/// `Expander`, which auto-collapses whenever the queue empties out, matching
+/// the sidebar's genre/artist sections.
 #[derive(Clone)]
 pub struct QueueView {
-    pub widget: ScrolledWindow,
+    pub widget: Expander,
     list: ListBox,
     tracks: Rc<RefCell<Vec<Track>>>,
     on_select: Rc<RefCell<Option<SelectCallback>>>,
@@ -35,6 +38,11 @@ impl QueueView {
         scrolled.set_min_content_height(140);
         scrolled.set_child(Some(&list));
 
+        let widget = Expander::new(Some("Queue"));
+        widget.set_expanded(true);
+        widget.set_margin_start(4);
+        widget.set_child(Some(&scrolled));
+
         let on_select: Rc<RefCell<Option<SelectCallback>>> = Rc::new(RefCell::new(None));
         {
             let on_select = Rc::clone(&on_select);
@@ -46,20 +54,25 @@ impl QueueView {
         }
 
         Self {
-            widget: scrolled,
+            widget,
             list,
             tracks: Rc::new(RefCell::new(Vec::new())),
             on_select,
         }
     }
 
-    /// Replaces the visible queue with `tracks`.
+    /// Replaces the visible queue with `tracks`. Collapses the section when
+    /// the queue empties out; never re-expands it on its own, so a manual
+    /// collapse of a non-empty queue is left alone.
     pub fn set_tracks(&self, tracks: Vec<Track>) {
         while let Some(child) = self.list.first_child() {
             self.list.remove(&child);
         }
         for track in &tracks {
             self.list.append(&track_row(track));
+        }
+        if tracks.is_empty() {
+            self.widget.set_expanded(false);
         }
         *self.tracks.borrow_mut() = tracks;
     }
