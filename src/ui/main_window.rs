@@ -1,8 +1,6 @@
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::mpsc;
 use std::time::Duration;
 
 use gtk4::Application;
@@ -114,7 +112,7 @@ struct MainWindow {
     current_sort: Rc<RefCell<AlbumSort>>,
     current_queue: Rc<RefCell<Vec<Track>>>,
     folder_watcher: Rc<RefCell<Option<FolderWatcher>>>,
-    watch_tx: mpsc::Sender<()>,
+    watch_tx: async_channel::Sender<()>,
 }
 
 impl MainWindow {
@@ -153,17 +151,22 @@ impl MainWindow {
     }
 
     fn refresh_sidebar(&self) {
-        let genres = self.db.distinct_genres().unwrap_or_default();
-        let artists = self.db.distinct_artists().unwrap_or_default();
+        let genres = match self.db.distinct_genres() {
+            Ok(v) => v,
+            Err(e) => return self.status_label.set_text(&format!("Error: {e}")),
+        };
+        let artists = match self.db.distinct_artists() {
+            Ok(v) => v,
+            Err(e) => return self.status_label.set_text(&format!("Error: {e}")),
+        };
         self.filter_sidebar.populate(genres, artists);
     }
 
     fn refresh_album_grid_with(&self, filter: &LibraryFilter, sort: AlbumSort) {
-        self.album_grid.set_albums(
-            self.db
-                .album_summaries_for(filter, &sort)
-                .unwrap_or_default(),
-        );
+        match self.db.album_summaries_for(filter, &sort) {
+            Ok(albums) => self.album_grid.set_albums(albums),
+            Err(e) => self.status_label.set_text(&format!("Error: {e}")),
+        }
     }
 
     /// Re-arms the folder watcher for the current folder set.
@@ -201,24 +204,22 @@ impl MainWindow {
         self.scan_status.set_text("Scanning…");
         self.scan_indicator.set_visible(true);
         self.scan_spinner.start();
-        self.install_scan_poll(spawn_scan(self.db_path.clone(), folders));
+        self.install_scan_receiver(spawn_scan(self.db_path.clone(), folders));
     }
 
-    /// Installs a 100 ms GLib timeout that drains scan events from `rx` until
-    /// the scan finishes or the channel closes, then refreshes the library views.
-    ///
-    /// Timeout (not idle) so progress counts stay current without pinning a core.
-    fn install_scan_poll(&self, rx: mpsc::Receiver<ScanEvent>) {
+    /// Attaches an async task that consumes scan events from `rx` until the
+    /// scan finishes or the channel closes, then refreshes the library views.
+    fn install_scan_receiver(&self, rx: async_channel::Receiver<ScanEvent>) {
         let this = self.clone();
-        glib::timeout_add_local(Duration::from_millis(100), move || {
-            loop {
-                match rx.try_recv() {
-                    Ok(ScanEvent::Progress(n)) => {
+        glib::spawn_future_local(async move {
+            while let Ok(event) = rx.recv().await {
+                match event {
+                    ScanEvent::Progress(n) => {
                         let msg = format!("Scanning… {n} files");
                         this.status_label.set_text(&msg);
                         this.scan_status.set_text(&msg);
                     }
-                    Ok(ScanEvent::Finished(Ok(n))) => {
+                    ScanEvent::Finished(Ok(n)) => {
                         this.status_label.set_text(&format!("Indexed {n} tracks"));
                         this.scan_spinner.stop();
                         this.scan_indicator.set_visible(false);
@@ -230,19 +231,13 @@ impl MainWindow {
                             &this.current_filter.borrow(),
                             *this.current_sort.borrow(),
                         );
-                        return glib::ControlFlow::Break;
+                        break;
                     }
-                    Ok(ScanEvent::Finished(Err(e))) => {
+                    ScanEvent::Finished(Err(e)) => {
                         this.status_label.set_text(&format!("Scan error: {e}"));
                         this.scan_spinner.stop();
                         this.scan_indicator.set_visible(false);
-                        return glib::ControlFlow::Break;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        this.scan_spinner.stop();
-                        this.scan_indicator.set_visible(false);
-                        return glib::ControlFlow::Break;
+                        break;
                     }
                 }
             }
@@ -297,7 +292,7 @@ pub fn build(
     db: Rc<Db>,
     db_path: PathBuf,
     player: PlayerHandle,
-    state_rx: mpsc::Receiver<PlaybackState>,
+    state_rx: async_channel::Receiver<PlaybackState>,
 ) -> ApplicationWindow {
     install_styles();
 
@@ -470,7 +465,7 @@ pub fn build(
         .build();
     window.set_titlebar(Some(&header));
 
-    let (watch_tx, watch_rx) = mpsc::channel::<()>();
+    let (watch_tx, watch_rx) = async_channel::unbounded::<()>();
 
     let mw = MainWindow {
         db,
@@ -712,31 +707,34 @@ pub fn build(
         });
     }
 
-    // Debounced auto-rescan: coalesce fs events and rescan once changes settle.
+    // Debounced auto-rescan: wait for an fs event then rescan after 700 ms of
+    // silence. If more events arrive during the wait, the timer resets.
     {
         let mw = mw.clone();
-        let dirty = Rc::new(Cell::new(false));
-        glib::timeout_add_local(Duration::from_millis(700), move || {
-            let mut changed = false;
-            while watch_rx.try_recv().is_ok() {
-                changed = true;
-            }
-            if changed {
-                dirty.set(true);
-            } else if dirty.replace(false) {
+        glib::spawn_future_local(async move {
+            while watch_rx.recv().await.is_ok() {
+                while watch_rx.try_recv().is_ok() {}
+                loop {
+                    glib::timeout_future(Duration::from_millis(700)).await;
+                    match watch_rx.try_recv() {
+                        Ok(()) => while watch_rx.try_recv().is_ok() {},
+                        Err(async_channel::TryRecvError::Empty) => break,
+                        Err(async_channel::TryRecvError::Closed) => return,
+                    }
+                }
                 mw.start_scan();
             }
-            glib::ControlFlow::Continue
         });
     }
 
-    // Poll player state every 250 ms: update the player bar and persist position.
+    // Player state receiver: wakes only when the player thread emits a new state.
+    // Position ticks arrive every 250 ms while playing; no wakeups when idle.
     {
         let mw = mw.clone();
         let mut last_shown: Option<TrackId> = None;
         let mut last_saved_secs: Option<u64> = None;
-        glib::timeout_add_local(Duration::from_millis(250), move || {
-            while let Ok(state) = state_rx.try_recv() {
+        glib::spawn_future_local(async move {
+            while let Ok(state) = state_rx.recv().await {
                 let track_id = state.current_track();
                 if track_id != last_shown {
                     last_shown = track_id;
@@ -757,6 +755,9 @@ pub fn build(
                         None => mw.queue_view.set_current(None),
                     }
                 }
+                if let PlaybackState::Failed { ref error, .. } = state {
+                    mw.status_label.set_text(&format!("Playback error: {error}"));
+                }
                 mw.player_bar.update_state(&state);
                 if let Some(position) = state.position()
                     && last_saved_secs != Some(position.as_secs())
@@ -766,7 +767,6 @@ pub fn build(
                     mw.settings().set_queue_position_millis(millis);
                 }
             }
-            glib::ControlFlow::Continue
         });
     }
 

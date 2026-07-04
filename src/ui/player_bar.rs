@@ -208,7 +208,7 @@ impl PlayerBar {
         self.progress.set_value(0.0);
     }
 
-    /// Called on every state change (play/pause/stop) and on position ticks.
+    /// Called on every state change (play/pause/stop/fail) and on position ticks.
     pub fn update_state(&self, state: &PlaybackState) {
         match state {
             PlaybackState::Stopped => {
@@ -231,6 +231,11 @@ impl PlayerBar {
                 self.play_pause_btn
                     .set_icon_name("media-playback-start-symbolic");
                 self.show_position(*position);
+            }
+            PlaybackState::Failed { .. } => {
+                self.is_playing.set(false);
+                self.play_pause_btn
+                    .set_icon_name("media-playback-start-symbolic");
             }
         }
     }

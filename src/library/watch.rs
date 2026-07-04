@@ -1,5 +1,4 @@
-use std::sync::mpsc::Sender;
-
+use async_channel::Sender;
 use notify::Event;
 use notify::EventKind;
 use notify::RecommendedWatcher;
@@ -36,7 +35,7 @@ pub fn watch_folders(
         if let Ok(event) = result
             && is_structural(&event.kind)
         {
-            let _ = tx.send(());
+            let _ = tx.try_send(());
         }
     })?;
 
@@ -59,14 +58,14 @@ fn is_structural(kind: &EventKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
     use std::time::Duration;
+    use std::time::Instant;
 
     use super::*;
 
     #[test]
     fn watch_folders_errors_on_nonexistent_folder() {
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = async_channel::unbounded();
         let folder = LibraryFolder::new("/nonexistent/watch/target/xyz").unwrap();
         assert!(matches!(
             watch_folders(&[folder], tx),
@@ -78,16 +77,24 @@ mod tests {
     fn watch_folders_reports_a_newly_created_file() {
         let dir = tempfile::tempdir().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = async_channel::unbounded();
 
         // Bind the watcher — dropping it would stop watching.
         let _watcher = watch_folders(&[folder], tx).unwrap();
         std::fs::write(dir.path().join("track01.flac"), b"").unwrap();
 
-        assert!(
-            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-            "creating a file should notify the watcher"
-        );
+        // Poll for up to 5 seconds in 50 ms increments.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if rx.try_recv().is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "creating a file should notify the watcher within 5 seconds"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]

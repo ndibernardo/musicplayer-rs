@@ -6,7 +6,6 @@ fn main() {
 #[cfg(feature = "ui")]
 fn run_ui() {
     use std::rc::Rc;
-    use std::sync::mpsc;
 
     use musicplayer_rs::library::db::Db;
     use musicplayer_rs::player::PlaybackState;
@@ -26,9 +25,9 @@ fn run_ui() {
         }
     };
 
-    let (state_tx, state_rx) = mpsc::channel::<PlaybackState>();
+    let (state_tx, state_rx) = async_channel::unbounded::<PlaybackState>();
     let player = PlayerHandle::launch(RodioAudioBackend::new, move |s| {
-        let _ = state_tx.send(s);
+        let _ = state_tx.try_send(s);
     });
 
     ui::run(db, db_path, player, state_rx);

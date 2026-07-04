@@ -83,6 +83,11 @@ pub enum PlaybackState {
         track: TrackId,
         position: SeekPosition,
     },
+    /// The backend failed to open or decode the track (e.g. missing file, corrupt data).
+    Failed {
+        track: TrackId,
+        error: String,
+    },
 }
 
 impl PlaybackState {
@@ -99,15 +104,17 @@ impl PlaybackState {
             Self::Stopped => None,
             Self::Playing { track, .. } => Some(*track),
             Self::Paused { track, .. } => Some(*track),
+            Self::Failed { track, .. } => Some(*track),
         }
     }
 
-    /// The playback position, or `None` when stopped.
+    /// The playback position, or `None` when stopped or failed.
     pub fn position(&self) -> Option<SeekPosition> {
         match self {
             Self::Stopped => None,
             Self::Playing { position, .. } => Some(*position),
             Self::Paused { position, .. } => Some(*position),
+            Self::Failed { .. } => None,
         }
     }
 }
@@ -200,15 +207,17 @@ impl PlayerHandle {
     }
 }
 
-/// Starts `track` on the backend and reports it as playing from the start, or
-/// logs and stays put on a decode/device error.
+/// Starts `track` on the backend. Emits `Playing` on success or `Failed` on error.
 fn play_track<B: AudioBackend, F: Fn(PlaybackState)>(backend: &mut B, track: &Track, on_state: &F) {
     match backend.play(&track.path) {
         Ok(()) => on_state(PlaybackState::Playing {
             track: track.id,
             position: SeekPosition::zero(),
         }),
-        Err(e) => tracing::error!("playback error: {e}"),
+        Err(e) => on_state(PlaybackState::Failed {
+            track: track.id,
+            error: e.to_string(),
+        }),
     }
 }
 
@@ -229,18 +238,63 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
     on_state: F,
 ) {
     let mut queue = Queue::empty();
+    // True while a track is playing — drives the 250 ms position tick. Set by
+    // play commands; cleared by stop, pause, failure, or end-of-queue. Tracked
+    // here rather than re-querying `backend.is_playing()` at the loop top to
+    // avoid a race where the backend's playing flag changes between the check
+    // and the timeout decision.
+    let mut ticking = false;
 
     loop {
-        match command_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(PlayerCommand::Play(track)) => {
+        let cmd_opt = if ticking {
+            match command_rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(cmd) => Some(cmd),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match command_rx.recv() {
+                Ok(cmd) => Some(cmd),
+                Err(_) => break,
+            }
+        };
+
+        match cmd_opt {
+            None => {
+                // 250 ms tick: update position or detect natural end-of-track.
+                let Some(current_id) = queue.current().map(|t| t.id) else {
+                    ticking = false;
+                    continue;
+                };
+                if backend.is_playing() {
+                    on_state(PlaybackState::Playing {
+                        track: current_id,
+                        position: SeekPosition::from_millis(backend.position().as_millis() as u64),
+                    });
+                } else if !backend.is_paused() {
+                    // Track ended: advance to the next or stop at end of queue.
+                    if queue.advance().is_some() {
+                        play_current(backend, &queue, &on_state);
+                        ticking = backend.is_playing();
+                    } else {
+                        backend.stop();
+                        queue = Queue::empty();
+                        ticking = false;
+                        on_state(PlaybackState::Stopped);
+                    }
+                }
+            }
+            Some(PlayerCommand::Play(track)) => {
                 queue = Queue::single(*track);
                 play_current(backend, &queue, &on_state);
+                ticking = backend.is_playing();
             }
-            Ok(PlayerCommand::PlayQueue { tracks, start }) => {
+            Some(PlayerCommand::PlayQueue { tracks, start }) => {
                 queue = Queue::new(tracks, start);
                 play_current(backend, &queue, &on_state);
+                ticking = backend.is_playing();
             }
-            Ok(PlayerCommand::RestorePaused {
+            Some(PlayerCommand::RestorePaused {
                 tracks,
                 start,
                 position,
@@ -252,22 +306,29 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                             track: track.id,
                             position,
                         }),
-                        Err(e) => tracing::error!("restore error: {e}"),
+                        Err(e) => on_state(PlaybackState::Failed {
+                            track: track.id,
+                            error: e.to_string(),
+                        }),
                     }
                 }
+                ticking = false;
             }
-            Ok(PlayerCommand::Next) => {
+            Some(PlayerCommand::Next) => {
                 if queue.advance().is_some() {
                     play_current(backend, &queue, &on_state);
+                    ticking = backend.is_playing();
                 }
             }
-            Ok(PlayerCommand::Previous) => {
+            Some(PlayerCommand::Previous) => {
                 if queue.rewind().is_some() {
                     play_current(backend, &queue, &on_state);
+                    ticking = backend.is_playing();
                 }
             }
-            Ok(PlayerCommand::Pause) => {
+            Some(PlayerCommand::Pause) => {
                 backend.pause();
+                ticking = false;
                 if let Some(t) = queue.current() {
                     on_state(PlaybackState::Paused {
                         track: t.id,
@@ -275,8 +336,9 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                     });
                 }
             }
-            Ok(PlayerCommand::Resume) => {
+            Some(PlayerCommand::Resume) => {
                 backend.resume();
+                ticking = backend.is_playing();
                 if let Some(t) = queue.current() {
                     on_state(PlaybackState::Playing {
                         track: t.id,
@@ -284,15 +346,16 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                     });
                 }
             }
-            Ok(PlayerCommand::Stop) => {
+            Some(PlayerCommand::Stop) => {
                 backend.stop();
                 queue = Queue::empty();
+                ticking = false;
                 on_state(PlaybackState::Stopped);
             }
-            Ok(PlayerCommand::SetVolume(v)) => {
+            Some(PlayerCommand::SetVolume(v)) => {
                 backend.set_volume(v);
             }
-            Ok(PlayerCommand::Seek(position)) => {
+            Some(PlayerCommand::Seek(position)) => {
                 backend.seek(position.as_duration());
                 if let Some(track) = queue.current() {
                     // Report the new position immediately, keeping the play/pause
@@ -311,28 +374,6 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                     on_state(state);
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let Some(current_id) = queue.current().map(|t| t.id) else {
-                    continue;
-                };
-                if backend.is_playing() {
-                    on_state(PlaybackState::Playing {
-                        track: current_id,
-                        position: SeekPosition::from_millis(backend.position().as_millis() as u64),
-                    });
-                } else if !backend.is_paused() {
-                    // The track ended on its own: advance to the next, or stop and
-                    // clear the queue at the end so this branch doesn't re-fire.
-                    if queue.advance().is_some() {
-                        play_current(backend, &queue, &on_state);
-                    } else {
-                        backend.stop();
-                        queue = Queue::empty();
-                        on_state(PlaybackState::Stopped);
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 }
@@ -815,5 +856,88 @@ mod tests {
             position: SeekPosition::from_secs(30),
         };
         assert_eq!(state.position(), Some(SeekPosition::from_secs(30)));
+    }
+
+    #[test]
+    fn playback_state_failed_is_not_stopped() {
+        let state = PlaybackState::Failed {
+            track: TrackId::new(1),
+            error: "corrupt file".into(),
+        };
+        assert!(!state.is_stopped());
+    }
+
+    #[test]
+    fn playback_state_failed_is_not_playing() {
+        let state = PlaybackState::Failed {
+            track: TrackId::new(1),
+            error: "corrupt file".into(),
+        };
+        assert!(!state.is_playing());
+    }
+
+    #[test]
+    fn playback_state_failed_exposes_current_track() {
+        let id = TrackId::new(5);
+        let state = PlaybackState::Failed {
+            track: id,
+            error: "missing file".into(),
+        };
+        assert_eq!(state.current_track(), Some(id));
+    }
+
+    #[test]
+    fn playback_state_failed_has_no_position() {
+        let state = PlaybackState::Failed {
+            track: TrackId::new(1),
+            error: "missing file".into(),
+        };
+        assert_eq!(state.position(), None);
+    }
+
+    /// A backend whose `play` always fails, so the player emits `Failed`.
+    struct FailingBackend;
+
+    impl AudioBackend for FailingBackend {
+        fn play(&mut self, _path: &TrackPath) -> Result<(), AudioError> {
+            Err(AudioError::Decode("track.flac".into(), "corrupt file".into()))
+        }
+        fn play_paused(&mut self, _path: &TrackPath, _position: Duration) -> Result<(), AudioError> {
+            Err(AudioError::Decode("track.flac".into(), "corrupt file".into()))
+        }
+        fn pause(&mut self) {}
+        fn resume(&mut self) {}
+        fn stop(&mut self) {}
+        fn seek(&mut self, _position: Duration) {}
+        fn set_volume(&mut self, _v: Volume) {}
+        fn is_playing(&self) -> bool { false }
+        fn is_paused(&self) -> bool { false }
+        fn position(&self) -> Duration { Duration::ZERO }
+    }
+
+    #[test]
+    fn player_transitions_to_failed_state_on_decode_error() {
+        let (tx, rx) = mpsc::channel();
+        let handle = PlayerHandle::launch(
+            || Ok(FailingBackend),
+            move |s| { let _ = tx.send(s); },
+        );
+        handle.send(PlayerCommand::Play(Box::new(julie_and_candy())));
+        let s = recv_matching(&rx, |s| matches!(s, PlaybackState::Failed { .. }));
+        assert!(matches!(s, PlaybackState::Failed { .. }));
+    }
+
+    #[test]
+    fn player_failed_state_includes_the_track_id() {
+        let track = julie_and_candy();
+        let expected = track.id;
+        let (tx, rx) = mpsc::channel();
+        let handle = PlayerHandle::launch(
+            || Ok(FailingBackend),
+            move |s| { let _ = tx.send(s); },
+        );
+        handle.send(PlayerCommand::Play(Box::new(track)));
+        let s = recv_matching(&rx, |s| matches!(s, PlaybackState::Failed { .. }));
+        assert_eq!(s.current_track(), Some(expected));
     }
 }

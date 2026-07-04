@@ -2,9 +2,10 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::mpsc;
-use std::sync::mpsc::Receiver;
 use std::time::UNIX_EPOCH;
+
+use async_channel::Receiver;
+use async_channel::Sender;
 
 use crate::library::db::Db;
 use crate::library::db::DbError;
@@ -113,13 +114,13 @@ fn file_mtime(meta: &std::fs::Metadata) -> u64 {
 /// lets it write while the UI reads). Streams `ScanEvent::Progress` as files are
 /// indexed, then a final `ScanEvent::Finished` with the total or the first error.
 pub fn spawn_scan(db_path: PathBuf, folders: Vec<LibraryFolder>) -> Receiver<ScanEvent> {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = async_channel::unbounded::<ScanEvent>();
 
     std::thread::spawn(move || {
         let db = match Db::open(&db_path) {
             Ok(db) => db,
             Err(e) => {
-                let _ = tx.send(ScanEvent::Finished(Err(ScanError::from(e))));
+                let _ = tx.try_send(ScanEvent::Finished(Err(ScanError::from(e))));
                 return;
             }
         };
@@ -127,25 +128,25 @@ pub fn spawn_scan(db_path: PathBuf, folders: Vec<LibraryFolder>) -> Receiver<Sca
         let mut total = 0u32;
         for folder in &folders {
             let base = total;
-            let progress_tx = tx.clone();
+            let progress_tx: Sender<ScanEvent> = tx.clone();
             let result = scan_folder_with_progress(
                 folder,
                 &db,
                 |p| crate::library::metadata::read(p).ok(),
                 |n| {
-                    let _ = progress_tx.send(ScanEvent::Progress(base + n));
+                    let _ = progress_tx.try_send(ScanEvent::Progress(base + n));
                 },
             );
             match result {
                 Ok(n) => total += n,
                 Err(e) => {
-                    let _ = tx.send(ScanEvent::Finished(Err(e)));
+                    let _ = tx.try_send(ScanEvent::Finished(Err(e)));
                     return;
                 }
             }
         }
 
-        let _ = tx.send(ScanEvent::Finished(Ok(total)));
+        let _ = tx.try_send(ScanEvent::Finished(Ok(total)));
     });
 
     rx

@@ -9,6 +9,7 @@ ui = ["dep:gtk4", "dep:glib", "dep:rodio"]
 
 [dependencies]
 # Pure Rust — compile and test anywhere
+async-channel = "2"
 lofty      = "0.24.0"
 symphonia  = { version = "0.5", features = ["all"] }
 rusqlite   = { version = "0.40.1", features = ["bundled"] }
