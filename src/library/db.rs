@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -233,6 +234,8 @@ impl Db {
             ("art",          "BLOB"),
             ("album_artist", "TEXT"),
             ("composer",     "TEXT"),
+            ("mtime",        "INTEGER"),
+            ("size",         "INTEGER"),
         ] {
             if !existing.iter().any(|c| c == name) {
                 self.conn
@@ -280,7 +283,7 @@ impl Db {
     /// `Connection`) and returns the assigned `track_id`. Uses `prepare_cached`
     /// so the statement is compiled once and reused on subsequent calls with the
     /// same connection.
-    pub(crate) fn upsert_one(conn: &Connection, track: &Track) -> Result<TrackId, DbError> {
+    pub(crate) fn upsert_one(conn: &Connection, track: &Track, mtime: u64, size: u64) -> Result<TrackId, DbError> {
         let path = track.path.as_path().to_string_lossy();
         let title = (!track.title.is_unknown()).then(|| track.title.as_str().to_owned());
         let artist = (!track.artist.is_unknown()).then(|| track.artist.as_str().to_owned());
@@ -298,9 +301,11 @@ impl Db {
 
         // RETURNING yields the row's id on both the insert and the update path;
         // last_insert_rowid() would be stale after ON CONFLICT DO UPDATE.
+        let mtime = mtime as i64;
+        let size = size as i64;
         let mut stmt = conn.prepare_cached(
-            "INSERT INTO tracks (path, title, artist, album, genre, duration_ms, track_number, disc_number, year, album_artist, composer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            "INSERT INTO tracks (path, title, artist, album, genre, duration_ms, track_number, disc_number, year, album_artist, composer, mtime, size)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(path) DO UPDATE SET
                  title        = excluded.title,
                  artist       = excluded.artist,
@@ -311,7 +316,9 @@ impl Db {
                  disc_number  = excluded.disc_number,
                  year         = excluded.year,
                  album_artist = excluded.album_artist,
-                 composer     = excluded.composer
+                 composer     = excluded.composer,
+                 mtime        = excluded.mtime,
+                 size         = excluded.size
              RETURNING track_id",
         )?;
         let id = stmt.query_row(
@@ -327,6 +334,8 @@ impl Db {
                 year,
                 album_artist,
                 composer,
+                mtime,
+                size,
             ],
             |row| row.get::<_, i64>(0),
         )?;
@@ -373,7 +382,7 @@ impl Db {
 
     /// Inserts or updates a track keyed on its path. Returns the assigned track_id.
     pub fn upsert_track(&self, track: &Track) -> Result<TrackId, DbError> {
-        Self::upsert_one(&self.conn, track)
+        Self::upsert_one(&self.conn, track, 0, 0)
     }
 
     /// Upserts all `tracks` in a single transaction. Prefer this over calling
@@ -382,10 +391,70 @@ impl Db {
     pub fn upsert_tracks(&self, tracks: &[Track]) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
         for track in tracks {
-            Self::upsert_one(&tx, track)?;
+            Self::upsert_one(&tx, track, 0, 0)?;
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Returns the `(mtime, size)` pair for every track path under `folder`.
+    /// Used by the scanner to decide whether a file needs re-indexing.
+    pub(crate) fn known_file_stats(
+        &self,
+        folder: &LibraryFolder,
+    ) -> Result<HashMap<PathBuf, (u64, u64)>, DbError> {
+        let prefix = format!("{}/", folder.as_path().to_string_lossy());
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT path, mtime, size FROM tracks WHERE substr(path, 1, length(?1)) = ?1",
+        )?;
+        let map = stmt
+            .query_map([&prefix], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(path, mtime, size)| {
+                (
+                    PathBuf::from(path),
+                    (mtime.unwrap_or(0) as u64, size.unwrap_or(0) as u64),
+                )
+            })
+            .collect();
+        Ok(map)
+    }
+
+    /// Deletes tracks whose paths lie under `folder` but are absent from `seen`.
+    /// Returns the count of removed rows.
+    pub fn remove_stale_tracks(
+        &self,
+        folder: &LibraryFolder,
+        seen: &HashSet<PathBuf>,
+    ) -> Result<u64, DbError> {
+        let prefix = format!("{}/", folder.as_path().to_string_lossy());
+        let existing: Vec<String> = {
+            let mut stmt = self.conn.prepare_cached(
+                "SELECT path FROM tracks WHERE substr(path, 1, length(?1)) = ?1",
+            )?;
+            stmt.query_map([&prefix], |row| row.get::<_, String>(0))?
+                .map(|r| r.map_err(DbError::from))
+                .collect::<Result<_, _>>()?
+        };
+        let stale: Vec<String> = existing
+            .into_iter()
+            .filter(|p| !seen.contains(Path::new(p)))
+            .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for path in &stale {
+            tx.execute("DELETE FROM tracks WHERE path = ?1", [path])?;
+        }
+        tx.commit()?;
+        Ok(stale.len() as u64)
     }
 
     /// Returns all tracks ordered by artist, then album, then track number.
@@ -1587,5 +1656,79 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM album_art", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn known_file_stats_returns_mtime_and_size_for_indexed_paths() {
+        let db = Db::open_in_memory().unwrap();
+        let track = full_track("/music/boc/roygbiv.flac");
+        Db::upsert_one(&db.conn, &track, 1_700_000_000, 4096).unwrap();
+
+        let folder = LibraryFolder::new("/music/boc").unwrap();
+        let stats = db.known_file_stats(&folder).unwrap();
+
+        assert_eq!(
+            stats.get(&PathBuf::from("/music/boc/roygbiv.flac")),
+            Some(&(1_700_000_000, 4096))
+        );
+    }
+
+    #[test]
+    fn known_file_stats_excludes_paths_outside_the_folder() {
+        let db = Db::open_in_memory().unwrap();
+        Db::upsert_one(&db.conn, &full_track("/music/boc/roygbiv.flac"), 100, 200).unwrap();
+        Db::upsert_one(&db.conn, &full_track("/other/track.flac"), 300, 400).unwrap();
+
+        let folder = LibraryFolder::new("/music/boc").unwrap();
+        let stats = db.known_file_stats(&folder).unwrap();
+
+        assert_eq!(stats.len(), 1);
+        assert!(stats.contains_key(&PathBuf::from("/music/boc/roygbiv.flac")));
+    }
+
+    #[test]
+    fn remove_stale_tracks_deletes_paths_absent_from_seen() {
+        let db = Db::open_in_memory().unwrap();
+        let id1 = db.upsert_track(&full_track("/music/boc/roygbiv.flac")).unwrap();
+        let id2 = db.upsert_track(&full_track("/music/boc/aquarius.flac")).unwrap();
+
+        let seen: HashSet<PathBuf> = [PathBuf::from("/music/boc/roygbiv.flac")]
+            .into_iter()
+            .collect();
+        let folder = LibraryFolder::new("/music/boc").unwrap();
+        let removed = db.remove_stale_tracks(&folder, &seen).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(db.track_by_id(id1).unwrap().is_some(), "seen track must survive");
+        assert!(db.track_by_id(id2).unwrap().is_none(), "unseen track must be removed");
+    }
+
+    #[test]
+    fn remove_stale_tracks_returns_zero_when_all_paths_are_seen() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac")).unwrap();
+
+        let seen: HashSet<PathBuf> = [PathBuf::from("/music/boc/roygbiv.flac")]
+            .into_iter()
+            .collect();
+        let folder = LibraryFolder::new("/music/boc").unwrap();
+        let removed = db.remove_stale_tracks(&folder, &seen).unwrap();
+
+        assert_eq!(removed, 0);
+        assert_eq!(db.track_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn remove_stale_tracks_spares_paths_outside_the_folder() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac")).unwrap();
+        db.upsert_track(&full_track("/other/track.flac")).unwrap();
+
+        // Scan only /music/boc; the other track is outside and must not be touched.
+        let seen: HashSet<PathBuf> = HashSet::new();
+        let folder = LibraryFolder::new("/music/boc").unwrap();
+        db.remove_stale_tracks(&folder, &seen).unwrap();
+
+        assert_eq!(db.track_count().unwrap(), 1, "/other/track.flac must survive");
     }
 }

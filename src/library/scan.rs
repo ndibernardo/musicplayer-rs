@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
+use std::time::UNIX_EPOCH;
 
 use crate::library::db::Db;
 use crate::library::db::DbError;
@@ -57,16 +59,25 @@ pub fn scan_folder_with_progress(
 ) -> Result<u32, ScanError> {
     const BATCH_SIZE: usize = 200;
     let files = collect_audio_files(folder.as_path())?;
+    let known = db.known_file_stats(folder)?;
+    let mut seen: HashSet<PathBuf> = HashSet::with_capacity(files.len());
     let mut count = 0u32;
 
     for chunk in files.chunks(BATCH_SIZE) {
         let tx = db.conn.unchecked_transaction().map_err(DbError::from)?;
         for path in chunk {
+            seen.insert(path.clone());
             let Ok(track_path) = TrackPath::new(path) else {
                 continue;
             };
+            let meta = std::fs::metadata(path).ok();
+            let mtime = meta.as_ref().map(file_mtime).unwrap_or(0);
+            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            if known.get(path) == Some(&(mtime, size)) {
+                continue; // file unchanged — skip re-indexing
+            }
             if let Some((track, art_opt)) = read_track(&track_path) {
-                Db::upsert_one(&tx, &track)?;
+                Db::upsert_one(&tx, &track, mtime, size)?;
                 if let Some(art) = art_opt {
                     // Use the effective album artist (COALESCE logic) so the key
                     // matches the JOIN condition in album_summaries_query.
@@ -84,7 +95,18 @@ pub fn scan_folder_with_progress(
         tx.commit().map_err(DbError::from)?;
     }
 
+    db.remove_stale_tracks(folder, &seen)?;
     Ok(count)
+}
+
+/// Returns the file's last-modified timestamp as seconds since Unix epoch.
+/// Returns 0 on any error (causes the file to be re-indexed on the next scan).
+fn file_mtime(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Scans `folders` on a background thread with its own DB connection (WAL mode
@@ -319,5 +341,57 @@ mod tests {
             1,
             "re-scan must not duplicate rows"
         );
+    }
+
+    #[test]
+    fn scan_folder_skips_unchanged_files_on_second_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("track.flac"));
+
+        let db = Db::open_in_memory().unwrap();
+        let folder = LibraryFolder::new(dir.path()).unwrap();
+
+        let first = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        assert_eq!(first, 1);
+
+        // File unchanged on disk: mtime and size are the same.
+        let second = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        assert_eq!(second, 0, "unchanged file must be skipped");
+        assert_eq!(db.track_count().unwrap(), 1, "track must still exist");
+    }
+
+    #[test]
+    fn scan_folder_reindexes_file_whose_size_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("track.flac");
+        std::fs::write(&file, b"original").unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        let folder = LibraryFolder::new(dir.path()).unwrap();
+
+        scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+
+        // Write more bytes so the file size changes, triggering re-indexing.
+        std::fs::write(&file, b"updated with different byte length").unwrap();
+        let count = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        assert_eq!(count, 1, "file with changed size must be re-indexed");
+    }
+
+    #[test]
+    fn scan_folder_removes_deleted_files_from_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("track.flac");
+        touch(&file);
+
+        let db = Db::open_in_memory().unwrap();
+        let folder = LibraryFolder::new(dir.path()).unwrap();
+
+        scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        assert_eq!(db.track_count().unwrap(), 1);
+
+        std::fs::remove_file(&file).unwrap();
+
+        scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        assert_eq!(db.track_count().unwrap(), 0, "deleted file must be removed from DB");
     }
 }
