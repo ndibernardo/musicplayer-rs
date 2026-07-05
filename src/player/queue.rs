@@ -72,6 +72,11 @@ impl Queue {
         self.cursor
     }
 
+    /// The full track list, in order.
+    pub fn tracks(&self) -> &[Track] {
+        &self.tracks
+    }
+
     /// Appends `tracks` to the end of the queue. The cursor (and hence the
     /// currently playing track) is untouched; on a previously empty queue it
     /// stays at 0, pointing at the first appended track.
@@ -239,5 +244,17 @@ mod tests {
         let mut queue = three_tracks();
         queue.append(vec![geogaddi(4, "In a Beautiful Place Out in the Country")]);
         assert_eq!(queue.len(), 4);
+    }
+
+    #[test]
+    fn tracks_returns_the_full_list_in_order() {
+        let queue = three_tracks();
+        let titles: Vec<&str> = queue.tracks().iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["Music Is Math", "Gyroscope", "Dandelion"]);
+    }
+
+    #[test]
+    fn tracks_is_empty_for_an_empty_queue() {
+        assert!(Queue::empty().tracks().is_empty());
     }
 }

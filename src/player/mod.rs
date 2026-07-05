@@ -141,6 +141,12 @@ pub enum PlayerCommand {
         start: usize,
         position: SeekPosition,
     },
+    /// Replaces the queue's track list without disturbing playback: if the
+    /// current track is present in `tracks`, its position resumes unchanged;
+    /// otherwise playback stops. Used to reconcile the queue after a library
+    /// change removes some of its tracks — the player is the sole owner of
+    /// the queue, so the UI cannot just drop entries from its own copy.
+    SetQueue(Vec<Track>),
     Pause,
     Resume,
     Stop,
@@ -199,19 +205,24 @@ pub struct PlayerHandle {
 
 impl PlayerHandle {
     /// Spawns a background thread, creates the backend with `make_backend`,
-    /// and runs the player loop.  `on_state` is called from that thread on
+    /// and runs the player loop. `on_state` is called from that thread on
     /// every state transition and on each 250 ms position tick while playing.
-    pub fn launch<B, F>(
+    /// `on_queue_changed` is called whenever the queue's track list itself
+    /// changes (not on cursor-only moves like `Next`/`Previous`) — the player
+    /// owns the queue, so this is the only way a caller learns its contents.
+    pub fn launch<B, F, G>(
         make_backend: impl FnOnce() -> Result<B, AudioError> + Send + 'static,
         on_state: F,
+        on_queue_changed: G,
     ) -> Self
     where
         B: AudioBackend + 'static,
         F: Fn(PlaybackState) + Send + 'static,
+        G: Fn(Vec<Track>) + Send + 'static,
     {
         let (command_tx, command_rx) = mpsc::channel();
         std::thread::spawn(move || match make_backend() {
-            Ok(mut backend) => player_loop(&mut backend, command_rx, on_state),
+            Ok(mut backend) => player_loop(&mut backend, command_rx, on_state, on_queue_changed),
             Err(e) => tracing::error!("audio backend init failed: {e}"),
         });
         Self { command_tx }
@@ -247,10 +258,11 @@ fn play_current<B: AudioBackend, F: Fn(PlaybackState)>(
     }
 }
 
-fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
+fn player_loop<B: AudioBackend, F: Fn(PlaybackState), G: Fn(Vec<Track>)>(
     backend: &mut B,
     command_rx: Receiver<PlayerCommand>,
     on_state: F,
+    on_queue_changed: G,
 ) {
     let mut queue = Queue::empty();
     // True while a track is playing — drives the 250 ms position tick. Set by
@@ -298,6 +310,7 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                             backend.stop();
                             queue = Queue::empty();
                             ticking = false;
+                            on_queue_changed(Vec::new());
                             on_state(PlaybackState::Stopped);
                         }
                     }
@@ -305,17 +318,20 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
             }
             Some(PlayerCommand::Play(track)) => {
                 queue = Queue::single(*track);
+                on_queue_changed(queue.tracks().to_vec());
                 play_current(backend, &queue, &on_state);
                 ticking = matches!(backend.state(), BackendState::Playing);
             }
             Some(PlayerCommand::PlayQueue { tracks, start }) => {
                 queue = Queue::new(tracks, start);
+                on_queue_changed(queue.tracks().to_vec());
                 play_current(backend, &queue, &on_state);
                 ticking = matches!(backend.state(), BackendState::Playing);
             }
             Some(PlayerCommand::Enqueue(tracks)) => {
                 let was_empty = queue.is_empty();
                 queue.append(tracks);
+                on_queue_changed(queue.tracks().to_vec());
                 if was_empty {
                     play_current(backend, &queue, &on_state);
                     ticking = matches!(backend.state(), BackendState::Playing);
@@ -327,6 +343,7 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                 position,
             }) => {
                 queue = Queue::new(tracks, start);
+                on_queue_changed(queue.tracks().to_vec());
                 if let Some(track) = queue.current() {
                     match backend.play_paused(&track.path, position.as_duration()) {
                         Ok(()) => on_state(PlaybackState::Paused {
@@ -340,6 +357,27 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                     }
                 }
                 ticking = false;
+            }
+            Some(PlayerCommand::SetQueue(tracks)) => {
+                let current_id = queue.current().map(|t| t.id);
+                let survives = current_id.is_some_and(|id| tracks.iter().any(|t| t.id == id));
+                if current_id.is_some() && !survives {
+                    // The playing/paused track was pruned out from under us —
+                    // the safe, unsurprising behaviour is to stop rather than
+                    // silently continue on (or jump to) a track the user
+                    // didn't choose.
+                    backend.stop();
+                    queue = Queue::empty();
+                    ticking = false;
+                    on_queue_changed(Vec::new());
+                    on_state(PlaybackState::Stopped);
+                } else {
+                    let start = current_id
+                        .and_then(|id| tracks.iter().position(|t| t.id == id))
+                        .unwrap_or(0);
+                    queue = Queue::new(tracks, start);
+                    on_queue_changed(queue.tracks().to_vec());
+                }
             }
             Some(PlayerCommand::Next) => {
                 if queue.advance().is_some() {
@@ -381,6 +419,7 @@ fn player_loop<B: AudioBackend, F: Fn(PlaybackState)>(
                 backend.stop();
                 queue = Queue::empty();
                 ticking = false;
+                on_queue_changed(Vec::new());
                 on_state(PlaybackState::Stopped);
             }
             Some(PlayerCommand::SetVolume(v)) => {
@@ -592,14 +631,29 @@ mod tests {
     }
 
     fn launch_with_channel() -> (PlayerHandle, mpsc::Receiver<PlaybackState>) {
+        let (handle, rx, _queue_rx) = launch_with_channels();
+        (handle, rx)
+    }
+
+    /// Like `launch_with_channel`, but also returns the queue-snapshot receiver
+    /// for tests that care about `on_queue_changed`.
+    fn launch_with_channels() -> (
+        PlayerHandle,
+        mpsc::Receiver<PlaybackState>,
+        mpsc::Receiver<Vec<Track>>,
+    ) {
         let (tx, rx) = mpsc::channel();
+        let (queue_tx, queue_rx) = mpsc::channel();
         let handle = PlayerHandle::launch(
             || Ok(MockAudioBackend::new()),
             move |s| {
                 let _ = tx.send(s);
             },
+            move |tracks| {
+                let _ = queue_tx.send(tracks);
+            },
         );
-        (handle, rx)
+        (handle, rx, queue_rx)
     }
 
     /// Drains `rx` until a message matching `pred` arrives (or 3 s elapses).
@@ -825,6 +879,7 @@ mod tests {
             move |s| {
                 let _ = tx.send(s);
             },
+            |_tracks| {},
         );
         (handle, rx, flag)
     }
@@ -989,6 +1044,7 @@ mod tests {
             move |s| {
                 let _ = tx.send(s);
             },
+            |_tracks| {},
         );
         handle.send(PlayerCommand::Play(Box::new(julie_and_candy())));
         let s = recv_matching(&rx, |s| matches!(s, PlaybackState::Failed { .. }));
@@ -1005,6 +1061,7 @@ mod tests {
             move |s| {
                 let _ = tx.send(s);
             },
+            |_tracks| {},
         );
         handle.send(PlayerCommand::Play(Box::new(track)));
         let s = recv_matching(&rx, |s| matches!(s, PlaybackState::Failed { .. }));
@@ -1019,6 +1076,7 @@ mod tests {
             move |s| {
                 let _ = tx.send(s);
             },
+            |_tracks| {},
         );
         handle.send(PlayerCommand::Play(Box::new(julie_and_candy())));
         recv_matching(&rx, |s| matches!(s, PlaybackState::Failed { .. }));
@@ -1037,5 +1095,131 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Drains `rx` until a track list matching `pred` arrives (or 3 s elapses),
+    /// mirroring `recv_matching` for the queue-snapshot channel.
+    fn recv_queue_matching(
+        rx: &mpsc::Receiver<Vec<Track>>,
+        pred: impl Fn(&[Track]) -> bool,
+    ) -> Vec<Track> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(tracks) = rx.recv_timeout(Duration::from_millis(100))
+                && pred(&tracks)
+            {
+                return tracks;
+            }
+            if Instant::now() > deadline {
+                panic!("deadline exceeded waiting for expected queue snapshot");
+            }
+        }
+    }
+
+    #[test]
+    fn queue_changed_reports_full_track_list_on_play_queue() {
+        let (handle, _rx, queue_rx) = launch_with_channels();
+        handle.send(PlayerCommand::PlayQueue {
+            tracks: geogaddi_pair(),
+            start: 0,
+        });
+        let tracks = recv_queue_matching(&queue_rx, |t| t.len() == 2);
+        assert_eq!(tracks[0].id, TrackId::new(10));
+        assert_eq!(tracks[1].id, TrackId::new(20));
+    }
+
+    #[test]
+    fn queue_changed_reports_appended_tracks_on_enqueue() {
+        let (handle, _rx, queue_rx) = launch_with_channels();
+        handle.send(PlayerCommand::Play(Box::new(julie_and_candy())));
+        recv_queue_matching(&queue_rx, |t| t.len() == 1);
+
+        handle.send(PlayerCommand::Enqueue(geogaddi_pair()));
+
+        let tracks = recv_queue_matching(&queue_rx, |t| t.len() == 3);
+        assert_eq!(tracks[0].id, julie_and_candy().id);
+        assert_eq!(tracks[1].id, TrackId::new(10));
+        assert_eq!(tracks[2].id, TrackId::new(20));
+    }
+
+    #[test]
+    fn queue_changed_reports_empty_list_on_stop() {
+        let (handle, rx, queue_rx) = launch_with_channels();
+        handle.send(PlayerCommand::Play(Box::new(julie_and_candy())));
+        recv_matching(&rx, |s| matches!(s, PlaybackState::Playing { .. }));
+        recv_queue_matching(&queue_rx, |t| t.len() == 1);
+
+        handle.send(PlayerCommand::Stop);
+
+        let tracks = recv_queue_matching(&queue_rx, |t| t.is_empty());
+        assert!(tracks.is_empty());
+    }
+
+    #[test]
+    fn queue_changed_not_emitted_on_next_or_previous() {
+        let (handle, rx, queue_rx) = launch_with_channels();
+        handle.send(PlayerCommand::PlayQueue {
+            tracks: geogaddi_pair(),
+            start: 0,
+        });
+        recv_queue_matching(&queue_rx, |t| t.len() == 2);
+        recv_matching(&rx, |s| s.current_track() == Some(TrackId::new(10)));
+
+        handle.send(PlayerCommand::Next);
+        recv_matching(&rx, |s| s.current_track() == Some(TrackId::new(20)));
+
+        // Absence check: the track list itself didn't change, only the
+        // cursor, so no further queue snapshot should follow.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if let Ok(tracks) = queue_rx.recv_timeout(Duration::from_millis(50)) {
+                panic!("Next must not emit a queue snapshot, got {tracks:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn set_queue_preserves_current_track_position_when_it_survives() {
+        let (handle, rx, queue_rx) = launch_with_channels();
+        handle.send(PlayerCommand::PlayQueue {
+            tracks: geogaddi_pair(),
+            start: 1,
+        });
+        recv_matching(&rx, |s| s.current_track() == Some(TrackId::new(20)));
+        recv_queue_matching(&queue_rx, |t| t.len() == 2);
+
+        // Prune the first track; the playing track (id 20) survives.
+        handle.send(PlayerCommand::SetQueue(vec![geogaddi(20, "1969")]));
+
+        let tracks = recv_queue_matching(&queue_rx, |t| t.len() == 1);
+        assert_eq!(tracks[0].id, TrackId::new(20));
+
+        // Playback must not have been disturbed: no Stopped state follows.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            if let Ok(s) = rx.recv_timeout(Duration::from_millis(50)) {
+                assert_ne!(
+                    s,
+                    PlaybackState::Stopped,
+                    "the surviving current track must keep playing"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_queue_stops_playback_when_current_track_is_pruned() {
+        let (handle, rx, queue_rx) = launch_with_channels();
+        handle.send(PlayerCommand::Play(Box::new(julie_and_candy())));
+        recv_matching(&rx, |s| matches!(s, PlaybackState::Playing { .. }));
+        recv_queue_matching(&queue_rx, |t| t.len() == 1);
+
+        // The playing track (julie_and_candy) is not in the new list.
+        handle.send(PlayerCommand::SetQueue(geogaddi_pair()));
+
+        let s = recv_matching(&rx, |s| s == &PlaybackState::Stopped);
+        assert_eq!(s, PlaybackState::Stopped);
+        let tracks = recv_queue_matching(&queue_rx, |t| t.is_empty());
+        assert!(tracks.is_empty());
     }
 }
