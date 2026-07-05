@@ -3,6 +3,7 @@ use crate::library::album::AlbumSortField;
 use crate::library::album::SortDirection;
 use crate::library::db::Db;
 use crate::library::track::TrackId;
+use crate::library::view_mode::ViewMode;
 
 const COVER_SIZE_KEY: &str = "cover_size";
 pub const COVER_SIZE_MIN: i32 = 200;
@@ -119,14 +120,15 @@ impl<'a> Settings<'a> {
         self.set(QUEUE_POSITION_KEY, &millis.to_string());
     }
 
-    /// Persisted view-mode name (the raw string stored by the UI layer).
-    /// Returns `None` when unset; the UI converts to its `ViewMode` type.
-    pub fn view_mode_name(&self) -> Option<String> {
+    /// Persisted view mode. Returns `None` when unset or unrecognised.
+    pub fn view_mode(&self) -> Option<ViewMode> {
         self.get(VIEW_MODE_KEY)
+            .as_deref()
+            .and_then(ViewMode::from_name)
     }
 
-    pub fn set_view_mode_name(&self, name: &str) {
-        self.set(VIEW_MODE_KEY, name);
+    pub fn set_view_mode(&self, mode: ViewMode) {
+        self.set(VIEW_MODE_KEY, mode.child_name());
     }
 
     /// Persisted window size in device pixels, or `None` on first run (both
@@ -281,16 +283,23 @@ mod tests {
     }
 
     #[test]
-    fn view_mode_name_returns_none_when_unset() {
+    fn view_mode_returns_none_when_unset() {
         let db = fresh();
-        assert!(Settings::new(&db).view_mode_name().is_none());
+        assert!(Settings::new(&db).view_mode().is_none());
     }
 
     #[test]
-    fn view_mode_name_round_trips() {
+    fn view_mode_round_trips() {
         let db = fresh();
-        Settings::new(&db).set_view_mode_name("grid");
-        assert_eq!(Settings::new(&db).view_mode_name().as_deref(), Some("grid"));
+        Settings::new(&db).set_view_mode(ViewMode::Grid);
+        assert_eq!(Settings::new(&db).view_mode(), Some(ViewMode::Grid));
+    }
+
+    #[test]
+    fn view_mode_returns_none_for_an_unrecognised_stored_value() {
+        let db = fresh();
+        db.set_setting(VIEW_MODE_KEY, "carousel").unwrap();
+        assert!(Settings::new(&db).view_mode().is_none());
     }
 
     #[test]
