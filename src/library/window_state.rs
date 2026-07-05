@@ -21,10 +21,11 @@ pub struct WindowState {
 
 /// Every user action and external event `MainWindow` reacts to. `ScanEvent`
 /// wraps `rusqlite::Error` transitively, which isn't `Clone`/`PartialEq`, so
-/// `Msg` only derives `Debug` — nothing needs to clone or compare a whole
-/// `Msg`, only the domain values carried inside specific variants.
+/// `WindowMessage` only derives `Debug` — nothing needs to clone or compare a
+/// whole `WindowMessage`, only the domain values carried inside specific
+/// variants.
 #[derive(Debug)]
-pub enum Msg {
+pub enum WindowMessage {
     FilterSelected(LibraryFilter),
     SortFieldChanged(AlbumSortField),
     SortDirectionChanged(SortDirection),
@@ -51,27 +52,27 @@ pub enum Msg {
 /// The pure state transition for `msg`: no I/O, no GTK — fully unit-testable.
 /// `ui::main_window::Context::apply` performs the corresponding side effects
 /// (DB queries, player commands, widget updates) for the same `msg`.
-pub fn reduce(state: WindowState, msg: &Msg) -> WindowState {
+pub fn reduce(state: WindowState, msg: &WindowMessage) -> WindowState {
     match msg {
-        Msg::FilterSelected(filter) => WindowState {
+        WindowMessage::FilterSelected(filter) => WindowState {
             filter: filter.clone(),
             ..state
         },
-        Msg::SortFieldChanged(field) => WindowState {
+        WindowMessage::SortFieldChanged(field) => WindowState {
             sort: AlbumSort {
                 field: *field,
                 ..state.sort
             },
             ..state
         },
-        Msg::SortDirectionChanged(direction) => WindowState {
+        WindowMessage::SortDirectionChanged(direction) => WindowState {
             sort: AlbumSort {
                 direction: *direction,
                 ..state.sort
             },
             ..state
         },
-        Msg::PlayerQueueChanged(tracks) => WindowState {
+        WindowMessage::PlayerQueueChanged(tracks) => WindowState {
             queue: tracks.clone(),
             ..state
         },
@@ -79,18 +80,18 @@ pub fn reduce(state: WindowState, msg: &Msg) -> WindowState {
         // (cover size, volume, view mode, scan/folder events) or is applied to
         // WindowState.queue indirectly via the PlayerQueueChanged echo that
         // follows a PlayerCommand — see Context::apply.
-        Msg::ViewModeChanged(_)
-        | Msg::CoverSizeChanged(_)
-        | Msg::VolumeChanged(_)
-        | Msg::Enqueue(_, _)
-        | Msg::AppendToQueue(_)
-        | Msg::QueueTrackSelected(_)
-        | Msg::PlayerStateChanged(_)
-        | Msg::ScanRequested
-        | Msg::ScanEvent(_)
-        | Msg::RescanRequested
-        | Msg::FolderAdded(_)
-        | Msg::FolderRemoved(_) => state,
+        WindowMessage::ViewModeChanged(_)
+        | WindowMessage::CoverSizeChanged(_)
+        | WindowMessage::VolumeChanged(_)
+        | WindowMessage::Enqueue(_, _)
+        | WindowMessage::AppendToQueue(_)
+        | WindowMessage::QueueTrackSelected(_)
+        | WindowMessage::PlayerStateChanged(_)
+        | WindowMessage::ScanRequested
+        | WindowMessage::ScanEvent(_)
+        | WindowMessage::RescanRequested
+        | WindowMessage::FolderAdded(_)
+        | WindowMessage::FolderRemoved(_) => state,
     }
 }
 
@@ -138,7 +139,10 @@ mod tests {
     fn reduce_filter_selected_updates_filter_and_leaves_sort_and_queue() {
         let state = initial_state();
         let filter = LibraryFilter::ByGenre(Genre::new("Ambient"));
-        let next = reduce(state.clone(), &Msg::FilterSelected(filter.clone()));
+        let next = reduce(
+            state.clone(),
+            &WindowMessage::FilterSelected(filter.clone()),
+        );
 
         assert_eq!(next.filter, filter);
         assert_eq!(next.sort, state.sort);
@@ -148,7 +152,10 @@ mod tests {
     #[test]
     fn reduce_sort_field_changed_updates_only_the_field() {
         let state = initial_state();
-        let next = reduce(state.clone(), &Msg::SortFieldChanged(AlbumSortField::Year));
+        let next = reduce(
+            state.clone(),
+            &WindowMessage::SortFieldChanged(AlbumSortField::Year),
+        );
 
         assert_eq!(next.sort.field, AlbumSortField::Year);
         assert_eq!(next.sort.direction, state.sort.direction);
@@ -160,7 +167,7 @@ mod tests {
         let state = initial_state();
         let next = reduce(
             state.clone(),
-            &Msg::SortDirectionChanged(SortDirection::Descending),
+            &WindowMessage::SortDirectionChanged(SortDirection::Descending),
         );
 
         assert_eq!(next.sort.direction, SortDirection::Descending);
@@ -171,7 +178,7 @@ mod tests {
     fn reduce_player_queue_changed_replaces_the_queue() {
         let state = initial_state();
         let tracks = vec![roygbiv()];
-        let next = reduce(state, &Msg::PlayerQueueChanged(tracks.clone()));
+        let next = reduce(state, &WindowMessage::PlayerQueueChanged(tracks.clone()));
 
         assert_eq!(next.queue, tracks);
     }
@@ -179,7 +186,7 @@ mod tests {
     #[test]
     fn reduce_volume_changed_leaves_state_unchanged() {
         let state = initial_state();
-        let next = reduce(state.clone(), &Msg::VolumeChanged(42.0));
+        let next = reduce(state.clone(), &WindowMessage::VolumeChanged(42.0));
 
         assert_eq!(next, state);
     }

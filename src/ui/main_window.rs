@@ -42,7 +42,7 @@ use crate::library::track::TrackId;
 use crate::library::view_mode::ViewMode;
 use crate::library::watch::FolderWatcher;
 use crate::library::watch::watch_folders;
-use crate::library::window_state::Msg;
+use crate::library::window_state::WindowMessage;
 use crate::library::window_state::WindowState;
 use crate::library::window_state::reduce;
 use crate::player::PlaybackState;
@@ -130,7 +130,7 @@ impl InitialSettings {
     }
 }
 
-/// Everything `apply` needs to turn a reduced `WindowState` + the `Msg` that
+/// Everything `apply` needs to turn a reduced `WindowState` + the `WindowMessage` that
 /// produced it into DB queries, player commands, and widget updates. Owned
 /// solely by the one dispatch loop in `build` — never `Clone`, never shared,
 /// so none of its fields need `Rc<RefCell<_>>`.
@@ -152,7 +152,7 @@ struct Context {
     content: Stack,
     toggle_grid_controls: Rc<dyn Fn(ViewMode)>,
     watch_tx: Sender<()>,
-    tx: Sender<Msg>,
+    tx: Sender<WindowMessage>,
     // Track-change display bookkeeping — plain fields, not `Cell`, since
     // `apply` takes `&mut self` and nothing else ever touches `Context`.
     last_shown: Option<TrackId>,
@@ -160,17 +160,17 @@ struct Context {
 }
 
 impl Context {
-    /// Builds every widget, wiring each GTK signal to send a `Msg` (or, for
+    /// Builds every widget, wiring each GTK signal to send a `WindowMessage` (or, for
     /// the handful of concerns that never touch `WindowState`, a direct
     /// closure). Returns the `Context` plus the raw folder-watcher receiver,
-    /// which `build` bridges into the `Msg` stream separately.
+    /// which `build` bridges into the `WindowMessage` stream separately.
     fn new(
         app: &Application,
         db: Rc<Db>,
         db_path: PathBuf,
         player: PlayerHandle,
         initial: &InitialSettings,
-        tx: Sender<Msg>,
+        tx: Sender<WindowMessage>,
     ) -> (Self, async_channel::Receiver<()>) {
         install_styles();
 
@@ -314,53 +314,58 @@ impl Context {
     /// The impure half of handling `msg`: DB queries, player commands, widget
     /// updates, using `state` (already reduced) and `watcher` (infrastructure
     /// state, not part of `WindowState` — see `library::window_state`).
-    fn apply(&mut self, state: &WindowState, msg: &Msg, watcher: &mut Option<FolderWatcher>) {
+    fn apply(
+        &mut self,
+        state: &WindowState,
+        msg: &WindowMessage,
+        watcher: &mut Option<FolderWatcher>,
+    ) {
         match msg {
-            Msg::FilterSelected(filter) => {
+            WindowMessage::FilterSelected(filter) => {
                 match self.db.tracks_for(filter) {
                     Ok(tracks) => self.library_view.set_tracks(tracks),
                     Err(e) => tracing::error!("Filter query failed: {e}"),
                 }
                 self.refresh_album_grid_with(&state.filter, state.sort);
             }
-            Msg::SortFieldChanged(_) | Msg::SortDirectionChanged(_) => {
+            WindowMessage::SortFieldChanged(_) | WindowMessage::SortDirectionChanged(_) => {
                 self.settings().set_album_sort(state.sort);
                 self.refresh_album_grid_with(&state.filter, state.sort);
             }
-            Msg::ViewModeChanged(mode) => {
+            WindowMessage::ViewModeChanged(mode) => {
                 self.content.set_visible_child_name(mode.child_name());
                 self.settings().set_view_mode(*mode);
                 (self.toggle_grid_controls)(*mode);
             }
-            Msg::CoverSizeChanged(size) => {
+            WindowMessage::CoverSizeChanged(size) => {
                 self.album_grid.set_cover_size(*size);
                 self.settings().set_cover_size(*size);
             }
-            Msg::VolumeChanged(percent) => {
+            WindowMessage::VolumeChanged(percent) => {
                 self.settings().set_volume(*percent);
             }
-            Msg::Enqueue(tracks, start) => {
+            WindowMessage::Enqueue(tracks, start) => {
                 self.do_enqueue(tracks.clone(), *start);
             }
-            Msg::QueueTrackSelected(index) => {
+            WindowMessage::QueueTrackSelected(index) => {
                 self.do_enqueue(state.queue.clone(), *index);
             }
-            Msg::AppendToQueue(tracks) => {
+            WindowMessage::AppendToQueue(tracks) => {
                 self.player.send(PlayerCommand::Enqueue(tracks.clone()));
             }
-            Msg::PlayerQueueChanged(tracks) => {
+            WindowMessage::PlayerQueueChanged(tracks) => {
                 self.apply_queue_changed(tracks);
             }
-            Msg::PlayerStateChanged(playback_state) => {
+            WindowMessage::PlayerStateChanged(playback_state) => {
                 self.apply_player_state(state, playback_state);
             }
-            Msg::ScanRequested | Msg::RescanRequested => {
+            WindowMessage::ScanRequested | WindowMessage::RescanRequested => {
                 self.start_scan();
             }
-            Msg::ScanEvent(event) => {
+            WindowMessage::ScanEvent(event) => {
                 self.apply_scan_event(state, event);
             }
-            Msg::FolderAdded(folder) => {
+            WindowMessage::FolderAdded(folder) => {
                 if let Err(e) = self.db.add_folder(folder) {
                     tracing::error!("Failed to add folder: {e}");
                     return;
@@ -369,7 +374,7 @@ impl Context {
                 self.rewatch(watcher);
                 self.start_scan();
             }
-            Msg::FolderRemoved(folder) => {
+            WindowMessage::FolderRemoved(folder) => {
                 if let Err(e) = self.db.remove_folder(folder) {
                     tracing::error!("Failed to remove folder: {e}");
                     return;
@@ -510,7 +515,7 @@ impl Context {
     }
 
     /// Starts a background scan of every watched folder, showing a spinner
-    /// overlay, and forwards its events into the `Msg` stream as `ScanEvent`.
+    /// overlay, and forwards its events into the `WindowMessage` stream as `ScanEvent`.
     fn start_scan(&self) {
         let folders = match self.db.list_folders() {
             Ok(f) => f,
@@ -532,7 +537,7 @@ impl Context {
         glib::spawn_future_local(async move {
             while let Ok(event) = rx.recv().await {
                 let finished = matches!(event, ScanEvent::Finished(_));
-                if tx.send(Msg::ScanEvent(event)).await.is_err() || finished {
+                if tx.send(WindowMessage::ScanEvent(event)).await.is_err() || finished {
                     break;
                 }
             }
@@ -577,7 +582,7 @@ impl Context {
     /// Restores the queue from the previous session, paused at its saved
     /// position. Runs once during bootstrap, before the dispatch loop takes
     /// ownership of `state` — so it writes `state.queue` directly rather than
-    /// through a `Msg`.
+    /// through a `WindowMessage`.
     fn restore_queue(&self, initial: &InitialSettings, state: &mut WindowState) {
         if initial.queue_ids.is_empty() {
             return;
@@ -609,7 +614,7 @@ impl Context {
     }
 }
 
-fn folder_row(folder: LibraryFolder, tx: &Sender<Msg>) -> ListBoxRow {
+fn folder_row(folder: LibraryFolder, tx: &Sender<WindowMessage>) -> ListBoxRow {
     let path_label = Label::new(folder.as_path().to_str());
     path_label.set_hexpand(true);
     path_label.set_xalign(0.0);
@@ -628,7 +633,7 @@ fn folder_row(folder: LibraryFolder, tx: &Sender<Msg>) -> ListBoxRow {
 
     let tx = tx.clone();
     remove_btn.connect_clicked(move |_| {
-        let _ = tx.send_blocking(Msg::FolderRemoved(folder.clone()));
+        let _ = tx.send_blocking(WindowMessage::FolderRemoved(folder.clone()));
     });
 
     let row = ListBoxRow::new();
@@ -636,12 +641,12 @@ fn folder_row(folder: LibraryFolder, tx: &Sender<Msg>) -> ListBoxRow {
     row
 }
 
-/// Restores the sort controls and wires further changes to send `Msg`s.
+/// Restores the sort controls and wires further changes to send `WindowMessage`s.
 fn wire_sort_controls(
     sort_field: &DropDown,
     sort_dir: &ToggleButton,
     initial: AlbumSort,
-    tx: &Sender<Msg>,
+    tx: &Sender<WindowMessage>,
 ) {
     sort_field.set_selected(sort_field_index(initial.field));
     sort_dir.set_active(matches!(initial.direction, SortDirection::Descending));
@@ -649,7 +654,9 @@ fn wire_sort_controls(
 
     let tx_field = tx.clone();
     sort_field.connect_selected_notify(move |dropdown| {
-        let _ = tx_field.send_blocking(Msg::SortFieldChanged(sort_field_at(dropdown.selected())));
+        let _ = tx_field.send_blocking(WindowMessage::SortFieldChanged(sort_field_at(
+            dropdown.selected(),
+        )));
     });
 
     let tx_dir = tx.clone();
@@ -660,23 +667,23 @@ fn wire_sort_controls(
             SortDirection::Ascending
         };
         btn.set_icon_name(direction_icon(direction));
-        let _ = tx_dir.send_blocking(Msg::SortDirectionChanged(direction));
+        let _ = tx_dir.send_blocking(WindowMessage::SortDirectionChanged(direction));
     });
 }
 
-/// Restores the cover-size slider and wires further changes to send `Msg`s.
+/// Restores the cover-size slider and wires further changes to send `WindowMessage`s.
 fn wire_cover_size(
     size_scale: &Scale,
     album_grid: &AlbumGrid,
     initial_cover_size: i32,
-    tx: &Sender<Msg>,
+    tx: &Sender<WindowMessage>,
 ) {
     size_scale.set_value(initial_cover_size as f64);
     album_grid.set_cover_size(initial_cover_size);
 
     let tx = tx.clone();
     size_scale.connect_value_changed(move |scale| {
-        let _ = tx.send_blocking(Msg::CoverSizeChanged(scale.value() as i32));
+        let _ = tx.send_blocking(WindowMessage::CoverSizeChanged(scale.value() as i32));
     });
 }
 
@@ -687,7 +694,7 @@ fn wire_view_toggles(
     content: &Stack,
     toggle_grid_controls: Rc<dyn Fn(ViewMode)>,
     initial_view_mode: ViewMode,
-    tx: &Sender<Msg>,
+    tx: &Sender<WindowMessage>,
 ) {
     match initial_view_mode {
         ViewMode::List => list_toggle.set_active(true),
@@ -699,57 +706,57 @@ fn wire_view_toggles(
     let tx_list = tx.clone();
     list_toggle.connect_toggled(move |btn| {
         if btn.is_active() {
-            let _ = tx_list.send_blocking(Msg::ViewModeChanged(ViewMode::List));
+            let _ = tx_list.send_blocking(WindowMessage::ViewModeChanged(ViewMode::List));
         }
     });
 
     let tx_grid = tx.clone();
     grid_toggle.connect_toggled(move |btn| {
         if btn.is_active() {
-            let _ = tx_grid.send_blocking(Msg::ViewModeChanged(ViewMode::Grid));
+            let _ = tx_grid.send_blocking(WindowMessage::ViewModeChanged(ViewMode::Grid));
         }
     });
 }
 
-fn wire_volume(player_bar: &PlayerBar, tx: &Sender<Msg>) {
+fn wire_volume(player_bar: &PlayerBar, tx: &Sender<WindowMessage>) {
     let tx = tx.clone();
     player_bar.connect_volume_changed(move |percent| {
-        let _ = tx.send_blocking(Msg::VolumeChanged(percent));
+        let _ = tx.send_blocking(WindowMessage::VolumeChanged(percent));
     });
 }
 
-fn wire_sidebar(filter_sidebar: &Sidebar, tx: &Sender<Msg>) {
+fn wire_sidebar(filter_sidebar: &Sidebar, tx: &Sender<WindowMessage>) {
     let tx = tx.clone();
     filter_sidebar.connect_filter_selected(move |filter| {
-        let _ = tx.send_blocking(Msg::FilterSelected(filter));
+        let _ = tx.send_blocking(WindowMessage::FilterSelected(filter));
     });
 }
 
-fn wire_queue_view(queue_view: &QueueView, tx: &Sender<Msg>) {
+fn wire_queue_view(queue_view: &QueueView, tx: &Sender<WindowMessage>) {
     let tx = tx.clone();
     queue_view.connect_track_selected(move |index| {
-        let _ = tx.send_blocking(Msg::QueueTrackSelected(index));
+        let _ = tx.send_blocking(WindowMessage::QueueTrackSelected(index));
     });
 }
 
-fn wire_library_view(library_view: &LibraryView, tx: &Sender<Msg>) {
+fn wire_library_view(library_view: &LibraryView, tx: &Sender<WindowMessage>) {
     let tx_activated = tx.clone();
     library_view.connect_track_activated(move |tracks, index| {
         if let Some(track) = tracks.get(index) {
-            let _ = tx_activated.send_blocking(Msg::Enqueue(vec![track.clone()], 0));
+            let _ = tx_activated.send_blocking(WindowMessage::Enqueue(vec![track.clone()], 0));
         }
     });
 
     let tx_enqueue = tx.clone();
     library_view.connect_track_enqueue(move |track| {
-        let _ = tx_enqueue.send_blocking(Msg::AppendToQueue(vec![track]));
+        let _ = tx_enqueue.send_blocking(WindowMessage::AppendToQueue(vec![track]));
     });
 }
 
 /// The album grid's track and cover-art providers (synchronous DB reads, not
 /// messages — the grid needs the answer inline to render a drawer or a cover)
-/// plus its activation/enqueue callbacks (which do go through `Msg`).
-fn wire_album_grid(album_grid: &AlbumGrid, db: &Rc<Db>, tx: &Sender<Msg>) {
+/// plus its activation/enqueue callbacks (which do go through `WindowMessage`).
+fn wire_album_grid(album_grid: &AlbumGrid, db: &Rc<Db>, tx: &Sender<WindowMessage>) {
     let db_tracks = Rc::clone(db);
     album_grid.set_track_provider(move |summary| {
         db_tracks
@@ -770,38 +777,43 @@ fn wire_album_grid(album_grid: &AlbumGrid, db: &Rc<Db>, tx: &Sender<Msg>) {
 
     let tx_activated = tx.clone();
     album_grid.connect_album_activated(move |tracks| {
-        let _ = tx_activated.send_blocking(Msg::Enqueue(tracks, 0));
+        let _ = tx_activated.send_blocking(WindowMessage::Enqueue(tracks, 0));
     });
 
     let tx_track_activated = tx.clone();
     album_grid.connect_track_activated(move |tracks, index| {
         if let Some(track) = tracks.get(index) {
-            let _ = tx_track_activated.send_blocking(Msg::Enqueue(vec![track.clone()], 0));
+            let _ =
+                tx_track_activated.send_blocking(WindowMessage::Enqueue(vec![track.clone()], 0));
         }
     });
 
     let tx_album_enqueue = tx.clone();
     album_grid.connect_album_enqueue(move |tracks| {
-        let _ = tx_album_enqueue.send_blocking(Msg::AppendToQueue(tracks));
+        let _ = tx_album_enqueue.send_blocking(WindowMessage::AppendToQueue(tracks));
     });
 
     let tx_track_enqueue = tx.clone();
     album_grid.connect_track_enqueue(move |track| {
-        let _ = tx_track_enqueue.send_blocking(Msg::AppendToQueue(vec![track]));
+        let _ = tx_track_enqueue.send_blocking(WindowMessage::AppendToQueue(vec![track]));
     });
 }
 
-fn wire_scan_button(scan_btn: &Button, tx: &Sender<Msg>) {
+fn wire_scan_button(scan_btn: &Button, tx: &Sender<WindowMessage>) {
     let tx = tx.clone();
     scan_btn.connect_clicked(move |_| {
-        let _ = tx.send_blocking(Msg::ScanRequested);
+        let _ = tx.send_blocking(WindowMessage::ScanRequested);
     });
 }
 
-/// Add-folder button: pick a folder, then dispatch `Msg::FolderAdded`. The DB
+/// Add-folder button: pick a folder, then dispatch `WindowMessage::FolderAdded`. The DB
 /// write itself happens in `Context::apply` — this only handles the async
 /// file-dialog interaction, which doesn't belong in a state transition.
-fn wire_add_folder_button(add_btn: &Button, window: &ApplicationWindow, tx: &Sender<Msg>) {
+fn wire_add_folder_button(
+    add_btn: &Button,
+    window: &ApplicationWindow,
+    tx: &Sender<WindowMessage>,
+) {
     let window = window.clone();
     let tx = tx.clone();
     add_btn.connect_clicked(move |_| {
@@ -817,7 +829,7 @@ fn wire_add_folder_button(add_btn: &Button, window: &ApplicationWindow, tx: &Sen
             let Ok(folder) = LibraryFolder::new(path) else {
                 return;
             };
-            let _ = tx.send(Msg::FolderAdded(folder)).await;
+            let _ = tx.send(WindowMessage::FolderAdded(folder)).await;
         });
     });
 }
@@ -826,7 +838,7 @@ fn wire_add_folder_button(add_btn: &Button, window: &ApplicationWindow, tx: &Sen
 /// `default_width`/`default_height` hold the pre-maximize size even while
 /// maximized, but the guard below is a defensive no-op either way: don't
 /// overwrite the restore size with whatever a maximized window reports. Never
-/// touches `WindowState`, so it stays a direct closure rather than a `Msg`.
+/// touches `WindowState`, so it stays a direct closure rather than a `WindowMessage`.
 fn wire_window_geometry(window: &ApplicationWindow, db: &Rc<Db>) {
     let db = Rc::clone(db);
     window.connect_close_request(move |window| {
@@ -841,7 +853,7 @@ fn wire_window_geometry(window: &ApplicationWindow, db: &Rc<Db>) {
 
 /// Debounced auto-rescan: wait for an fs event then rescan after 700 ms of
 /// silence. If more events arrive during the wait, the timer resets.
-fn wire_debounced_watcher(watch_rx: async_channel::Receiver<()>, tx: Sender<Msg>) {
+fn wire_debounced_watcher(watch_rx: async_channel::Receiver<()>, tx: Sender<WindowMessage>) {
     glib::spawn_future_local(async move {
         while watch_rx.recv().await.is_ok() {
             while watch_rx.try_recv().is_ok() {}
@@ -853,7 +865,7 @@ fn wire_debounced_watcher(watch_rx: async_channel::Receiver<()>, tx: Sender<Msg>
                     Err(async_channel::TryRecvError::Closed) => return,
                 }
             }
-            if tx.send(Msg::RescanRequested).await.is_err() {
+            if tx.send(WindowMessage::RescanRequested).await.is_err() {
                 return;
             }
         }
@@ -862,11 +874,11 @@ fn wire_debounced_watcher(watch_rx: async_channel::Receiver<()>, tx: Sender<Msg>
 
 /// Forwards every value from `rx` into `tx`, transformed by `wrap`, until
 /// either side closes. Used to bridge the player's plain-value channels
-/// (`PlaybackState`, `Vec<Track>`) into the single `Msg` stream.
+/// (`PlaybackState`, `Vec<Track>`) into the single `WindowMessage` stream.
 fn spawn_forward<T: 'static>(
     rx: async_channel::Receiver<T>,
-    tx: Sender<Msg>,
-    wrap: impl Fn(T) -> Msg + 'static,
+    tx: Sender<WindowMessage>,
+    wrap: impl Fn(T) -> WindowMessage + 'static,
 ) {
     glib::spawn_future_local(async move {
         while let Ok(value) = rx.recv().await {
@@ -971,12 +983,12 @@ pub fn build(
     queue_rx: async_channel::Receiver<Vec<Track>>,
 ) -> ApplicationWindow {
     let initial = InitialSettings::read(&db);
-    let (tx, rx) = async_channel::unbounded::<Msg>();
+    let (tx, rx) = async_channel::unbounded::<WindowMessage>();
     let (mut ctx, watch_rx) = Context::new(app, db, db_path, player, &initial, tx.clone());
     let window = ctx.window.clone();
 
-    spawn_forward(state_rx, tx.clone(), Msg::PlayerStateChanged);
-    spawn_forward(queue_rx, tx.clone(), Msg::PlayerQueueChanged);
+    spawn_forward(state_rx, tx.clone(), WindowMessage::PlayerStateChanged);
+    spawn_forward(queue_rx, tx.clone(), WindowMessage::PlayerQueueChanged);
     wire_debounced_watcher(watch_rx, tx);
 
     let mut state = WindowState {
@@ -987,7 +999,7 @@ pub fn build(
     let mut watcher: Option<FolderWatcher> = None;
 
     // First population, plus restoring the previous session's queue — direct
-    // calls, not dispatched `Msg`s, since this runs once before the dispatch
+    // calls, not dispatched `WindowMessage`s, since this runs once before the dispatch
     // loop below takes ownership of `state`.
     ctx.refresh_folder_list();
     ctx.refresh_sidebar();
