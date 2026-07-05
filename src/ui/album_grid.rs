@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -24,6 +24,8 @@ use gtk4::gio::MemoryInputStream;
 use gtk4::prelude::*;
 
 use crate::library::album::AlbumSummary;
+use crate::library::album::ArtKey;
+use crate::library::album::CoverArt;
 use crate::library::track::AlbumArtData;
 use crate::library::track::Track;
 use crate::ui::context_menu::show_add_to_queue_menu;
@@ -61,10 +63,41 @@ type AlbumCallback = Rc<dyn Fn(Vec<Track>)>;
 /// Invoked with a single track chosen from a "add to queue" context menu.
 type SingleTrackCallback = Rc<dyn Fn(Track)>;
 /// Fetches an album's cover art bytes, called only on a texture-cache miss.
-type ArtProvider = Rc<dyn Fn(&AlbumSummary) -> Option<AlbumArtData>>;
-/// Identifies an album's cover in the texture cache and the decode-request
-/// pipeline: `(album, album artist)`.
-type ArtKey = (String, String);
+type ArtProvider = Rc<dyn Fn(&ArtKey) -> Option<AlbumArtData>>;
+
+/// The inline track drawer: closed, or open beneath exactly one album. A half-
+/// open drawer (an index with no widget, or vice versa) is unrepresentable.
+enum DrawerState {
+    Closed,
+    Open { index: usize, widget: Widget },
+}
+
+/// One album's grid presence: its summary and the widgets rendering it.
+struct AlbumCell {
+    summary: AlbumSummary,
+    cell: GtkBox,
+    cover: Image,
+}
+
+/// The grid's mutable state, behind one `RefCell` so no invariant here can be
+/// observed half-updated between two separate borrows.
+struct GridState {
+    cells: Vec<AlbumCell>,
+    // Rows of cells, in album order; rebuilt by `lay_out` whenever the column
+    // count changes.
+    row_boxes: Vec<GtkBox>,
+    drawer: DrawerState,
+    columns: usize,
+    cover_size: i32,
+    // Decoded, downscaled textures keyed by ArtKey. A cache hit skips both the
+    // DB byte fetch and the JPEG/PNG decode on repeat set_albums calls (sort
+    // change, filter change, reflow).
+    texture_cache: HashMap<ArtKey, Texture>,
+    // Images awaiting a decode result for a given key, so several cells (a grid
+    // cell and, if opened before decoding finishes, its drawer cover) requesting
+    // the same album's art all get updated from one decode.
+    pending_covers: HashMap<ArtKey, Vec<Image>>,
+}
 
 /// Album-art browser: a grid of cover cells. Activating a cover opens a
 /// full-width drawer with that album's full track list, inline on its own row
@@ -72,34 +105,20 @@ type ArtKey = (String, String);
 #[derive(Clone)]
 pub struct AlbumGrid {
     pub widget: ScrolledWindow,
+    inner: Rc<AlbumGridInner>,
+}
+
+struct AlbumGridInner {
     grid_box: GtkBox,
-    row_boxes: Rc<RefCell<Vec<GtkBox>>>,
-    albums: Rc<RefCell<Vec<AlbumSummary>>>,
-    open_album: Rc<RefCell<Option<usize>>>,
-    drawer: Rc<RefCell<Option<Widget>>>,
-    cover_size: Rc<Cell<i32>>,
-    // Current column count, recomputed from the viewport width.
-    columns: Rc<Cell<usize>>,
-    // Cover cells in album order, reused when the grid reflows (no re-decode).
-    cells: Rc<RefCell<Vec<GtkBox>>>,
-    // Cover image + its cell box, kept so `set_cover_size` can resize in place.
-    covers: Rc<RefCell<Vec<(Image, GtkBox)>>>,
-    // Decoded, downscaled textures keyed by (album, album_artist). A cache hit
-    // skips both the DB byte fetch and the JPEG/PNG decode on repeat
-    // set_albums calls (sort change, filter change, reflow).
-    texture_cache: Rc<RefCell<HashMap<ArtKey, Texture>>>,
-    // Images awaiting a decode result for a given key, so several cells (a grid
-    // cell and, if opened before decoding finishes, its drawer cover) requesting
-    // the same album's art all get updated from one decode.
-    pending_covers: Rc<RefCell<HashMap<ArtKey, Vec<Image>>>>,
+    state: RefCell<GridState>,
     // Sends (key, bytes) to the background decode thread; see `spawn_art_decoder`.
     art_request_tx: async_channel::Sender<(ArtKey, AlbumArtData)>,
-    art_provider: Rc<RefCell<Option<ArtProvider>>>,
-    track_provider: Rc<RefCell<Option<TrackProvider>>>,
-    on_track_activated: Rc<RefCell<Option<TrackCallback>>>,
-    on_album_activated: Rc<RefCell<Option<AlbumCallback>>>,
-    on_album_enqueue: Rc<RefCell<Option<AlbumCallback>>>,
-    on_track_enqueue: Rc<RefCell<Option<SingleTrackCallback>>>,
+    art_provider: OnceCell<ArtProvider>,
+    track_provider: OnceCell<TrackProvider>,
+    on_track_activated: OnceCell<TrackCallback>,
+    on_album_activated: OnceCell<AlbumCallback>,
+    on_album_enqueue: OnceCell<AlbumCallback>,
+    on_track_enqueue: OnceCell<SingleTrackCallback>,
 }
 
 impl AlbumGrid {
@@ -117,26 +136,29 @@ impl AlbumGrid {
 
         let (art_request_tx, art_result_rx) = spawn_art_decoder(COVER_DECODE_SIZE);
 
+        let inner = Rc::new(AlbumGridInner {
+            grid_box,
+            state: RefCell::new(GridState {
+                cells: Vec::new(),
+                row_boxes: Vec::new(),
+                drawer: DrawerState::Closed,
+                columns: DEFAULT_COLUMNS,
+                cover_size: DEFAULT_COVER_SIZE,
+                texture_cache: HashMap::new(),
+                pending_covers: HashMap::new(),
+            }),
+            art_request_tx,
+            art_provider: OnceCell::new(),
+            track_provider: OnceCell::new(),
+            on_track_activated: OnceCell::new(),
+            on_album_activated: OnceCell::new(),
+            on_album_enqueue: OnceCell::new(),
+            on_track_enqueue: OnceCell::new(),
+        });
+
         let grid = Self {
             widget: scrolled,
-            grid_box,
-            row_boxes: Rc::new(RefCell::new(Vec::new())),
-            albums: Rc::new(RefCell::new(Vec::new())),
-            open_album: Rc::new(RefCell::new(None)),
-            drawer: Rc::new(RefCell::new(None)),
-            cover_size: Rc::new(Cell::new(DEFAULT_COVER_SIZE)),
-            columns: Rc::new(Cell::new(DEFAULT_COLUMNS)),
-            cells: Rc::new(RefCell::new(Vec::new())),
-            covers: Rc::new(RefCell::new(Vec::new())),
-            texture_cache: Rc::new(RefCell::new(HashMap::new())),
-            pending_covers: Rc::new(RefCell::new(HashMap::new())),
-            art_request_tx,
-            art_provider: Rc::new(RefCell::new(None)),
-            track_provider: Rc::new(RefCell::new(None)),
-            on_track_activated: Rc::new(RefCell::new(None)),
-            on_album_activated: Rc::new(RefCell::new(None)),
-            on_album_enqueue: Rc::new(RefCell::new(None)),
-            on_track_enqueue: Rc::new(RefCell::new(None)),
+            inner,
         };
         grid.install_reflow_handler();
         grid.install_art_decode_receiver(art_result_rx);
@@ -147,12 +169,15 @@ impl AlbumGrid {
     /// to every cell that was waiting on it — a grid cell, and its drawer cover
     /// if the drawer was opened before the decode finished.
     fn install_art_decode_receiver(&self, rx: async_channel::Receiver<(ArtKey, Texture)>) {
-        let texture_cache = Rc::clone(&self.texture_cache);
-        let pending_covers = Rc::clone(&self.pending_covers);
+        let inner = Rc::clone(&self.inner);
         glib::spawn_future_local(async move {
             while let Ok((key, texture)) = rx.recv().await {
-                let waiting = pending_covers.borrow_mut().remove(&key);
-                texture_cache.borrow_mut().insert(key, texture.clone());
+                let waiting = {
+                    let mut state = inner.state.borrow_mut();
+                    let waiting = state.pending_covers.remove(&key);
+                    state.texture_cache.insert(key, texture.clone());
+                    waiting
+                };
                 for image in waiting.into_iter().flatten() {
                     image.set_paintable(Some(&texture));
                 }
@@ -170,30 +195,32 @@ impl AlbumGrid {
 
     /// Rebuilds the cover grid and closes any open drawer.
     pub fn set_albums(&self, albums: Vec<AlbumSummary>) {
-        while let Some(child) = self.grid_box.first_child() {
-            self.grid_box.remove(&child);
+        while let Some(child) = self.inner.grid_box.first_child() {
+            self.inner.grid_box.remove(&child);
         }
-        *self.open_album.borrow_mut() = None;
-        *self.drawer.borrow_mut() = None;
-        self.covers.borrow_mut().clear();
 
-        let cells: Vec<GtkBox> = albums
-            .iter()
+        let cells: Vec<AlbumCell> = albums
+            .into_iter()
             .enumerate()
-            .map(|(index, summary)| self.cover_cell(index, summary))
+            .map(|(index, summary)| self.build_cell(index, summary))
             .collect();
-        *self.cells.borrow_mut() = cells;
-        *self.albums.borrow_mut() = albums;
-
-        self.lay_out(self.columns_for_current_width());
+        let columns = self.columns_for_current_width();
+        {
+            let mut state = self.inner.state.borrow_mut();
+            state.drawer = DrawerState::Closed;
+            state.cells = cells;
+        }
+        self.lay_out(columns);
     }
 
-    /// Arranges the existing cover buttons into rows of `columns`.
+    /// Arranges the existing cover cells into rows of `columns`.
     fn lay_out(&self, columns: usize) {
-        self.columns.set(columns);
-        let cells = self.cells.borrow();
+        let cell_widgets: Vec<GtkBox> = {
+            let state = self.inner.state.borrow();
+            state.cells.iter().map(|c| c.cell.clone()).collect()
+        };
         let mut row_boxes = Vec::new();
-        for chunk in cells.chunks(columns) {
+        for chunk in cell_widgets.chunks(columns) {
             let row_box = GtkBox::new(Orientation::Horizontal, 16);
             // Left-align every row, including a partial last row, so covers
             // always start at the same edge instead of the last row floating
@@ -202,29 +229,40 @@ impl AlbumGrid {
             for cell in chunk {
                 row_box.append(cell);
             }
-            self.grid_box.append(&row_box);
+            self.inner.grid_box.append(&row_box);
             row_boxes.push(row_box);
         }
-        *self.row_boxes.borrow_mut() = row_boxes;
+        let mut state = self.inner.state.borrow_mut();
+        state.columns = columns;
+        state.row_boxes = row_boxes;
     }
 
     /// Re-lays the covers when the column count changes (window resize or a new
     /// cover size). Reuses the built cells — no texture re-decode.
     fn reflow(&self) {
         let columns = self.columns_for_current_width();
-        if columns == self.columns.get() {
+        if columns == self.inner.state.borrow().columns {
             return;
         }
-        if let Some(open) = self.drawer.borrow_mut().take() {
-            self.grid_box.remove(&open);
+
+        let previously_open = {
+            let mut state = self.inner.state.borrow_mut();
+            std::mem::replace(&mut state.drawer, DrawerState::Closed)
+        };
+        if let DrawerState::Open { widget, .. } = previously_open {
+            self.inner.grid_box.remove(&widget);
         }
-        *self.open_album.borrow_mut() = None;
         self.highlight(None);
-        for cell in self.cells.borrow().iter() {
+
+        let cell_widgets: Vec<GtkBox> = {
+            let state = self.inner.state.borrow();
+            state.cells.iter().map(|c| c.cell.clone()).collect()
+        };
+        for cell in &cell_widgets {
             cell.unparent();
         }
-        while let Some(child) = self.grid_box.first_child() {
-            self.grid_box.remove(&child);
+        while let Some(child) = self.inner.grid_box.first_child() {
+            self.inner.grid_box.remove(&child);
         }
         self.lay_out(columns);
     }
@@ -232,93 +270,99 @@ impl AlbumGrid {
     /// How many covers fit the current viewport width (at least one).
     fn columns_for_current_width(&self) -> usize {
         let available = self.widget.hadjustment().page_size() as i32 - GRID_MARGIN_TOTAL;
-        let slot = self.cover_size.get() + COVER_SLOT_EXTRA;
+        let cover_size = self.inner.state.borrow().cover_size;
+        let slot = cover_size + COVER_SLOT_EXTRA;
         (available / slot).max(1) as usize
     }
 
     /// Supplies the tracks of an album, fetched when its drawer opens.
     pub fn set_track_provider<F: Fn(&AlbumSummary) -> Vec<Track> + 'static>(&self, f: F) {
-        *self.track_provider.borrow_mut() = Some(Rc::new(f));
+        let _ = self.inner.track_provider.set(Rc::new(f));
     }
 
     /// Supplies an album's cover art bytes, called only on a texture-cache miss
     /// (once per album, ever, unless `invalidate_art_cache` runs).
-    pub fn set_art_provider<F: Fn(&AlbumSummary) -> Option<AlbumArtData> + 'static>(
-        &self,
-        f: F,
-    ) {
-        *self.art_provider.borrow_mut() = Some(Rc::new(f));
+    pub fn set_art_provider<F: Fn(&ArtKey) -> Option<AlbumArtData> + 'static>(&self, f: F) {
+        let _ = self.inner.art_provider.set(Rc::new(f));
     }
 
     /// Clears every decoded texture, so the next display of each cover re-fetches
     /// and re-decodes its bytes. Call after a scan may have changed an album's
-    /// embedded art — the cache is keyed only by (album, artist), so it would
-    /// otherwise keep showing a stale cover until restart.
+    /// embedded art — the cache is keyed only by `ArtKey`, so it would otherwise
+    /// keep showing a stale cover until restart.
     pub fn invalidate_art_cache(&self) {
-        self.texture_cache.borrow_mut().clear();
+        self.inner.state.borrow_mut().texture_cache.clear();
     }
 
     /// Registers `image` to receive `key`'s texture once decoded, fetching the
     /// art bytes and dispatching the decode on the first request for `key`.
     /// A second cell asking for the same album (e.g. its drawer, opened before
     /// the first decode finishes) just joins the waiting list.
-    fn request_art(&self, key: ArtKey, summary: &AlbumSummary, image: Image) {
+    fn request_art(&self, key: ArtKey, image: Image) {
         let first_request = {
-            let mut pending = self.pending_covers.borrow_mut();
-            let waiting = pending.entry(key.clone()).or_default();
+            let mut state = self.inner.state.borrow_mut();
+            let waiting = state.pending_covers.entry(key.clone()).or_default();
             waiting.push(image);
             waiting.len() == 1
         };
         if !first_request {
             return;
         }
-        let Some(art) = self.art_provider.borrow().as_ref().and_then(|f| f(summary)) else {
-            self.pending_covers.borrow_mut().remove(&key);
+        let Some(art) = self.inner.art_provider.get().and_then(|f| f(&key)) else {
+            self.inner.state.borrow_mut().pending_covers.remove(&key);
             return;
         };
         // The decoder thread is unbounded and never closes its receiver while
         // `self` is alive, so a send failure can't happen in practice; dropping
         // the request would just leave that cover blank, which is recoverable.
-        let _ = self.art_request_tx.try_send((key, art));
+        let _ = self.inner.art_request_tx.try_send((key, art));
     }
 
     /// Registers the callback invoked when a track inside a drawer is activated.
     /// It receives the album's full track list and the activated track's index.
     pub fn connect_track_activated<F: Fn(Vec<Track>, usize) + 'static>(&self, f: F) {
-        *self.on_track_activated.borrow_mut() = Some(Rc::new(f));
+        let _ = self.inner.on_track_activated.set(Rc::new(f));
     }
 
     /// Registers the callback invoked with an album's tracks when its cover is
     /// opened, so the caller can enqueue the whole album.
     pub fn connect_album_activated<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
-        *self.on_album_activated.borrow_mut() = Some(Rc::new(f));
+        let _ = self.inner.on_album_activated.set(Rc::new(f));
     }
 
     /// Registers the callback invoked with an album's tracks when "Add to
     /// Queue" is chosen from a cover's right-click menu.
     pub fn connect_album_enqueue<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
-        *self.on_album_enqueue.borrow_mut() = Some(Rc::new(f));
+        let _ = self.inner.on_album_enqueue.set(Rc::new(f));
     }
 
     /// Registers the callback invoked with a single track when "Add to Queue"
     /// is chosen from a drawer row's right-click menu.
     pub fn connect_track_enqueue<F: Fn(Track) + 'static>(&self, f: F) {
-        *self.on_track_enqueue.borrow_mut() = Some(Rc::new(f));
+        let _ = self.inner.on_track_enqueue.set(Rc::new(f));
     }
 
     /// Resizes every cover in place to `size` px, then reflows since a different
     /// cover size changes how many fit per row. No texture re-decode.
     pub fn set_cover_size(&self, size: i32) {
-        self.cover_size.set(size);
-        for (image, cell) in self.covers.borrow().iter() {
+        let cell_widgets: Vec<(Image, GtkBox)> = {
+            let mut state = self.inner.state.borrow_mut();
+            state.cover_size = size;
+            state
+                .cells
+                .iter()
+                .map(|c| (c.cover.clone(), c.cell.clone()))
+                .collect()
+        };
+        for (image, cell) in &cell_widgets {
             image.set_pixel_size(size);
             cell.set_width_request(size);
         }
         self.reflow();
     }
 
-    fn cover_cell(&self, index: usize, summary: &AlbumSummary) -> GtkBox {
-        let size = self.cover_size.get();
+    fn build_cell(&self, index: usize, summary: AlbumSummary) -> AlbumCell {
+        let size = self.inner.state.borrow().cover_size;
 
         // GtkImage renders at a fixed pixel size; GtkPicture instead grows to the
         // texture's natural size (the covers-too-big bug), since size_request only
@@ -327,13 +371,11 @@ impl AlbumGrid {
         image.set_pixel_size(size);
         image.set_halign(Align::Center);
 
-        if summary.has_art {
-            let key = art_key(summary);
-            if let Some(texture) = self.texture_cache.borrow().get(&key) {
-                // Already decoded from a prior set_albums call — reuse instantly.
-                image.set_paintable(Some(texture));
-            } else {
-                self.request_art(key, summary, image.clone());
+        if let CoverArt::Available(key) = &summary.art {
+            let cached = self.inner.state.borrow().texture_cache.get(key).cloned();
+            match cached {
+                Some(texture) => image.set_paintable(Some(&texture)),
+                None => self.request_art(key.clone(), image.clone()),
             }
         }
 
@@ -385,32 +427,40 @@ impl AlbumGrid {
         let context_gesture = GestureClick::new();
         context_gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
         let this = self.clone();
-        let summary = summary.clone();
+        let context_summary = summary.clone();
         let cell_widget = cell.clone().upcast::<Widget>();
         context_gesture.connect_pressed(move |_, _, x, y| {
-            let tracks = match this.track_provider.borrow().as_ref() {
-                Some(provide) => provide(&summary),
-                None => Vec::new(),
-            };
+            let tracks = this
+                .inner
+                .track_provider
+                .get()
+                .map_or_else(Vec::new, |provide| provide(&context_summary));
             if tracks.is_empty() {
                 return;
             }
-            let on_enqueue = this.on_album_enqueue.borrow().clone();
+            let on_enqueue = this.inner.on_album_enqueue.get().cloned();
             show_add_to_queue_menu(&cell_widget, x, y, move || {
-                if let Some(callback) = on_enqueue.as_ref() {
+                if let Some(callback) = &on_enqueue {
                     callback(tracks.clone());
                 }
             });
         });
         cell.add_controller(context_gesture);
 
-        self.covers.borrow_mut().push((image, cell.clone()));
-        cell
+        AlbumCell {
+            summary,
+            cell,
+            cover: image,
+        }
     }
 
     /// Highlights the cover at `index` as selected and clears the others.
     fn highlight(&self, index: Option<usize>) {
-        for (i, cell) in self.cells.borrow().iter().enumerate() {
+        let cell_widgets: Vec<GtkBox> = {
+            let state = self.inner.state.borrow();
+            state.cells.iter().map(|c| c.cell.clone()).collect()
+        };
+        for (i, cell) in cell_widgets.iter().enumerate() {
             if Some(i) == index {
                 cell.add_css_class("album-selected");
             } else {
@@ -421,47 +471,77 @@ impl AlbumGrid {
 
     /// Opens the drawer for `index` beneath its row, or closes it if already open.
     fn toggle_drawer(&self, index: usize) {
-        if let Some(open) = self.drawer.borrow_mut().take() {
-            self.grid_box.remove(&open);
-        }
-        if *self.open_album.borrow() == Some(index) {
-            *self.open_album.borrow_mut() = None;
+        let previously_open = {
+            let mut state = self.inner.state.borrow_mut();
+            std::mem::replace(&mut state.drawer, DrawerState::Closed)
+        };
+        let previously_open_index = match previously_open {
+            DrawerState::Closed => None,
+            DrawerState::Open {
+                index: open,
+                widget,
+            } => {
+                self.inner.grid_box.remove(&widget);
+                Some(open)
+            }
+        };
+        if previously_open_index == Some(index) {
             self.highlight(None);
             return;
         }
 
-        let drawer = {
-            let albums = self.albums.borrow();
-            let Some(summary) = albums.get(index) else {
-                return;
-            };
-            let tracks = match self.track_provider.borrow().as_ref() {
-                Some(provide) => provide(summary),
-                None => Vec::new(),
-            };
-            let key = art_key(summary);
-            let cached = self.texture_cache.borrow().get(&key).cloned();
-            let (drawer, cover) = build_drawer(
-                summary,
-                tracks,
-                self.on_track_activated.borrow().clone(),
-                self.on_album_activated.borrow().clone(),
-                self.on_track_enqueue.borrow().clone(),
-                cached.as_ref(),
-            );
-            if cached.is_none() && summary.has_art {
-                self.request_art(key, summary, cover);
-            }
-            drawer
-        };
-
-        let row_boxes = self.row_boxes.borrow();
-        let Some(row_box) = row_boxes.get(index / self.columns.get()) else {
+        let Some(summary) = self
+            .inner
+            .state
+            .borrow()
+            .cells
+            .get(index)
+            .map(|c| c.summary.clone())
+        else {
             return;
         };
-        self.grid_box.insert_child_after(&drawer, Some(row_box));
-        *self.drawer.borrow_mut() = Some(drawer.upcast());
-        *self.open_album.borrow_mut() = Some(index);
+        let tracks = self
+            .inner
+            .track_provider
+            .get()
+            .map_or_else(Vec::new, |provide| provide(&summary));
+        let art_key = match &summary.art {
+            CoverArt::Available(key) => Some(key.clone()),
+            CoverArt::Absent => None,
+        };
+        let cached = art_key
+            .as_ref()
+            .and_then(|key| self.inner.state.borrow().texture_cache.get(key).cloned());
+        let (drawer_widget, cover) = build_drawer(
+            &summary,
+            tracks,
+            self.inner.on_track_activated.get().cloned(),
+            self.inner.on_album_activated.get().cloned(),
+            self.inner.on_track_enqueue.get().cloned(),
+            cached.as_ref(),
+        );
+        if cached.is_none()
+            && let Some(key) = art_key
+        {
+            self.request_art(key, cover);
+        }
+
+        let columns = self.inner.state.borrow().columns;
+        let row_box = self
+            .inner
+            .state
+            .borrow()
+            .row_boxes
+            .get(index / columns)
+            .cloned();
+        let Some(row_box) = row_box else { return };
+        self.inner
+            .grid_box
+            .insert_child_after(&drawer_widget, Some(&row_box));
+        self.inner.state.borrow_mut().drawer = DrawerState::Open {
+            index,
+            widget: drawer_widget.clone().upcast(),
+        };
         self.highlight(Some(index));
     }
 }
@@ -613,14 +693,6 @@ fn track_number(track: &Track) -> String {
     } else {
         format!("{}.{:02}", track.disc_number.value(), track_num.value())
     }
-}
-
-/// The texture-cache and decode-request key for `summary`'s cover.
-fn art_key(summary: &AlbumSummary) -> ArtKey {
-    (
-        summary.album.as_str().to_owned(),
-        summary.artist.as_str().to_owned(),
-    )
 }
 
 /// Channel endpoints returned by `spawn_art_decoder`: the request sender and

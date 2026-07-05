@@ -5,4 +5,5 @@ pub mod metadata;
 pub mod scan;
 pub mod settings;
 pub mod track;
+pub mod view_mode;
 pub mod watch;

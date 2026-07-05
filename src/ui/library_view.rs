@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::OnceCell;
 use std::rc::Rc;
 
 use glib::BoxedAnyObject;
@@ -26,7 +26,7 @@ pub struct LibraryView {
     pub widget: ScrolledWindow,
     column_view: ColumnView,
     store: ListStore,
-    on_track_enqueue: Rc<RefCell<Option<SingleTrackCallback>>>,
+    on_track_enqueue: Rc<OnceCell<SingleTrackCallback>>,
 }
 
 impl LibraryView {
@@ -38,8 +38,7 @@ impl LibraryView {
         column_view.set_hexpand(true);
         column_view.set_vexpand(true);
 
-        let on_track_enqueue: Rc<RefCell<Option<SingleTrackCallback>>> =
-            Rc::new(RefCell::new(None));
+        let on_track_enqueue: Rc<OnceCell<SingleTrackCallback>> = Rc::new(OnceCell::new());
 
         let title_col = text_column(
             "Title",
@@ -119,7 +118,7 @@ impl LibraryView {
     /// Registers the callback invoked with a single track when "Add to Queue"
     /// is chosen from a row's right-click menu.
     pub fn connect_track_enqueue<F: Fn(Track) + 'static>(&self, f: F) {
-        *self.on_track_enqueue.borrow_mut() = Some(Rc::new(f));
+        let _ = self.on_track_enqueue.set(Rc::new(f));
     }
 }
 
@@ -134,7 +133,7 @@ fn collect_tracks(store: &ListStore) -> Vec<Track> {
 fn text_column<F>(
     title: &str,
     extract: F,
-    on_enqueue: Rc<RefCell<Option<SingleTrackCallback>>>,
+    on_enqueue: Rc<OnceCell<SingleTrackCallback>>,
 ) -> ColumnViewColumn
 where
     F: Fn(&Track) -> String + 'static,
@@ -165,7 +164,7 @@ where
                 return;
             };
             let track = data.borrow::<Track>().clone();
-            let Some(callback) = on_enqueue.borrow().clone() else {
+            let Some(callback) = on_enqueue.get().cloned() else {
                 return;
             };
             show_add_to_queue_menu(&label_widget, x, y, move || callback(track.clone()));

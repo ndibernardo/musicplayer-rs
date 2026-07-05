@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -17,24 +18,30 @@ use crate::library::track::Genre;
 
 type FilterCallback = Rc<dyn Fn(LibraryFilter)>;
 
+struct SidebarState {
+    genres: Vec<Genre>,
+    artists: Vec<Artist>,
+}
+
 /// Genre / artist browser. Emits a `LibraryFilter` when the user selects an
 /// entry.
 #[derive(Clone)]
 pub struct Sidebar {
     pub widget: GtkBox,
+    inner: Rc<SidebarInner>,
+}
+
+struct SidebarInner {
     genres: ListBox,
     artists: ListBox,
     genres_section: Expander,
     artists_section: Expander,
-    genre_values: Rc<RefCell<Vec<Genre>>>,
-    artist_values: Rc<RefCell<Vec<Artist>>>,
-    on_select: Rc<RefCell<Option<FilterCallback>>>,
+    state: RefCell<SidebarState>,
+    on_select: OnceCell<FilterCallback>,
 }
 
 impl Sidebar {
     pub fn new() -> Self {
-        let on_select: Rc<RefCell<Option<FilterCallback>>> = Rc::new(RefCell::new(None));
-
         let all_btn = Button::with_label("All Tracks");
         all_btn.add_css_class("flat");
         all_btn.set_margin_start(4);
@@ -44,88 +51,95 @@ impl Sidebar {
         let genres = section_list();
         let artists = section_list();
 
+        let inner = Rc::new(SidebarInner {
+            genres: genres.clone(),
+            artists: artists.clone(),
+            genres_section: section("Genres", &genres, true),
+            artists_section: section("Artists", &artists, false),
+            state: RefCell::new(SidebarState {
+                genres: Vec::new(),
+                artists: Vec::new(),
+            }),
+            on_select: OnceCell::new(),
+        });
+
         {
-            let on_select = Rc::clone(&on_select);
+            let inner = Rc::clone(&inner);
             let lists = [genres.clone(), artists.clone()];
             all_btn.connect_clicked(move |_| {
                 clear_selections(&lists);
-                emit(&on_select, LibraryFilter::All);
+                emit(&inner, LibraryFilter::All);
             });
         }
-
-        let genre_values: Rc<RefCell<Vec<Genre>>> = Rc::new(RefCell::new(Vec::new()));
-        let artist_values: Rc<RefCell<Vec<Artist>>> = Rc::new(RefCell::new(Vec::new()));
-
         {
-            let on_select = Rc::clone(&on_select);
-            let values = Rc::clone(&genre_values);
+            let inner = Rc::clone(&inner);
             let others = [artists.clone()];
             genres.connect_row_activated(move |_, row| {
                 clear_selections(&others);
-                if let Some(genre) = values.borrow().get(row.index() as usize).cloned() {
-                    emit(&on_select, LibraryFilter::ByGenre(genre));
+                let genre = inner
+                    .state
+                    .borrow()
+                    .genres
+                    .get(row.index() as usize)
+                    .cloned();
+                if let Some(genre) = genre {
+                    emit(&inner, LibraryFilter::ByGenre(genre));
                 }
             });
         }
         {
-            let on_select = Rc::clone(&on_select);
-            let values = Rc::clone(&artist_values);
+            let inner = Rc::clone(&inner);
             let others = [genres.clone()];
             artists.connect_row_activated(move |_, row| {
                 clear_selections(&others);
-                if let Some(artist) = values.borrow().get(row.index() as usize).cloned() {
-                    emit(&on_select, LibraryFilter::ByArtist(artist));
+                let artist = inner
+                    .state
+                    .borrow()
+                    .artists
+                    .get(row.index() as usize)
+                    .cloned();
+                if let Some(artist) = artist {
+                    emit(&inner, LibraryFilter::ByArtist(artist));
                 }
             });
         }
 
-        let genres_section = section("Genres", &genres, true);
-        let artists_section = section("Artists", &artists, false);
-
-        let inner = GtkBox::new(Orientation::Vertical, 0);
-        inner.append(&all_btn);
-        inner.append(&genres_section);
-        inner.append(&artists_section);
+        let inner_box = GtkBox::new(Orientation::Vertical, 0);
+        inner_box.append(&all_btn);
+        inner_box.append(&inner.genres_section);
+        inner_box.append(&inner.artists_section);
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_vexpand(true);
-        scrolled.set_child(Some(&inner));
+        scrolled.set_child(Some(&inner_box));
 
         let widget = GtkBox::new(Orientation::Vertical, 0);
         widget.set_vexpand(true);
         widget.append(&scrolled);
 
-        Self {
-            widget,
-            genres,
-            artists,
-            genres_section,
-            artists_section,
-            genre_values,
-            artist_values,
-            on_select,
-        }
+        Self { widget, inner }
     }
 
     /// Registers the callback invoked whenever the user picks a filter.
     pub fn connect_filter_selected<F: Fn(LibraryFilter) + 'static>(&self, f: F) {
-        *self.on_select.borrow_mut() = Some(Rc::new(f));
+        let _ = self.inner.on_select.set(Rc::new(f));
     }
 
     /// Replaces every section's entries with the given distinct values.
     /// A section with no entries collapses itself, since there is nothing
     /// left inside it to expand into.
     pub fn populate(&self, genres: Vec<Genre>, artists: Vec<Artist>) {
-        fill(&self.genres, genres.iter().map(Genre::as_str));
-        fill(&self.artists, artists.iter().map(Artist::as_str));
+        fill(&self.inner.genres, genres.iter().map(Genre::as_str));
+        fill(&self.inner.artists, artists.iter().map(Artist::as_str));
         if genres.is_empty() {
-            self.genres_section.set_expanded(false);
+            self.inner.genres_section.set_expanded(false);
         }
         if artists.is_empty() {
-            self.artists_section.set_expanded(false);
+            self.inner.artists_section.set_expanded(false);
         }
-        *self.genre_values.borrow_mut() = genres;
-        *self.artist_values.borrow_mut() = artists;
+        let mut state = self.inner.state.borrow_mut();
+        state.genres = genres;
+        state.artists = artists;
     }
 }
 
@@ -137,8 +151,8 @@ fn clear_selections(lists: &[ListBox]) {
     }
 }
 
-fn emit(on_select: &Rc<RefCell<Option<FilterCallback>>>, filter: LibraryFilter) {
-    if let Some(callback) = on_select.borrow().as_ref() {
+fn emit(inner: &SidebarInner, filter: LibraryFilter) {
+    if let Some(callback) = inner.on_select.get() {
         callback(filter);
     }
 }
