@@ -15,11 +15,16 @@ use gtk4::Orientation;
 use gtk4::ScrolledWindow;
 use gtk4::SelectionMode;
 use gtk4::Widget;
-use gtk4::gdk::Paintable;
+use gtk4::gdk::MemoryFormat;
+use gtk4::gdk::MemoryTexture;
 use gtk4::gdk::Texture;
+use gtk4::gdk_pixbuf::Pixbuf;
+use gtk4::gio::Cancellable;
+use gtk4::gio::MemoryInputStream;
 use gtk4::prelude::*;
 
 use crate::library::album::AlbumSummary;
+use crate::library::track::AlbumArtData;
 use crate::library::track::Track;
 use crate::ui::context_menu::show_add_to_queue_menu;
 use crate::ui::format::format_duration;
@@ -40,6 +45,13 @@ const GRID_MARGIN_TOTAL: i32 = 12;
 /// applied via `set_cover_size`.
 const DEFAULT_COVER_SIZE: i32 = 200;
 
+/// Side length (px) covers are decoded and downscaled to, regardless of the
+/// display size chosen via `set_cover_size`. One fixed bucket means the decode
+/// happens once per album no matter how the user resizes the cover slider
+/// afterward — `set_cover_size` only calls `Image::set_pixel_size`, which
+/// scales the already-decoded texture at render time.
+const COVER_DECODE_SIZE: i32 = crate::library::settings::COVER_SIZE_MAX;
+
 type TrackProvider = Rc<dyn Fn(&AlbumSummary) -> Vec<Track>>;
 /// Invoked with the album's full track list and the index of the activated one,
 /// so the caller can enqueue the whole album starting at that track.
@@ -48,6 +60,11 @@ type TrackCallback = Rc<dyn Fn(Vec<Track>, usize)>;
 type AlbumCallback = Rc<dyn Fn(Vec<Track>)>;
 /// Invoked with a single track chosen from a "add to queue" context menu.
 type SingleTrackCallback = Rc<dyn Fn(Track)>;
+/// Fetches an album's cover art bytes, called only on a texture-cache miss.
+type ArtProvider = Rc<dyn Fn(&AlbumSummary) -> Option<AlbumArtData>>;
+/// Identifies an album's cover in the texture cache and the decode-request
+/// pipeline: `(album, album artist)`.
+type ArtKey = (String, String);
 
 /// Album-art browser: a grid of cover cells. Activating a cover opens a
 /// full-width drawer with that album's full track list, inline on its own row
@@ -67,9 +84,17 @@ pub struct AlbumGrid {
     cells: Rc<RefCell<Vec<GtkBox>>>,
     // Cover image + its cell box, kept so `set_cover_size` can resize in place.
     covers: Rc<RefCell<Vec<(Image, GtkBox)>>>,
-    // Decoded textures keyed by (album, album_artist). Shared with idle decode
-    // tasks so a cache hit skips the JPEG/PNG decode on repeat set_albums calls.
-    texture_cache: Rc<RefCell<HashMap<(String, String), Texture>>>,
+    // Decoded, downscaled textures keyed by (album, album_artist). A cache hit
+    // skips both the DB byte fetch and the JPEG/PNG decode on repeat
+    // set_albums calls (sort change, filter change, reflow).
+    texture_cache: Rc<RefCell<HashMap<ArtKey, Texture>>>,
+    // Images awaiting a decode result for a given key, so several cells (a grid
+    // cell and, if opened before decoding finishes, its drawer cover) requesting
+    // the same album's art all get updated from one decode.
+    pending_covers: Rc<RefCell<HashMap<ArtKey, Vec<Image>>>>,
+    // Sends (key, bytes) to the background decode thread; see `spawn_art_decoder`.
+    art_request_tx: async_channel::Sender<(ArtKey, AlbumArtData)>,
+    art_provider: Rc<RefCell<Option<ArtProvider>>>,
     track_provider: Rc<RefCell<Option<TrackProvider>>>,
     on_track_activated: Rc<RefCell<Option<TrackCallback>>>,
     on_album_activated: Rc<RefCell<Option<AlbumCallback>>>,
@@ -90,6 +115,8 @@ impl AlbumGrid {
         scrolled.set_vexpand(true);
         scrolled.set_child(Some(&grid_box));
 
+        let (art_request_tx, art_result_rx) = spawn_art_decoder(COVER_DECODE_SIZE);
+
         let grid = Self {
             widget: scrolled,
             grid_box,
@@ -102,6 +129,9 @@ impl AlbumGrid {
             cells: Rc::new(RefCell::new(Vec::new())),
             covers: Rc::new(RefCell::new(Vec::new())),
             texture_cache: Rc::new(RefCell::new(HashMap::new())),
+            pending_covers: Rc::new(RefCell::new(HashMap::new())),
+            art_request_tx,
+            art_provider: Rc::new(RefCell::new(None)),
             track_provider: Rc::new(RefCell::new(None)),
             on_track_activated: Rc::new(RefCell::new(None)),
             on_album_activated: Rc::new(RefCell::new(None)),
@@ -109,7 +139,25 @@ impl AlbumGrid {
             on_track_enqueue: Rc::new(RefCell::new(None)),
         };
         grid.install_reflow_handler();
+        grid.install_art_decode_receiver(art_result_rx);
         grid
+    }
+
+    /// Consumes decoded textures from the background decoder and hands each one
+    /// to every cell that was waiting on it — a grid cell, and its drawer cover
+    /// if the drawer was opened before the decode finished.
+    fn install_art_decode_receiver(&self, rx: async_channel::Receiver<(ArtKey, Texture)>) {
+        let texture_cache = Rc::clone(&self.texture_cache);
+        let pending_covers = Rc::clone(&self.pending_covers);
+        glib::spawn_future_local(async move {
+            while let Ok((key, texture)) = rx.recv().await {
+                let waiting = pending_covers.borrow_mut().remove(&key);
+                texture_cache.borrow_mut().insert(key, texture.clone());
+                for image in waiting.into_iter().flatten() {
+                    image.set_paintable(Some(&texture));
+                }
+            }
+        });
     }
 
     /// Reflows whenever the scroll viewport's width changes.
@@ -193,6 +241,47 @@ impl AlbumGrid {
         *self.track_provider.borrow_mut() = Some(Rc::new(f));
     }
 
+    /// Supplies an album's cover art bytes, called only on a texture-cache miss
+    /// (once per album, ever, unless `invalidate_art_cache` runs).
+    pub fn set_art_provider<F: Fn(&AlbumSummary) -> Option<AlbumArtData> + 'static>(
+        &self,
+        f: F,
+    ) {
+        *self.art_provider.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Clears every decoded texture, so the next display of each cover re-fetches
+    /// and re-decodes its bytes. Call after a scan may have changed an album's
+    /// embedded art — the cache is keyed only by (album, artist), so it would
+    /// otherwise keep showing a stale cover until restart.
+    pub fn invalidate_art_cache(&self) {
+        self.texture_cache.borrow_mut().clear();
+    }
+
+    /// Registers `image` to receive `key`'s texture once decoded, fetching the
+    /// art bytes and dispatching the decode on the first request for `key`.
+    /// A second cell asking for the same album (e.g. its drawer, opened before
+    /// the first decode finishes) just joins the waiting list.
+    fn request_art(&self, key: ArtKey, summary: &AlbumSummary, image: Image) {
+        let first_request = {
+            let mut pending = self.pending_covers.borrow_mut();
+            let waiting = pending.entry(key.clone()).or_default();
+            waiting.push(image);
+            waiting.len() == 1
+        };
+        if !first_request {
+            return;
+        }
+        let Some(art) = self.art_provider.borrow().as_ref().and_then(|f| f(summary)) else {
+            self.pending_covers.borrow_mut().remove(&key);
+            return;
+        };
+        // The decoder thread is unbounded and never closes its receiver while
+        // `self` is alive, so a send failure can't happen in practice; dropping
+        // the request would just leave that cover blank, which is recoverable.
+        let _ = self.art_request_tx.try_send((key, art));
+    }
+
     /// Registers the callback invoked when a track inside a drawer is activated.
     /// It receives the album's full track list and the activated track's index.
     pub fn connect_track_activated<F: Fn(Vec<Track>, usize) + 'static>(&self, f: F) {
@@ -238,31 +327,13 @@ impl AlbumGrid {
         image.set_pixel_size(size);
         image.set_halign(Align::Center);
 
-        if let Some(art) = summary.art.clone() {
-            let cache = Rc::clone(&self.texture_cache);
-            let key = (
-                summary.album.as_str().to_owned(),
-                summary.artist.as_str().to_owned(),
-            );
-            if let Some(texture) = cache.borrow().get(&key) {
+        if summary.has_art {
+            let key = art_key(summary);
+            if let Some(texture) = self.texture_cache.borrow().get(&key) {
                 // Already decoded from a prior set_albums call — reuse instantly.
                 image.set_paintable(Some(texture));
             } else {
-                // Defer the JPEG/PNG decode to an idle iteration so rebuilding the
-                // grid (e.g. on sort change) never stalls the main thread.
-                let img = image.clone();
-                glib::idle_add_local_once(move || {
-                    // Another cell for the same album may have decoded it already.
-                    if let Some(texture) = cache.borrow().get(&key) {
-                        img.set_paintable(Some(texture));
-                        return;
-                    }
-                    let bytes = glib::Bytes::from(art.as_bytes());
-                    if let Ok(texture) = Texture::from_bytes(&bytes) {
-                        img.set_paintable(Some(&texture));
-                        cache.borrow_mut().insert(key, texture);
-                    }
-                });
+                self.request_art(key, summary, image.clone());
             }
         }
 
@@ -368,19 +439,20 @@ impl AlbumGrid {
                 Some(provide) => provide(summary),
                 None => Vec::new(),
             };
-            let key = (
-                summary.album.as_str().to_owned(),
-                summary.artist.as_str().to_owned(),
-            );
+            let key = art_key(summary);
             let cached = self.texture_cache.borrow().get(&key).cloned();
-            build_drawer(
+            let (drawer, cover) = build_drawer(
                 summary,
                 tracks,
                 self.on_track_activated.borrow().clone(),
                 self.on_album_activated.borrow().clone(),
                 self.on_track_enqueue.borrow().clone(),
                 cached.as_ref(),
-            )
+            );
+            if cached.is_none() && summary.has_art {
+                self.request_art(key, summary, cover);
+            }
+            drawer
         };
 
         let row_boxes = self.row_boxes.borrow();
@@ -398,7 +470,9 @@ impl AlbumGrid {
 const DRAWER_COVER_SIZE: i32 = 160;
 
 /// Builds the inline drawer: the album cover on the left, and on the right a
-/// header (play button plus album heading) above the full track list.
+/// header (play button plus album heading) above the full track list. Returns
+/// the drawer widget together with its cover `Image`, so the caller can
+/// register the image for an async texture update on a cache miss.
 fn build_drawer(
     summary: &AlbumSummary,
     tracks: Vec<Track>,
@@ -406,7 +480,7 @@ fn build_drawer(
     on_album: Option<AlbumCallback>,
     on_track_enqueue: Option<SingleTrackCallback>,
     cached: Option<&Texture>,
-) -> GtkBox {
+) -> (GtkBox, Image) {
     let container = GtkBox::new(Orientation::Vertical, 0);
     container.set_hexpand(true);
 
@@ -467,12 +541,11 @@ fn build_drawer(
     cover.set_margin_start(8);
     cover.set_margin_top(8);
     cover.set_margin_bottom(8);
-    // Prefer the pre-decoded cached texture; fall back to a synchronous decode
-    // when the user opens the drawer before the idle task has fired for that cell.
-    let drawer_paintable: Option<Paintable> = cached
-        .map(|t| Paintable::from(t.clone()))
-        .or_else(|| cover_paintable(summary));
-    cover.set_paintable(drawer_paintable.as_ref());
+    // The pre-decoded cached texture, if the grid cell already resolved one;
+    // otherwise the caller registers `cover` to receive it once decoded.
+    if let Some(texture) = cached {
+        cover.set_paintable(Some(texture));
+    }
 
     let outer = GtkBox::new(Orientation::Horizontal, 8);
     // Same dark tint as the selected cover, so the open album and its track list
@@ -482,7 +555,7 @@ fn build_drawer(
     outer.set_margin_bottom(2);
     outer.append(&cover);
     outer.append(&container);
-    outer
+    (outer, cover)
 }
 
 fn drawer_heading(summary: &AlbumSummary) -> String {
@@ -542,10 +615,55 @@ fn track_number(track: &Track) -> String {
     }
 }
 
-/// Decodes embedded cover art to a paintable, or `None` when the album has no
-/// art or the bytes cannot be decoded.
-fn cover_paintable(summary: &AlbumSummary) -> Option<Paintable> {
-    let art = summary.art.as_ref()?;
-    let bytes = glib::Bytes::from(art.as_bytes());
-    Texture::from_bytes(&bytes).ok().map(Paintable::from)
+/// The texture-cache and decode-request key for `summary`'s cover.
+fn art_key(summary: &AlbumSummary) -> ArtKey {
+    (
+        summary.album.as_str().to_owned(),
+        summary.artist.as_str().to_owned(),
+    )
+}
+
+/// Channel endpoints returned by `spawn_art_decoder`: the request sender and
+/// the matching result receiver.
+type ArtDecoder = (
+    async_channel::Sender<(ArtKey, AlbumArtData)>,
+    async_channel::Receiver<(ArtKey, Texture)>,
+);
+
+/// Spawns the background cover decoder. It receives `(key, bytes)` requests and
+/// sends back `(key, texture)` once decoded and downscaled to at most
+/// `max_size` px on each side. Runs on its own thread so a 1500x1500 JPEG never
+/// blocks the main thread — `gdk4::Texture` is `Send`, and GDK4's object
+/// construction has no main-thread requirement (unlike GDK3's).
+fn spawn_art_decoder(max_size: i32) -> ArtDecoder {
+    let (request_tx, request_rx) = async_channel::unbounded::<(ArtKey, AlbumArtData)>();
+    let (result_tx, result_rx) = async_channel::unbounded::<(ArtKey, Texture)>();
+    std::thread::spawn(move || {
+        while let Ok((key, data)) = request_rx.recv_blocking() {
+            if let Some(texture) = decode_and_scale(&data, max_size)
+                && result_tx.send_blocking((key, texture)).is_err()
+            {
+                break; // the AlbumGrid was dropped — nothing left to decode for.
+            }
+        }
+    });
+    (request_tx, result_rx)
+}
+
+/// Decodes `data` and downscales it to fit within `max_size` x `max_size`,
+/// preserving aspect ratio. `None` when the bytes aren't a decodable image.
+fn decode_and_scale(data: &AlbumArtData, max_size: i32) -> Option<Texture> {
+    let bytes = glib::Bytes::from(data.as_bytes());
+    let stream = MemoryInputStream::from_bytes(&bytes);
+    let pixbuf =
+        Pixbuf::from_stream_at_scale(&stream, max_size, max_size, true, Cancellable::NONE).ok()?;
+    let format = if pixbuf.has_alpha() {
+        MemoryFormat::R8g8b8a8
+    } else {
+        MemoryFormat::R8g8b8
+    };
+    let row_stride = pixbuf.rowstride() as usize;
+    let pixels = pixbuf.pixel_bytes()?;
+    let texture = MemoryTexture::new(pixbuf.width(), pixbuf.height(), format, &pixels, row_stride);
+    Some(texture.upcast())
 }

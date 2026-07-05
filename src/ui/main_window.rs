@@ -302,14 +302,15 @@ impl MainWindow {
                         this.status_label.set_text(&format!("Indexed {n} tracks"));
                         this.scan_spinner.stop();
                         this.scan_indicator.set_visible(false);
-                        if let Ok(tracks) = this.db.tracks_for(&LibraryFilter::All) {
-                            this.library_view.set_tracks(tracks);
-                        }
-                        this.refresh_sidebar();
-                        this.refresh_album_grid_with(
-                            &this.current_filter.borrow(),
-                            *this.current_sort.borrow(),
-                        );
+                        // A rescan may have changed an album's embedded art; the
+                        // texture cache is keyed only by (album, artist), so it
+                        // must be dropped before the grid repopulates.
+                        this.album_grid.invalidate_art_cache();
+                        // refresh_views (not a hardcoded LibraryFilter::All) keeps
+                        // the track list honouring whatever filter is active —
+                        // otherwise a scan finishing while a genre filter is
+                        // selected would silently reset the list to everything.
+                        this.refresh_views();
                         break;
                     }
                     ScanEvent::Finished(Err(e)) => {
@@ -715,6 +716,20 @@ pub fn build(
                 .unwrap_or_else(|e| {
                     tracing::error!("Album query failed: {e}");
                     Vec::new()
+                })
+        });
+    }
+
+    // Cover art bytes, fetched only on a texture-cache miss (see AlbumGrid's
+    // art pipeline) instead of shipping every cover on every grid refresh.
+    {
+        let this = mw.clone();
+        mw.album_grid.set_art_provider(move |summary| {
+            this.db
+                .art_for_album(&summary.album, &summary.artist)
+                .unwrap_or_else(|e| {
+                    tracing::error!("Art lookup failed: {e}");
+                    None
                 })
         });
     }

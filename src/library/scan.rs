@@ -62,6 +62,9 @@ pub fn scan_folder_with_progress(
     let files = collect_audio_files(folder.as_path())?;
     let known = db.known_file_stats(folder)?;
     let mut seen: HashSet<PathBuf> = HashSet::with_capacity(files.len());
+    // Tracks (album, effective artist) pairs already written this scan, so a
+    // multi-track album writes its cover blob once instead of once per track.
+    let mut art_written: HashSet<(String, String)> = HashSet::new();
     let mut count = 0u32;
 
     for chunk in files.chunks(BATCH_SIZE) {
@@ -87,7 +90,13 @@ pub fn scan_folder_with_progress(
                     } else {
                         &track.album_artist
                     };
-                    Db::upsert_art(&tx, &track.album, effective_artist, art.as_bytes())?;
+                    let key = (
+                        track.album.as_str().to_owned(),
+                        effective_artist.as_str().to_owned(),
+                    );
+                    if art_written.insert(key) {
+                        Db::upsert_art(&tx, &track.album, effective_artist, art.as_bytes())?;
+                    }
                 }
                 count += 1;
                 on_progress(count);
@@ -97,6 +106,7 @@ pub fn scan_folder_with_progress(
     }
 
     db.remove_stale_tracks(folder, &seen)?;
+    db.prune_orphaned_art()?;
     Ok(count)
 }
 
@@ -401,6 +411,55 @@ mod tests {
             db.track_count().unwrap(),
             0,
             "deleted file must be removed from DB"
+        );
+    }
+
+    fn art_row_count(db: &Db) -> u32 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM album_art", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap() as u32
+    }
+
+    #[test]
+    fn scan_folder_writes_art_once_per_album_even_with_several_tracks() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("track01.flac"));
+        touch(&dir.path().join("track02.flac"));
+        touch(&dir.path().join("track03.flac"));
+
+        let db = Db::open_in_memory().unwrap();
+        let folder = LibraryFolder::new(dir.path()).unwrap();
+        let art = AlbumArtData::new(vec![0xFF, 0xD8, 0xFF]);
+        scan_folder(&folder, &db, |p| Some((fake_track(p), Some(art.clone())))).unwrap();
+
+        assert_eq!(
+            art_row_count(&db),
+            1,
+            "one album across three tracks must write one album_art row"
+        );
+    }
+
+    #[test]
+    fn scan_folder_prunes_art_for_an_album_whose_last_track_was_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("track.flac");
+        touch(&file);
+
+        let db = Db::open_in_memory().unwrap();
+        let folder = LibraryFolder::new(dir.path()).unwrap();
+        let art = AlbumArtData::new(vec![0xFF, 0xD8, 0xFF]);
+        scan_folder(&folder, &db, |p| Some((fake_track(p), Some(art.clone())))).unwrap();
+        assert_eq!(art_row_count(&db), 1);
+
+        std::fs::remove_file(&file).unwrap();
+        scan_folder(&folder, &db, |p| Some((fake_track(p), Some(art.clone())))).unwrap();
+
+        assert_eq!(
+            art_row_count(&db),
+            0,
+            "art for a fully-removed album must be pruned"
         );
     }
 }

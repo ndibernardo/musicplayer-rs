@@ -82,8 +82,7 @@ const SCHEMA: &str = "
         duration_ms  INTEGER,
         track_number INTEGER,
         disc_number  INTEGER,
-        year         INTEGER,
-        art          BLOB
+        year         INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS settings (
@@ -157,25 +156,25 @@ fn build_track(row: TrackRow) -> Result<Track, DbError> {
     })
 }
 
-/// Raw columns of one grouped album row: album, artist, genre, year, art.
+/// Raw columns of one grouped album row: album, artist, genre, year, has_art.
 type AlbumRow = (
     Option<String>,
     Option<String>,
     Option<String>,
     Option<i64>,
-    Option<Vec<u8>>,
+    bool,
 );
 
 /// Builds an `AlbumSummary` from a grouped row. All fields are infallible;
 /// NULLs map to the domain "unknown" defaults.
 fn build_album_summary(row: AlbumRow) -> AlbumSummary {
-    let (album, artist, genre, year, art) = row;
+    let (album, artist, genre, year, has_art) = row;
     AlbumSummary {
         album: AlbumTitle::new(or_empty(album)),
         artist: Artist::new(or_empty(artist)),
         genre: Genre::new(or_empty(genre)),
         year: Year::new(or_zero(year) as u16),
-        art: art.map(AlbumArtData::new),
+        has_art,
     }
 }
 
@@ -245,7 +244,6 @@ impl Db {
             ("track_number", "INTEGER"),
             ("disc_number", "INTEGER"),
             ("year", "INTEGER"),
-            ("art", "BLOB"),
             ("album_artist", "TEXT"),
             ("composer", "TEXT"),
             ("mtime", "INTEGER"),
@@ -290,6 +288,7 @@ impl Db {
         )?;
         tx.execute("DELETE FROM folders WHERE path = ?1", [folder_str.as_ref()])?;
         tx.commit()?;
+        self.prune_orphaned_art()?;
         Ok(())
     }
 
@@ -478,6 +477,21 @@ impl Db {
         }
         tx.commit()?;
         Ok(stale.len() as u64)
+    }
+
+    /// Deletes `album_art` rows for albums no track references any more (e.g.
+    /// after a folder or stale-track removal). Returns the count of removed rows.
+    pub fn prune_orphaned_art(&self) -> Result<u64, DbError> {
+        let n = self.conn.execute(
+            "DELETE FROM album_art
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM tracks
+                 WHERE tracks.album = album_art.album
+                   AND COALESCE(tracks.album_artist, tracks.artist) = album_art.album_artist
+             )",
+            [],
+        )?;
+        Ok(n as u64)
     }
 
     /// Returns all tracks ordered by artist, then album, then track number.
@@ -696,8 +710,9 @@ impl Db {
     /// Runs the album-summary aggregate with the given `WHERE` clause. Albums are
     /// grouped by their album artist, `COALESCE(album_artist, artist)`, so a
     /// compilation collapses to one entry and a missing album-artist tag falls
-    /// back to the track artist. `MAX` on genre/year/art skips NULLs, so a summary
-    /// carries art from any track in the group that has it.
+    /// back to the track artist. `MAX` on genre/year skips NULLs. `has_art` is an
+    /// `EXISTS` check rather than a data fetch — the grid only needs to know
+    /// whether a cover exists, and fetches the bytes separately on demand.
     fn album_summaries_query(
         &self,
         where_clause: &str,
@@ -705,19 +720,18 @@ impl Db {
         sort: &AlbumSort,
     ) -> Result<Vec<AlbumSummary>, DbError> {
         let order_by = sort.order_by_clause();
-        // Scalar subquery for art avoids a JOIN that would make `album` and
+        // Correlated EXISTS avoids a JOIN that would make `album` and
         // `album_artist` ambiguous in GROUP BY and ORDER BY (both tables share
         // those column names). The album_art table is small (one row per album)
-        // so the correlated lookup is cheap.
+        // so the correlated lookup is cheap, and EXISTS never reads the BLOB.
         let sql = format!(
             "SELECT album,
                     COALESCE(album_artist, artist) AS album_artist,
                     MAX(genre) AS album_genre,
                     MAX(year)  AS album_year,
-                    (SELECT aa.data FROM album_art aa
-                     WHERE aa.album        = tracks.album
-                       AND aa.album_artist = COALESCE(tracks.album_artist, tracks.artist)
-                     LIMIT 1)
+                    EXISTS(SELECT 1 FROM album_art aa
+                           WHERE aa.album        = tracks.album
+                             AND aa.album_artist = COALESCE(tracks.album_artist, tracks.artist))
              FROM tracks
              {where_clause}
              GROUP BY album, album_artist
@@ -730,7 +744,7 @@ impl Db {
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<Vec<u8>>>(4)?,
+                row.get::<_, bool>(4)?,
             ))
         })?
         .map(|r| r.map(build_album_summary).map_err(DbError::from))
@@ -1641,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn album_summaries_carries_cover_art_from_album_art_table() {
+    fn album_summaries_reports_has_art_when_album_art_table_has_a_row() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
             .unwrap();
@@ -1656,10 +1670,18 @@ mod tests {
 
         let summaries = db.album_summaries().unwrap();
         assert_eq!(summaries.len(), 1);
-        assert_eq!(
-            summaries[0].art.as_ref().map(AlbumArtData::as_bytes),
-            Some(&[0xFF, 0xD8, 0xFF][..])
-        );
+        assert!(summaries[0].has_art);
+    }
+
+    #[test]
+    fn album_summaries_reports_no_art_when_album_art_table_is_empty() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+
+        let summaries = db.album_summaries().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert!(!summaries[0].has_art);
     }
 
     #[test]
@@ -1692,6 +1714,91 @@ mod tests {
             .art_for_album(&AlbumTitle::new("Missing"), &Artist::new("Nobody"))
             .unwrap();
         assert!(art.is_none());
+    }
+
+    #[test]
+    fn prune_orphaned_art_removes_art_for_albums_with_no_surviving_tracks() {
+        let db = Db::open_in_memory().unwrap();
+        Db::upsert_art(
+            &db.conn,
+            &AlbumTitle::new("Geogaddi"),
+            &Artist::new("Boards of Canada"),
+            &[0xFF, 0xD8, 0xFF],
+        )
+        .unwrap();
+        // No track references this album — the art row is orphaned from the start.
+
+        let removed = db.prune_orphaned_art().unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(
+            db.art_for_album(
+                &AlbumTitle::new("Geogaddi"),
+                &Artist::new("Boards of Canada")
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn prune_orphaned_art_keeps_art_for_albums_with_surviving_tracks() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        Db::upsert_art(
+            &db.conn,
+            &AlbumTitle::new("Music Has the Right to Children"),
+            &Artist::new("Boards of Canada"),
+            &[0xFF, 0xD8, 0xFF],
+        )
+        .unwrap();
+
+        let removed = db.prune_orphaned_art().unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(
+            db.art_for_album(
+                &AlbumTitle::new("Music Has the Right to Children"),
+                &Artist::new("Boards of Canada")
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn remove_folder_prunes_orphaned_art() {
+        let db = Db::open_in_memory().unwrap();
+        let music = LibraryFolder::new("/home/user/Music").unwrap();
+        db.add_folder(&music).unwrap();
+        db.upsert_track(&full_track("/home/user/Music/boc/roygbiv.flac"))
+            .unwrap();
+        Db::upsert_art(
+            &db.conn,
+            &AlbumTitle::new("Music Has the Right to Children"),
+            &Artist::new("Boards of Canada"),
+            &[0xFF, 0xD8, 0xFF],
+        )
+        .unwrap();
+
+        db.remove_folder(&music).unwrap();
+
+        assert!(
+            db.art_for_album(
+                &AlbumTitle::new("Music Has the Right to Children"),
+                &Artist::new("Boards of Canada")
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn schema_has_no_art_column_on_a_fresh_database() {
+        let db = Db::open_in_memory().unwrap();
+        let columns = db.track_columns().unwrap();
+        assert!(!columns.iter().any(|c| c == "art"));
     }
 
     #[test]
