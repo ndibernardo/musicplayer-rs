@@ -10,6 +10,7 @@ use rodio::Player;
 use crate::library::track::TrackPath;
 use crate::player::AudioBackend;
 use crate::player::AudioError;
+use crate::player::BackendState;
 use crate::player::Volume;
 
 pub struct RodioAudioBackend {
@@ -113,12 +114,18 @@ impl AudioBackend for RodioAudioBackend {
         self.player.set_volume(self.volume);
     }
 
-    fn is_playing(&self) -> bool {
-        !self.player.is_paused() && !self.player.empty()
-    }
-
-    fn is_paused(&self) -> bool {
-        self.player.is_paused()
+    fn state(&self) -> BackendState {
+        // `empty` first: an empty player's `is_paused` flag reflects whatever
+        // it last was, not "nothing loaded" — checking it first would let a
+        // resume on an empty player (e.g. right after a decode failure)
+        // report Paused or Playing when there is genuinely nothing to play.
+        if self.player.empty() {
+            BackendState::Idle
+        } else if self.player.is_paused() {
+            BackendState::Paused
+        } else {
+            BackendState::Playing
+        }
     }
 
     fn position(&self) -> Duration {

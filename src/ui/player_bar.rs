@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use gtk4::Adjustment;
@@ -31,8 +32,12 @@ pub struct PlayerBar {
     progress: Scale,
     play_pause_btn: Button,
     volume_scale: Scale,
-    // Tracks whether the engine is currently playing so the button can toggle correctly.
-    is_playing: Rc<Cell<bool>>,
+    // The last state reported by the player, so the play/pause button can
+    // decide its action from the actual domain state instead of a bool that
+    // collapses Stopped and Failed into the same "not playing" bucket.
+    last_state: Rc<RefCell<PlaybackState>>,
+    // The last track shown, kept so a click on a Failed track can retry it.
+    last_track: Rc<RefCell<Option<Track>>>,
     // Current track length in milliseconds, used to set the progress scale range.
     duration_ms: Rc<Cell<u64>>,
 }
@@ -136,16 +141,25 @@ impl PlayerBar {
         widget.append(&track_label);
         widget.append(&bottom);
 
-        let is_playing = Rc::new(Cell::new(false));
+        let last_state = Rc::new(RefCell::new(PlaybackState::Stopped));
+        let last_track: Rc<RefCell<Option<Track>>> = Rc::new(RefCell::new(None));
 
         {
             let player = player.clone();
-            let is_playing = Rc::clone(&is_playing);
-            play_pause_btn.connect_clicked(move |_| {
-                if is_playing.get() {
-                    player.send(PlayerCommand::Pause);
-                } else {
-                    player.send(PlayerCommand::Resume);
+            let last_state = Rc::clone(&last_state);
+            let last_track = Rc::clone(&last_track);
+            play_pause_btn.connect_clicked(move |_| match &*last_state.borrow() {
+                PlaybackState::Playing { .. } => player.send(PlayerCommand::Pause),
+                PlaybackState::Paused { .. } => player.send(PlayerCommand::Resume),
+                // The queue was cleared on stop; there is nothing to resume.
+                PlaybackState::Stopped => {}
+                // Retry: the queue still holds this track, but the backend has
+                // no loaded source, so a bare Resume would report a phantom
+                // Playing state instead of actually retrying it.
+                PlaybackState::Failed { .. } => {
+                    if let Some(track) = last_track.borrow().clone() {
+                        player.send(PlayerCommand::Play(Box::new(track)));
+                    }
                 }
             });
         }
@@ -185,7 +199,8 @@ impl PlayerBar {
             progress,
             play_pause_btn,
             volume_scale,
-            is_playing,
+            last_state,
+            last_track,
             duration_ms,
         }
     }
@@ -199,6 +214,7 @@ impl PlayerBar {
 
     /// Called when a new track starts (from double-click or auto-advance).
     pub fn set_track(&self, track: &Track) {
+        *self.last_track.borrow_mut() = Some(track.clone());
         self.track_label.set_markup(&track_markup(track));
 
         let duration_ms = track.duration.as_duration().as_millis() as u64;
@@ -214,9 +230,9 @@ impl PlayerBar {
 
     /// Called on every state change (play/pause/stop/fail) and on position ticks.
     pub fn update_state(&self, state: &PlaybackState) {
+        *self.last_state.borrow_mut() = state.clone();
         match state {
             PlaybackState::Stopped => {
-                self.is_playing.set(false);
                 self.play_pause_btn
                     .set_icon_name("media-playback-start-symbolic");
                 self.track_label.set_text("");
@@ -225,19 +241,16 @@ impl PlayerBar {
                 self.progress.set_value(0.0);
             }
             PlaybackState::Playing { position, .. } => {
-                self.is_playing.set(true);
                 self.play_pause_btn
                     .set_icon_name("media-playback-pause-symbolic");
                 self.show_position(*position);
             }
             PlaybackState::Paused { position, .. } => {
-                self.is_playing.set(false);
                 self.play_pause_btn
                     .set_icon_name("media-playback-start-symbolic");
                 self.show_position(*position);
             }
             PlaybackState::Failed { .. } => {
-                self.is_playing.set(false);
                 self.play_pause_btn
                     .set_icon_name("media-playback-start-symbolic");
             }
