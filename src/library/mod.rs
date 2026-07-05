@@ -7,3 +7,4 @@ pub mod settings;
 pub mod track;
 pub mod view_mode;
 pub mod watch;
+pub mod window_state;

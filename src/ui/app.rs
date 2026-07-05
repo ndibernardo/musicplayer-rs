@@ -5,6 +5,7 @@ use gtk4::Application;
 use gtk4::prelude::*;
 
 use crate::library::db::Db;
+use crate::library::track::Track;
 use crate::player::PlaybackState;
 use crate::player::PlayerHandle;
 
@@ -13,6 +14,7 @@ pub fn run(
     db_path: PathBuf,
     player: PlayerHandle,
     state_rx: async_channel::Receiver<PlaybackState>,
+    queue_rx: async_channel::Receiver<Vec<Track>>,
 ) {
     let app = Application::builder()
         .application_id("io.github.musicplayer_rs")
@@ -25,6 +27,7 @@ pub fn run(
             db_path.clone(),
             player.clone(),
             state_rx.clone(),
+            queue_rx.clone(),
         )
         .present();
     });
