@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -23,9 +24,13 @@ type SelectCallback = Rc<dyn Fn(usize)>;
 #[derive(Clone)]
 pub struct QueueView {
     pub widget: Expander,
+    inner: Rc<QueueViewInner>,
+}
+
+struct QueueViewInner {
     list: ListBox,
-    tracks: Rc<RefCell<Vec<Track>>>,
-    on_select: Rc<RefCell<Option<SelectCallback>>>,
+    tracks: RefCell<Vec<Track>>,
+    on_select: OnceCell<SelectCallback>,
 }
 
 impl QueueView {
@@ -43,55 +48,59 @@ impl QueueView {
         widget.set_margin_start(4);
         widget.set_child(Some(&scrolled));
 
-        let on_select: Rc<RefCell<Option<SelectCallback>>> = Rc::new(RefCell::new(None));
+        let inner = Rc::new(QueueViewInner {
+            list: list.clone(),
+            tracks: RefCell::new(Vec::new()),
+            on_select: OnceCell::new(),
+        });
         {
-            let on_select = Rc::clone(&on_select);
+            let inner = Rc::clone(&inner);
             list.connect_row_activated(move |_, row| {
-                if let Some(callback) = on_select.borrow().as_ref() {
+                if let Some(callback) = inner.on_select.get() {
                     callback(row.index() as usize);
                 }
             });
         }
 
-        Self {
-            widget,
-            list,
-            tracks: Rc::new(RefCell::new(Vec::new())),
-            on_select,
-        }
+        Self { widget, inner }
     }
 
     /// Replaces the visible queue with `tracks`. Collapses the section when
     /// the queue empties out; never re-expands it on its own, so a manual
     /// collapse of a non-empty queue is left alone.
     pub fn set_tracks(&self, tracks: Vec<Track>) {
-        while let Some(child) = self.list.first_child() {
-            self.list.remove(&child);
+        while let Some(child) = self.inner.list.first_child() {
+            self.inner.list.remove(&child);
         }
         for track in &tracks {
-            self.list.append(&track_row(track));
+            self.inner.list.append(&track_row(track));
         }
         if tracks.is_empty() {
             self.widget.set_expanded(false);
         }
-        *self.tracks.borrow_mut() = tracks;
+        *self.inner.tracks.borrow_mut() = tracks;
     }
 
     /// Highlights the row whose track matches `current`, or clears the highlight
     /// when `current` is `None` or absent from the queue.
     pub fn set_current(&self, current: Option<TrackId>) {
-        let index =
-            current.and_then(|id| self.tracks.borrow().iter().position(|track| track.id == id));
-        match index.and_then(|i| self.list.row_at_index(i as i32)) {
-            Some(row) => self.list.select_row(Some(&row)),
-            None => self.list.unselect_all(),
+        let index = current.and_then(|id| {
+            self.inner
+                .tracks
+                .borrow()
+                .iter()
+                .position(|track| track.id == id)
+        });
+        match index.and_then(|i| self.inner.list.row_at_index(i as i32)) {
+            Some(row) => self.inner.list.select_row(Some(&row)),
+            None => self.inner.list.unselect_all(),
         }
     }
 
     /// Registers the callback invoked with the row index when a queue entry is
     /// activated.
     pub fn connect_track_selected<F: Fn(usize) + 'static>(&self, f: F) {
-        *self.on_select.borrow_mut() = Some(Rc::new(f));
+        let _ = self.inner.on_select.set(Rc::new(f));
     }
 }
 
