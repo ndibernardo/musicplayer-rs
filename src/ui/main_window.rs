@@ -1,9 +1,9 @@
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+use async_channel::Sender;
 use gtk4::Application;
 use gtk4::ApplicationWindow;
 use gtk4::Box as GtkBox;
@@ -42,6 +42,9 @@ use crate::library::track::TrackId;
 use crate::library::view_mode::ViewMode;
 use crate::library::watch::FolderWatcher;
 use crate::library::watch::watch_folders;
+use crate::library::window_state::Msg;
+use crate::library::window_state::WindowState;
+use crate::library::window_state::reduce;
 use crate::player::PlaybackState;
 use crate::player::PlayerCommand;
 use crate::player::PlayerHandle;
@@ -97,18 +100,7 @@ const APP_CSS: &str = "\
 }
 ";
 
-/// The window's mutable state, behind one `RefCell` so the active filter,
-/// sort, queue, and watcher can never be observed half-updated relative to
-/// each other.
-struct WindowState {
-    filter: LibraryFilter,
-    sort: AlbumSort,
-    queue: Vec<Track>,
-    watcher: Option<FolderWatcher>,
-}
-
-/// Every persisted setting read once at startup, before `db` moves into
-/// `MainWindow`.
+/// Every persisted setting read once at startup, before `db` moves into `Context`.
 struct InitialSettings {
     cover_size: i32,
     sort: AlbumSort,
@@ -138,54 +130,48 @@ impl InitialSettings {
     }
 }
 
-/// Header-bar and toggle widgets `MainWindow::new` constructs and `build`
-/// wires up afterward. Kept alive by their place in the widget tree once
-/// wiring finishes.
-struct Controls {
-    size_scale: Scale,
-    sort_field: DropDown,
-    sort_dir: ToggleButton,
-    list_toggle: ToggleButton,
-    grid_toggle: ToggleButton,
-    content: Stack,
-    toggle_grid_controls: Rc<dyn Fn(ViewMode)>,
-    scan_btn: Button,
-    add_btn: Button,
-}
-
-/// Shared application controller. All fields are ref-counted so the struct is
-/// cheap to clone; signal handlers capture `this = self.clone()`.
-#[derive(Clone)]
-struct MainWindow {
+/// Everything `apply` needs to turn a reduced `WindowState` + the `Msg` that
+/// produced it into DB queries, player commands, and widget updates. Owned
+/// solely by the one dispatch loop in `build` — never `Clone`, never shared,
+/// so none of its fields need `Rc<RefCell<_>>`.
+struct Context {
     db: Rc<Db>,
     db_path: PathBuf,
     player: PlayerHandle,
-    // Views
     library_view: LibraryView,
     album_grid: AlbumGrid,
     filter_sidebar: Sidebar,
     queue_view: QueueView,
     player_bar: PlayerBar,
-    // Widgets owned by the controller
     window: ApplicationWindow,
     folder_list: ListBox,
     status_label: Label,
     scan_spinner: Spinner,
     scan_status: Label,
     scan_indicator: GtkBox,
-    // Shared state
-    state: Rc<RefCell<WindowState>>,
-    watch_tx: async_channel::Sender<()>,
+    content: Stack,
+    toggle_grid_controls: Rc<dyn Fn(ViewMode)>,
+    watch_tx: Sender<()>,
+    tx: Sender<Msg>,
+    // Track-change display bookkeeping — plain fields, not `Cell`, since
+    // `apply` takes `&mut self` and nothing else ever touches `Context`.
+    last_shown: Option<TrackId>,
+    last_saved_secs: Option<u64>,
 }
 
-impl MainWindow {
+impl Context {
+    /// Builds every widget, wiring each GTK signal to send a `Msg` (or, for
+    /// the handful of concerns that never touch `WindowState`, a direct
+    /// closure). Returns the `Context` plus the raw folder-watcher receiver,
+    /// which `build` bridges into the `Msg` stream separately.
     fn new(
         app: &Application,
         db: Rc<Db>,
         db_path: PathBuf,
         player: PlayerHandle,
         initial: &InitialSettings,
-    ) -> (Self, Controls, async_channel::Receiver<()>) {
+        tx: Sender<Msg>,
+    ) -> (Self, async_channel::Receiver<()>) {
         install_styles();
 
         let header = HeaderBar::new();
@@ -200,8 +186,10 @@ impl MainWindow {
         let scan_btn = Button::from_icon_name("view-refresh-symbolic");
         scan_btn.set_tooltip_text(Some("Scan library"));
         header.pack_start(&scan_btn);
+        wire_scan_button(&scan_btn, &tx);
 
         let (sort_controls, sort_field, sort_dir) = build_sort_controls();
+        wire_sort_controls(&sort_field, &sort_dir, initial.sort, &tx);
         let size_scale = build_size_scale();
         let (list_toggle, grid_toggle) = build_view_toggles();
         header.pack_start(&sort_controls);
@@ -231,11 +219,17 @@ impl MainWindow {
         status_label.set_margin_bottom(4);
 
         let filter_sidebar = Sidebar::new();
+        wire_sidebar(&filter_sidebar, &tx);
         let queue_view = QueueView::new();
+        wire_queue_view(&queue_view, &tx);
         let sidebar = build_sidebar_box(&filter_sidebar, &queue_view, &folder_list, &status_label);
 
         let library_view = LibraryView::new();
+        wire_library_view(&library_view, &tx);
+
         let album_grid = AlbumGrid::new();
+        wire_cover_size(&size_scale, &album_grid, initial.cover_size, &tx);
+        wire_album_grid(&album_grid, &db, &tx);
 
         let content = Stack::new();
         content.set_hexpand(true);
@@ -255,7 +249,17 @@ impl MainWindow {
         paned.set_position(220);
         paned.set_vexpand(true);
 
+        wire_view_toggles(
+            &list_toggle,
+            &grid_toggle,
+            &content,
+            Rc::clone(&toggle_grid_controls),
+            initial.view_mode,
+            &tx,
+        );
+
         let player_bar = PlayerBar::new(player.clone(), initial.volume);
+        wire_volume(&player_bar, &tx);
 
         let root = GtkBox::new(Orientation::Vertical, 0);
         root.append(&paned);
@@ -272,9 +276,12 @@ impl MainWindow {
             .build();
         window.set_titlebar(Some(&header));
 
+        wire_window_geometry(&window, &db);
+        wire_add_folder_button(&add_btn, &window, &tx);
+
         let (watch_tx, watch_rx) = async_channel::unbounded::<()>();
 
-        let mw = Self {
+        let ctx = Self {
             db,
             db_path,
             player,
@@ -283,105 +290,168 @@ impl MainWindow {
             filter_sidebar,
             queue_view,
             player_bar,
-            window: window.clone(),
+            window,
             folder_list,
             status_label,
             scan_spinner,
             scan_status,
             scan_indicator,
-            state: Rc::new(RefCell::new(WindowState {
-                filter: LibraryFilter::All,
-                sort: initial.sort,
-                queue: Vec::new(),
-                watcher: None,
-            })),
-            watch_tx,
-        };
-
-        let controls = Controls {
-            size_scale,
-            sort_field,
-            sort_dir,
-            list_toggle,
-            grid_toggle,
             content,
             toggle_grid_controls,
-            scan_btn,
-            add_btn,
+            watch_tx,
+            tx,
+            last_shown: None,
+            last_saved_secs: None,
         };
 
-        (mw, controls, watch_rx)
+        (ctx, watch_rx)
     }
 
     fn settings(&self) -> Settings<'_> {
         Settings::new(&self.db)
     }
 
-    /// Replaces the queue with `tracks` at `start`: mirrors it to the sidebar,
-    /// shows the starting track, persists it, and plays it.
-    fn enqueue(&self, tracks: Vec<Track>, start: usize) {
+    /// The impure half of handling `msg`: DB queries, player commands, widget
+    /// updates, using `state` (already reduced) and `watcher` (infrastructure
+    /// state, not part of `WindowState` — see `library::window_state`).
+    fn apply(&mut self, state: &WindowState, msg: &Msg, watcher: &mut Option<FolderWatcher>) {
+        match msg {
+            Msg::FilterSelected(filter) => {
+                match self.db.tracks_for(filter) {
+                    Ok(tracks) => self.library_view.set_tracks(tracks),
+                    Err(e) => tracing::error!("Filter query failed: {e}"),
+                }
+                self.refresh_album_grid_with(&state.filter, state.sort);
+            }
+            Msg::SortFieldChanged(_) | Msg::SortDirectionChanged(_) => {
+                self.settings().set_album_sort(state.sort);
+                self.refresh_album_grid_with(&state.filter, state.sort);
+            }
+            Msg::ViewModeChanged(mode) => {
+                self.content.set_visible_child_name(mode.child_name());
+                self.settings().set_view_mode(*mode);
+                (self.toggle_grid_controls)(*mode);
+            }
+            Msg::CoverSizeChanged(size) => {
+                self.album_grid.set_cover_size(*size);
+                self.settings().set_cover_size(*size);
+            }
+            Msg::VolumeChanged(percent) => {
+                self.settings().set_volume(*percent);
+            }
+            Msg::Enqueue(tracks, start) => {
+                self.do_enqueue(tracks.clone(), *start);
+            }
+            Msg::QueueTrackSelected(index) => {
+                self.do_enqueue(state.queue.clone(), *index);
+            }
+            Msg::AppendToQueue(tracks) => {
+                self.player.send(PlayerCommand::Enqueue(tracks.clone()));
+            }
+            Msg::PlayerQueueChanged(tracks) => {
+                self.apply_queue_changed(tracks);
+            }
+            Msg::PlayerStateChanged(playback_state) => {
+                self.apply_player_state(state, playback_state);
+            }
+            Msg::ScanRequested | Msg::RescanRequested => {
+                self.start_scan();
+            }
+            Msg::ScanEvent(event) => {
+                self.apply_scan_event(state, event);
+            }
+            Msg::FolderAdded(folder) => {
+                if let Err(e) = self.db.add_folder(folder) {
+                    tracing::error!("Failed to add folder: {e}");
+                    return;
+                }
+                self.refresh_folder_list();
+                self.rewatch(watcher);
+                self.start_scan();
+            }
+            Msg::FolderRemoved(folder) => {
+                if let Err(e) = self.db.remove_folder(folder) {
+                    tracing::error!("Failed to remove folder: {e}");
+                    return;
+                }
+                self.refresh_folder_list();
+                self.rewatch(watcher);
+                self.refresh_views(state);
+                self.prune_queue(state);
+            }
+        }
+    }
+
+    /// Sends `tracks` to the player positioned at `start`. `queue_view` itself
+    /// isn't updated here — the player is the sole owner of the queue, so the
+    /// `PlayerQueueChanged` echo that follows is what renders it.
+    fn do_enqueue(&self, tracks: Vec<Track>, start: usize) {
         if tracks.is_empty() {
             return;
         }
         let start = start.min(tracks.len() - 1);
         let current_id = tracks[start].id;
-        self.state.borrow_mut().queue = tracks.clone();
-        self.queue_view.set_tracks(tracks.clone());
-        self.queue_view.set_current(Some(current_id));
         self.player_bar.set_track(&tracks[start]);
-        let s = self.settings();
-        s.set_queue(&tracks.iter().map(|t| t.id).collect::<Vec<_>>());
-        s.set_queue_current(current_id);
+        self.settings().set_queue_current(current_id);
         self.player.send(PlayerCommand::PlayQueue { tracks, start });
     }
 
-    /// Appends `tracks` to the end of the play queue without disturbing
-    /// what's already playing. Starts playback from the first appended track
-    /// if the queue was empty.
-    fn append_to_queue(&self, tracks: Vec<Track>) {
-        if tracks.is_empty() {
-            return;
+    /// Renders the player's authoritative queue snapshot and persists it.
+    fn apply_queue_changed(&self, tracks: &[Track]) {
+        self.queue_view.set_tracks(tracks.to_vec());
+        self.settings()
+            .set_queue(&tracks.iter().map(|t| t.id).collect::<Vec<_>>());
+        // `set_tracks` rebuilds every row, dropping the highlight — restore it
+        // if the currently playing track is still in the new list.
+        let current = self
+            .settings()
+            .queue_current_id()
+            .map(TrackId::new)
+            .filter(|id| tracks.iter().any(|t| t.id == *id));
+        self.queue_view.set_current(current);
+    }
+
+    /// Updates the player bar, queue highlight, and status label for a new
+    /// playback state, and throttles position persistence to once per second.
+    fn apply_player_state(&mut self, state: &WindowState, playback_state: &PlaybackState) {
+        let track_id = playback_state.current_track();
+        if track_id != self.last_shown {
+            self.last_shown = track_id;
+            match track_id {
+                Some(id) => {
+                    let track = state.queue.iter().find(|t| t.id == id).cloned();
+                    if let Some(track) = track {
+                        self.player_bar.set_track(&track);
+                    }
+                    self.queue_view.set_current(Some(id));
+                    self.settings().set_queue_current(id);
+                }
+                None => self.queue_view.set_current(None),
+            }
         }
-        let mut state = self.state.borrow_mut();
-        let was_empty = state.queue.is_empty();
-        state.queue.extend(tracks.clone());
-        let updated = state.queue.clone();
-        drop(state);
-
-        self.queue_view.set_tracks(updated.clone());
-        let s = self.settings();
-        s.set_queue(&updated.iter().map(|t| t.id).collect::<Vec<_>>());
-
-        if was_empty {
-            let first = &tracks[0];
-            self.player_bar.set_track(first);
-            s.set_queue_current(first.id);
-            self.queue_view.set_current(Some(first.id));
-        } else {
-            // `set_tracks` rebuilds every row, dropping the highlight — restore it.
-            let current = s
-                .queue_current_id()
-                .map(TrackId::new)
-                .filter(|id| updated.iter().any(|t| t.id == *id));
-            self.queue_view.set_current(current);
+        if let PlaybackState::Failed { error, .. } = playback_state {
+            self.status_label
+                .set_text(&format!("Playback error: {error}"));
         }
-
-        self.player.send(PlayerCommand::Enqueue(tracks));
+        self.player_bar.update_state(playback_state);
+        if let Some(position) = playback_state.position()
+            && self.last_saved_secs != Some(position.as_secs())
+        {
+            self.last_saved_secs = Some(position.as_secs());
+            let millis = position.as_duration().as_millis() as u64;
+            self.settings().set_queue_position_millis(millis);
+        }
     }
 
     /// Reloads the tracks/sidebar/grid after the library changes, keeping the
     /// active filter applied.
-    fn refresh_views(&self) {
-        let (filter, sort) = {
-            let state = self.state.borrow();
-            (state.filter.clone(), state.sort)
-        };
-        match self.db.tracks_for(&filter) {
+    fn refresh_views(&self, state: &WindowState) {
+        match self.db.tracks_for(&state.filter) {
             Ok(tracks) => self.library_view.set_tracks(tracks),
             Err(e) => tracing::error!("Reload after library change failed: {e}"),
         }
         self.refresh_sidebar();
-        self.refresh_album_grid_with(&filter, sort);
+        self.refresh_album_grid_with(&state.filter, state.sort);
     }
 
     fn refresh_sidebar(&self) {
@@ -404,28 +474,23 @@ impl MainWindow {
     }
 
     /// Re-arms the folder watcher for the current folder set.
-    fn rewatch(&self) {
-        self.state.borrow_mut().watcher = None;
+    fn rewatch(&self, watcher: &mut Option<FolderWatcher>) {
+        *watcher = None;
         let folders = self.db.list_folders().unwrap_or_default();
         if folders.is_empty() {
             return;
         }
         match watch_folders(&folders, self.watch_tx.clone()) {
-            Ok(watcher) => self.state.borrow_mut().watcher = Some(watcher),
+            Ok(w) => *watcher = Some(w),
             Err(e) => tracing::error!("Failed to watch folders: {e}"),
         }
     }
 
-    fn on_folders_changed(&self) {
-        self.refresh_views();
-        self.rewatch();
-        self.prune_queue();
-    }
-
-    /// Drops queue entries whose track no longer exists in the db (e.g. its
-    /// watched folder was just removed), keeping the queue in sync with the
-    /// library.
-    fn prune_queue(&self) {
+    /// Asks the player to adopt whatever queue tracks still exist in the
+    /// library, if the library change dropped any. The player is the sole
+    /// owner of the queue, so this is a request, not a direct mutation — the
+    /// resulting `PlayerQueueChanged` is what actually updates the UI.
+    fn prune_queue(&self, state: &WindowState) {
         let surviving = match self.db.list_tracks() {
             Ok(tracks) => tracks.into_iter().map(|t| t.id).collect::<HashSet<_>>(),
             Err(e) => {
@@ -433,31 +498,19 @@ impl MainWindow {
                 return;
             }
         };
-        let mut state = self.state.borrow_mut();
-        let before = state.queue.len();
-        state.queue.retain(|track| surviving.contains(&track.id));
-        if state.queue.len() == before {
-            return;
+        let remaining: Vec<Track> = state
+            .queue
+            .iter()
+            .filter(|t| surviving.contains(&t.id))
+            .cloned()
+            .collect();
+        if remaining.len() != state.queue.len() {
+            self.player.send(PlayerCommand::SetQueue(remaining));
         }
-        let remaining = state.queue.clone();
-        drop(state);
-
-        self.queue_view.set_tracks(remaining.clone());
-        self.settings()
-            .set_queue(&remaining.iter().map(|t| t.id).collect::<Vec<_>>());
-
-        // `set_tracks` rebuilds every row, dropping the highlight — restore it
-        // if the currently playing track survived the prune.
-        let current = self
-            .settings()
-            .queue_current_id()
-            .map(TrackId::new)
-            .filter(|id| remaining.iter().any(|t| t.id == *id));
-        self.queue_view.set_current(current);
     }
 
     /// Starts a background scan of every watched folder, showing a spinner
-    /// overlay and live progress, then refreshes the library on completion.
+    /// overlay, and forwards its events into the `Msg` stream as `ScanEvent`.
     fn start_scan(&self) {
         let folders = match self.db.list_folders() {
             Ok(f) => f,
@@ -473,45 +526,42 @@ impl MainWindow {
         self.scan_status.set_text("Scanning…");
         self.scan_indicator.set_visible(true);
         self.scan_spinner.start();
-        self.install_scan_receiver(spawn_scan(self.db_path.clone(), folders));
-    }
 
-    /// Attaches an async task that consumes scan events from `rx` until the
-    /// scan finishes or the channel closes, then refreshes the library views.
-    fn install_scan_receiver(&self, rx: async_channel::Receiver<ScanEvent>) {
-        let this = self.clone();
+        let rx = spawn_scan(self.db_path.clone(), folders);
+        let tx = self.tx.clone();
         glib::spawn_future_local(async move {
             while let Ok(event) = rx.recv().await {
-                match event {
-                    ScanEvent::Progress(n) => {
-                        let msg = format!("Scanning… {n} files");
-                        this.status_label.set_text(&msg);
-                        this.scan_status.set_text(&msg);
-                    }
-                    ScanEvent::Finished(Ok(n)) => {
-                        this.status_label.set_text(&format!("Indexed {n} tracks"));
-                        this.scan_spinner.stop();
-                        this.scan_indicator.set_visible(false);
-                        // A rescan may have changed an album's embedded art; the
-                        // texture cache is keyed only by ArtKey, so it must be
-                        // dropped before the grid repopulates.
-                        this.album_grid.invalidate_art_cache();
-                        // refresh_views (not a hardcoded LibraryFilter::All) keeps
-                        // the track list honouring whatever filter is active —
-                        // otherwise a scan finishing while a genre filter is
-                        // selected would silently reset the list to everything.
-                        this.refresh_views();
-                        break;
-                    }
-                    ScanEvent::Finished(Err(e)) => {
-                        this.status_label.set_text(&format!("Scan error: {e}"));
-                        this.scan_spinner.stop();
-                        this.scan_indicator.set_visible(false);
-                        break;
-                    }
+                let finished = matches!(event, ScanEvent::Finished(_));
+                if tx.send(Msg::ScanEvent(event)).await.is_err() || finished {
+                    break;
                 }
             }
         });
+    }
+
+    fn apply_scan_event(&self, state: &WindowState, event: &ScanEvent) {
+        match event {
+            ScanEvent::Progress(n) => {
+                let msg = format!("Scanning… {n} files");
+                self.status_label.set_text(&msg);
+                self.scan_status.set_text(&msg);
+            }
+            ScanEvent::Finished(Ok(n)) => {
+                self.status_label.set_text(&format!("Indexed {n} tracks"));
+                self.scan_spinner.stop();
+                self.scan_indicator.set_visible(false);
+                // A rescan may have changed an album's embedded art; the
+                // texture cache is keyed only by ArtKey, so it must be
+                // dropped before the grid repopulates.
+                self.album_grid.invalidate_art_cache();
+                self.refresh_views(state);
+            }
+            ScanEvent::Finished(Err(e)) => {
+                self.status_label.set_text(&format!("Scan error: {e}"));
+                self.scan_spinner.stop();
+                self.scan_indicator.set_visible(false);
+            }
+        }
     }
 
     fn refresh_folder_list(&self) {
@@ -520,154 +570,15 @@ impl MainWindow {
             list.remove(&child);
         }
         for folder in self.db.list_folders().unwrap_or_default() {
-            list.append(&self.folder_row(folder));
+            list.append(&folder_row(folder, &self.tx));
         }
     }
 
-    fn folder_row(&self, folder: LibraryFolder) -> ListBoxRow {
-        let path_label = Label::new(folder.as_path().to_str());
-        path_label.set_hexpand(true);
-        path_label.set_xalign(0.0);
-        path_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-        path_label.set_margin_start(8);
-
-        let remove_btn = Button::from_icon_name("list-remove-symbolic");
-        remove_btn.add_css_class("flat");
-        remove_btn.set_margin_end(4);
-
-        let row_box = GtkBox::new(Orientation::Horizontal, 0);
-        row_box.set_margin_top(2);
-        row_box.set_margin_bottom(2);
-        row_box.append(&path_label);
-        row_box.append(&remove_btn);
-
-        let this = self.clone();
-        remove_btn.connect_clicked(move |_| {
-            if let Err(e) = this.db.remove_folder(&folder) {
-                tracing::error!("Failed to remove folder: {e}");
-                return;
-            }
-            this.refresh_folder_list();
-            this.on_folders_changed();
-        });
-
-        let row = ListBoxRow::new();
-        row.set_child(Some(&row_box));
-        row
-    }
-
-    /// Restores the cover-size slider and wires further changes to resize the
-    /// grid and persist the choice.
-    fn wire_cover_size(&self, size_scale: &Scale, initial_cover_size: i32) {
-        size_scale.set_value(initial_cover_size as f64);
-        self.album_grid.set_cover_size(initial_cover_size);
-
-        let this = self.clone();
-        size_scale.connect_value_changed(move |scale| {
-            let size = scale.value() as i32;
-            this.album_grid.set_cover_size(size);
-            this.settings().set_cover_size(size);
-        });
-    }
-
-    /// Restores the sort controls and wires further changes to re-sort the
-    /// grid and persist the choice.
-    fn wire_sort_controls(&self, sort_field: &DropDown, sort_dir: &ToggleButton) {
-        let sort = self.state.borrow().sort;
-        sort_field.set_selected(sort_field_index(sort.field));
-        sort_dir.set_active(matches!(sort.direction, SortDirection::Descending));
-        sort_dir.set_icon_name(direction_icon(sort.direction));
-
-        let this = self.clone();
-        sort_field.connect_selected_notify(move |dropdown| {
-            let sort = {
-                let mut state = this.state.borrow_mut();
-                state.sort.field = sort_field_at(dropdown.selected());
-                state.sort
-            };
-            this.settings().set_album_sort(sort);
-            let filter = this.state.borrow().filter.clone();
-            this.refresh_album_grid_with(&filter, sort);
-        });
-
-        let this = self.clone();
-        sort_dir.connect_toggled(move |btn| {
-            let direction = if btn.is_active() {
-                SortDirection::Descending
-            } else {
-                SortDirection::Ascending
-            };
-            btn.set_icon_name(direction_icon(direction));
-            let sort = {
-                let mut state = this.state.borrow_mut();
-                state.sort.direction = direction;
-                state.sort
-            };
-            this.settings().set_album_sort(sort);
-            let filter = this.state.borrow().filter.clone();
-            this.refresh_album_grid_with(&filter, sort);
-        });
-    }
-
-    /// Restores the active view and wires the list/grid toggle buttons.
-    fn wire_view_toggles(&self, controls: &Controls, initial_view_mode: ViewMode) {
-        match initial_view_mode {
-            ViewMode::List => controls.list_toggle.set_active(true),
-            ViewMode::Grid => controls.grid_toggle.set_active(true),
-        }
-        controls
-            .content
-            .set_visible_child_name(initial_view_mode.child_name());
-        (controls.toggle_grid_controls)(initial_view_mode);
-
-        let this = self.clone();
-        let content = controls.content.clone();
-        let toggle_grid_controls = Rc::clone(&controls.toggle_grid_controls);
-        controls.list_toggle.connect_toggled(move |btn| {
-            if btn.is_active() {
-                content.set_visible_child_name(ViewMode::List.child_name());
-                this.settings().set_view_mode(ViewMode::List);
-                toggle_grid_controls(ViewMode::List);
-            }
-        });
-
-        let this = self.clone();
-        let content = controls.content.clone();
-        let toggle_grid_controls = Rc::clone(&controls.toggle_grid_controls);
-        controls.grid_toggle.connect_toggled(move |btn| {
-            if btn.is_active() {
-                content.set_visible_child_name(ViewMode::Grid.child_name());
-                this.settings().set_view_mode(ViewMode::Grid);
-                toggle_grid_controls(ViewMode::Grid);
-            }
-        });
-    }
-
-    fn wire_volume_persistence(&self) {
-        let this = self.clone();
-        self.player_bar.connect_volume_changed(move |percent| {
-            this.settings().set_volume(percent);
-        });
-    }
-
-    /// First population of the folder list, sidebar, grid, and track list,
-    /// plus arming the folder watcher.
-    fn initial_populate(&self) {
-        self.refresh_folder_list();
-        self.refresh_sidebar();
-        let (filter, sort) = {
-            let state = self.state.borrow();
-            (state.filter.clone(), state.sort)
-        };
-        self.refresh_album_grid_with(&filter, sort);
-        self.rewatch();
-        if let Ok(tracks) = self.db.tracks_for(&LibraryFilter::All) {
-            self.library_view.set_tracks(tracks);
-        }
-    }
-
-    /// Restores the queue from the previous session, paused at its saved position.
-    fn restore_queue(&self, initial: &InitialSettings) {
+    /// Restores the queue from the previous session, paused at its saved
+    /// position. Runs once during bootstrap, before the dispatch loop takes
+    /// ownership of `state` — so it writes `state.queue` directly rather than
+    /// through a `Msg`.
+    fn restore_queue(&self, initial: &InitialSettings, state: &mut WindowState) {
         if initial.queue_ids.is_empty() {
             return;
         }
@@ -694,207 +605,276 @@ impl MainWindow {
             start,
             position,
         });
-        self.state.borrow_mut().queue = restored;
+        state.queue = restored;
     }
+}
 
-    /// Sidebar selection filters both views.
-    fn wire_sidebar_filter(&self) {
-        let this = self.clone();
-        self.filter_sidebar.connect_filter_selected(move |filter| {
-            this.state.borrow_mut().filter = filter.clone();
-            match this.db.tracks_for(&filter) {
-                Ok(tracks) => this.library_view.set_tracks(tracks),
-                Err(e) => tracing::error!("Filter query failed: {e}"),
-            }
-            let sort = this.state.borrow().sort;
-            this.refresh_album_grid_with(&filter, sort);
-        });
+fn folder_row(folder: LibraryFolder, tx: &Sender<Msg>) -> ListBoxRow {
+    let path_label = Label::new(folder.as_path().to_str());
+    path_label.set_hexpand(true);
+    path_label.set_xalign(0.0);
+    path_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    path_label.set_margin_start(8);
+
+    let remove_btn = Button::from_icon_name("list-remove-symbolic");
+    remove_btn.add_css_class("flat");
+    remove_btn.set_margin_end(4);
+
+    let row_box = GtkBox::new(Orientation::Horizontal, 0);
+    row_box.set_margin_top(2);
+    row_box.set_margin_bottom(2);
+    row_box.append(&path_label);
+    row_box.append(&remove_btn);
+
+    let tx = tx.clone();
+    remove_btn.connect_clicked(move |_| {
+        let _ = tx.send_blocking(Msg::FolderRemoved(folder.clone()));
+    });
+
+    let row = ListBoxRow::new();
+    row.set_child(Some(&row_box));
+    row
+}
+
+/// Restores the sort controls and wires further changes to send `Msg`s.
+fn wire_sort_controls(
+    sort_field: &DropDown,
+    sort_dir: &ToggleButton,
+    initial: AlbumSort,
+    tx: &Sender<Msg>,
+) {
+    sort_field.set_selected(sort_field_index(initial.field));
+    sort_dir.set_active(matches!(initial.direction, SortDirection::Descending));
+    sort_dir.set_icon_name(direction_icon(initial.direction));
+
+    let tx_field = tx.clone();
+    sort_field.connect_selected_notify(move |dropdown| {
+        let _ = tx_field.send_blocking(Msg::SortFieldChanged(sort_field_at(dropdown.selected())));
+    });
+
+    let tx_dir = tx.clone();
+    sort_dir.connect_toggled(move |btn| {
+        let direction = if btn.is_active() {
+            SortDirection::Descending
+        } else {
+            SortDirection::Ascending
+        };
+        btn.set_icon_name(direction_icon(direction));
+        let _ = tx_dir.send_blocking(Msg::SortDirectionChanged(direction));
+    });
+}
+
+/// Restores the cover-size slider and wires further changes to send `Msg`s.
+fn wire_cover_size(
+    size_scale: &Scale,
+    album_grid: &AlbumGrid,
+    initial_cover_size: i32,
+    tx: &Sender<Msg>,
+) {
+    size_scale.set_value(initial_cover_size as f64);
+    album_grid.set_cover_size(initial_cover_size);
+
+    let tx = tx.clone();
+    size_scale.connect_value_changed(move |scale| {
+        let _ = tx.send_blocking(Msg::CoverSizeChanged(scale.value() as i32));
+    });
+}
+
+/// Restores the active view and wires the list/grid toggle buttons.
+fn wire_view_toggles(
+    list_toggle: &ToggleButton,
+    grid_toggle: &ToggleButton,
+    content: &Stack,
+    toggle_grid_controls: Rc<dyn Fn(ViewMode)>,
+    initial_view_mode: ViewMode,
+    tx: &Sender<Msg>,
+) {
+    match initial_view_mode {
+        ViewMode::List => list_toggle.set_active(true),
+        ViewMode::Grid => grid_toggle.set_active(true),
     }
+    content.set_visible_child_name(initial_view_mode.child_name());
+    toggle_grid_controls(initial_view_mode);
 
-    /// The album grid's track and cover-art providers, called lazily when a
-    /// drawer opens or a cover needs decoding.
-    fn wire_album_grid_providers(&self) {
-        let this = self.clone();
-        self.album_grid.set_track_provider(move |summary| {
-            this.db
-                .tracks_for(&LibraryFilter::ByAlbum(summary.album.clone()))
-                .unwrap_or_else(|e| {
-                    tracing::error!("Album query failed: {e}");
-                    Vec::new()
-                })
-        });
-
-        let this = self.clone();
-        self.album_grid.set_art_provider(move |key| {
-            this.db.art_for(key).unwrap_or_else(|e| {
-                tracing::error!("Art lookup failed: {e}");
-                None
-            })
-        });
-    }
-
-    /// Cover/drawer activation and right-click "Add to Queue" events.
-    fn wire_album_grid_callbacks(&self) {
-        let this = self.clone();
-        self.album_grid
-            .connect_album_activated(move |tracks| this.enqueue(tracks, 0));
-
-        let this = self.clone();
-        self.album_grid
-            .connect_track_activated(move |tracks, index| {
-                if let Some(track) = tracks.get(index) {
-                    this.enqueue(vec![track.clone()], 0);
-                }
-            });
-
-        let this = self.clone();
-        self.album_grid
-            .connect_album_enqueue(move |tracks| this.append_to_queue(tracks));
-
-        let this = self.clone();
-        self.album_grid
-            .connect_track_enqueue(move |track| this.append_to_queue(vec![track]));
-    }
-
-    fn wire_library_view_callbacks(&self) {
-        let this = self.clone();
-        self.library_view
-            .connect_track_activated(move |tracks, index| {
-                if let Some(track) = tracks.get(index) {
-                    this.enqueue(vec![track.clone()], 0);
-                }
-            });
-
-        let this = self.clone();
-        self.library_view
-            .connect_track_enqueue(move |track| this.append_to_queue(vec![track]));
-    }
-
-    fn wire_queue_callbacks(&self) {
-        let this = self.clone();
-        self.queue_view.connect_track_selected(move |index| {
-            let tracks = this.state.borrow().queue.clone();
-            this.enqueue(tracks, index);
-        });
-    }
-
-    fn wire_scan_button(&self, scan_btn: &Button) {
-        let this = self.clone();
-        scan_btn.connect_clicked(move |_| this.start_scan());
-    }
-
-    /// Add-folder button: pick a folder, persist, re-watch, scan.
-    fn wire_add_folder_button(&self, add_btn: &Button) {
-        let this = self.clone();
-        add_btn.connect_clicked(move |_| {
-            let this = this.clone();
-            glib::spawn_future_local(async move {
-                let dialog = FileDialog::new();
-                dialog.set_title("Add Music Folder");
-                let Ok(file) = dialog.select_folder_future(Some(&this.window)).await else {
-                    return;
-                };
-                let Some(path) = file.path() else { return };
-                let Ok(folder) = LibraryFolder::new(path) else {
-                    return;
-                };
-                if let Err(e) = this.db.add_folder(&folder) {
-                    tracing::error!("Failed to add folder: {e}");
-                    return;
-                }
-                this.refresh_folder_list();
-                this.rewatch();
-                this.start_scan();
-            });
-        });
-    }
-
-    /// Debounced auto-rescan: wait for an fs event then rescan after 700 ms of
-    /// silence. If more events arrive during the wait, the timer resets.
-    fn wire_watcher(&self, watch_rx: async_channel::Receiver<()>) {
-        let this = self.clone();
-        glib::spawn_future_local(async move {
-            while watch_rx.recv().await.is_ok() {
-                while watch_rx.try_recv().is_ok() {}
-                loop {
-                    glib::timeout_future(Duration::from_millis(700)).await;
-                    match watch_rx.try_recv() {
-                        Ok(()) => while watch_rx.try_recv().is_ok() {},
-                        Err(async_channel::TryRecvError::Empty) => break,
-                        Err(async_channel::TryRecvError::Closed) => return,
-                    }
-                }
-                this.start_scan();
-            }
-        });
-    }
-
-    /// Wakes only when the player thread emits a new state. Position ticks
-    /// arrive every 250 ms while playing; no wakeups when idle.
-    fn wire_player_state(&self, state_rx: async_channel::Receiver<PlaybackState>) {
-        let this = self.clone();
-        let mut last_shown: Option<TrackId> = None;
-        let mut last_saved_secs: Option<u64> = None;
-        glib::spawn_future_local(async move {
-            while let Ok(state) = state_rx.recv().await {
-                let track_id = state.current_track();
-                if track_id != last_shown {
-                    last_shown = track_id;
-                    this.show_track_change(track_id);
-                }
-                if let PlaybackState::Failed { ref error, .. } = state {
-                    this.status_label
-                        .set_text(&format!("Playback error: {error}"));
-                }
-                this.player_bar.update_state(&state);
-                if let Some(position) = state.position()
-                    && last_saved_secs != Some(position.as_secs())
-                {
-                    last_saved_secs = Some(position.as_secs());
-                    let millis = position.as_duration().as_millis() as u64;
-                    this.settings().set_queue_position_millis(millis);
-                }
-            }
-        });
-    }
-
-    /// Updates the player bar and queue highlight when the playing track
-    /// changes, and persists the new current-track id.
-    fn show_track_change(&self, track_id: Option<TrackId>) {
-        match track_id {
-            Some(id) => {
-                let track = self
-                    .state
-                    .borrow()
-                    .queue
-                    .iter()
-                    .find(|t| t.id == id)
-                    .cloned();
-                if let Some(track) = track {
-                    self.player_bar.set_track(&track);
-                }
-                self.queue_view.set_current(Some(id));
-                self.settings().set_queue_current(id);
-            }
-            None => self.queue_view.set_current(None),
+    let tx_list = tx.clone();
+    list_toggle.connect_toggled(move |btn| {
+        if btn.is_active() {
+            let _ = tx_list.send_blocking(Msg::ViewModeChanged(ViewMode::List));
         }
-    }
+    });
 
-    /// Persist window geometry so the next launch reopens at the same size.
-    /// `default_width`/`default_height` hold the pre-maximize size even while
-    /// maximized, but the guard below is a defensive no-op either way: don't
-    /// overwrite the restore size with whatever a maximized window reports.
-    fn wire_window_geometry_persistence(&self) {
-        let this = self.clone();
-        self.window.connect_close_request(move |window| {
-            let s = this.settings();
-            if !window.is_maximized() {
-                s.set_window_size(window.default_width(), window.default_height());
-            }
-            s.set_window_maximized(window.is_maximized());
-            glib::Propagation::Proceed
+    let tx_grid = tx.clone();
+    grid_toggle.connect_toggled(move |btn| {
+        if btn.is_active() {
+            let _ = tx_grid.send_blocking(Msg::ViewModeChanged(ViewMode::Grid));
+        }
+    });
+}
+
+fn wire_volume(player_bar: &PlayerBar, tx: &Sender<Msg>) {
+    let tx = tx.clone();
+    player_bar.connect_volume_changed(move |percent| {
+        let _ = tx.send_blocking(Msg::VolumeChanged(percent));
+    });
+}
+
+fn wire_sidebar(filter_sidebar: &Sidebar, tx: &Sender<Msg>) {
+    let tx = tx.clone();
+    filter_sidebar.connect_filter_selected(move |filter| {
+        let _ = tx.send_blocking(Msg::FilterSelected(filter));
+    });
+}
+
+fn wire_queue_view(queue_view: &QueueView, tx: &Sender<Msg>) {
+    let tx = tx.clone();
+    queue_view.connect_track_selected(move |index| {
+        let _ = tx.send_blocking(Msg::QueueTrackSelected(index));
+    });
+}
+
+fn wire_library_view(library_view: &LibraryView, tx: &Sender<Msg>) {
+    let tx_activated = tx.clone();
+    library_view.connect_track_activated(move |tracks, index| {
+        if let Some(track) = tracks.get(index) {
+            let _ = tx_activated.send_blocking(Msg::Enqueue(vec![track.clone()], 0));
+        }
+    });
+
+    let tx_enqueue = tx.clone();
+    library_view.connect_track_enqueue(move |track| {
+        let _ = tx_enqueue.send_blocking(Msg::AppendToQueue(vec![track]));
+    });
+}
+
+/// The album grid's track and cover-art providers (synchronous DB reads, not
+/// messages — the grid needs the answer inline to render a drawer or a cover)
+/// plus its activation/enqueue callbacks (which do go through `Msg`).
+fn wire_album_grid(album_grid: &AlbumGrid, db: &Rc<Db>, tx: &Sender<Msg>) {
+    let db_tracks = Rc::clone(db);
+    album_grid.set_track_provider(move |summary| {
+        db_tracks
+            .tracks_for(&LibraryFilter::ByAlbum(summary.album.clone()))
+            .unwrap_or_else(|e| {
+                tracing::error!("Album query failed: {e}");
+                Vec::new()
+            })
+    });
+
+    let db_art = Rc::clone(db);
+    album_grid.set_art_provider(move |key| {
+        db_art.art_for(key).unwrap_or_else(|e| {
+            tracing::error!("Art lookup failed: {e}");
+            None
+        })
+    });
+
+    let tx_activated = tx.clone();
+    album_grid.connect_album_activated(move |tracks| {
+        let _ = tx_activated.send_blocking(Msg::Enqueue(tracks, 0));
+    });
+
+    let tx_track_activated = tx.clone();
+    album_grid.connect_track_activated(move |tracks, index| {
+        if let Some(track) = tracks.get(index) {
+            let _ = tx_track_activated.send_blocking(Msg::Enqueue(vec![track.clone()], 0));
+        }
+    });
+
+    let tx_album_enqueue = tx.clone();
+    album_grid.connect_album_enqueue(move |tracks| {
+        let _ = tx_album_enqueue.send_blocking(Msg::AppendToQueue(tracks));
+    });
+
+    let tx_track_enqueue = tx.clone();
+    album_grid.connect_track_enqueue(move |track| {
+        let _ = tx_track_enqueue.send_blocking(Msg::AppendToQueue(vec![track]));
+    });
+}
+
+fn wire_scan_button(scan_btn: &Button, tx: &Sender<Msg>) {
+    let tx = tx.clone();
+    scan_btn.connect_clicked(move |_| {
+        let _ = tx.send_blocking(Msg::ScanRequested);
+    });
+}
+
+/// Add-folder button: pick a folder, then dispatch `Msg::FolderAdded`. The DB
+/// write itself happens in `Context::apply` — this only handles the async
+/// file-dialog interaction, which doesn't belong in a state transition.
+fn wire_add_folder_button(add_btn: &Button, window: &ApplicationWindow, tx: &Sender<Msg>) {
+    let window = window.clone();
+    let tx = tx.clone();
+    add_btn.connect_clicked(move |_| {
+        let window = window.clone();
+        let tx = tx.clone();
+        glib::spawn_future_local(async move {
+            let dialog = FileDialog::new();
+            dialog.set_title("Add Music Folder");
+            let Ok(file) = dialog.select_folder_future(Some(&window)).await else {
+                return;
+            };
+            let Some(path) = file.path() else { return };
+            let Ok(folder) = LibraryFolder::new(path) else {
+                return;
+            };
+            let _ = tx.send(Msg::FolderAdded(folder)).await;
         });
-    }
+    });
+}
+
+/// Persist window geometry so the next launch reopens at the same size.
+/// `default_width`/`default_height` hold the pre-maximize size even while
+/// maximized, but the guard below is a defensive no-op either way: don't
+/// overwrite the restore size with whatever a maximized window reports. Never
+/// touches `WindowState`, so it stays a direct closure rather than a `Msg`.
+fn wire_window_geometry(window: &ApplicationWindow, db: &Rc<Db>) {
+    let db = Rc::clone(db);
+    window.connect_close_request(move |window| {
+        let s = Settings::new(&db);
+        if !window.is_maximized() {
+            s.set_window_size(window.default_width(), window.default_height());
+        }
+        s.set_window_maximized(window.is_maximized());
+        glib::Propagation::Proceed
+    });
+}
+
+/// Debounced auto-rescan: wait for an fs event then rescan after 700 ms of
+/// silence. If more events arrive during the wait, the timer resets.
+fn wire_debounced_watcher(watch_rx: async_channel::Receiver<()>, tx: Sender<Msg>) {
+    glib::spawn_future_local(async move {
+        while watch_rx.recv().await.is_ok() {
+            while watch_rx.try_recv().is_ok() {}
+            loop {
+                glib::timeout_future(Duration::from_millis(700)).await;
+                match watch_rx.try_recv() {
+                    Ok(()) => while watch_rx.try_recv().is_ok() {},
+                    Err(async_channel::TryRecvError::Empty) => break,
+                    Err(async_channel::TryRecvError::Closed) => return,
+                }
+            }
+            if tx.send(Msg::RescanRequested).await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Forwards every value from `rx` into `tx`, transformed by `wrap`, until
+/// either side closes. Used to bridge the player's plain-value channels
+/// (`PlaybackState`, `Vec<Track>`) into the single `Msg` stream.
+fn spawn_forward<T: 'static>(
+    rx: async_channel::Receiver<T>,
+    tx: Sender<Msg>,
+    wrap: impl Fn(T) -> Msg + 'static,
+) {
+    glib::spawn_future_local(async move {
+        while let Ok(value) = rx.recv().await {
+            if tx.send(wrap(value)).await.is_err() {
+                break;
+            }
+        }
+    });
 }
 
 fn build_sort_controls() -> (GtkBox, DropDown, ToggleButton) {
@@ -988,30 +968,44 @@ pub fn build(
     db_path: PathBuf,
     player: PlayerHandle,
     state_rx: async_channel::Receiver<PlaybackState>,
+    queue_rx: async_channel::Receiver<Vec<Track>>,
 ) -> ApplicationWindow {
     let initial = InitialSettings::read(&db);
-    let (mw, controls, watch_rx) = MainWindow::new(app, db, db_path, player, &initial);
+    let (tx, rx) = async_channel::unbounded::<Msg>();
+    let (mut ctx, watch_rx) = Context::new(app, db, db_path, player, &initial, tx.clone());
+    let window = ctx.window.clone();
 
-    mw.wire_cover_size(&controls.size_scale, initial.cover_size);
-    mw.wire_sort_controls(&controls.sort_field, &controls.sort_dir);
-    mw.wire_view_toggles(&controls, initial.view_mode);
-    mw.wire_volume_persistence();
+    spawn_forward(state_rx, tx.clone(), Msg::PlayerStateChanged);
+    spawn_forward(queue_rx, tx.clone(), Msg::PlayerQueueChanged);
+    wire_debounced_watcher(watch_rx, tx);
 
-    mw.initial_populate();
-    mw.restore_queue(&initial);
+    let mut state = WindowState {
+        filter: LibraryFilter::All,
+        sort: initial.sort,
+        queue: Vec::new(),
+    };
+    let mut watcher: Option<FolderWatcher> = None;
 
-    mw.wire_sidebar_filter();
-    mw.wire_album_grid_providers();
-    mw.wire_album_grid_callbacks();
-    mw.wire_library_view_callbacks();
-    mw.wire_queue_callbacks();
-    mw.wire_scan_button(&controls.scan_btn);
-    mw.wire_add_folder_button(&controls.add_btn);
-    mw.wire_watcher(watch_rx);
-    mw.wire_player_state(state_rx);
-    mw.wire_window_geometry_persistence();
+    // First population, plus restoring the previous session's queue — direct
+    // calls, not dispatched `Msg`s, since this runs once before the dispatch
+    // loop below takes ownership of `state`.
+    ctx.refresh_folder_list();
+    ctx.refresh_sidebar();
+    ctx.refresh_album_grid_with(&state.filter, state.sort);
+    ctx.rewatch(&mut watcher);
+    if let Ok(tracks) = ctx.db.tracks_for(&LibraryFilter::All) {
+        ctx.library_view.set_tracks(tracks);
+    }
+    ctx.restore_queue(&initial, &mut state);
 
-    mw.window.clone()
+    glib::spawn_future_local(async move {
+        while let Ok(msg) = rx.recv().await {
+            state = reduce(state, &msg);
+            ctx.apply(&state, &msg, &mut watcher);
+        }
+    });
+
+    window
 }
 
 fn install_styles() {

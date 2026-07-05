@@ -8,6 +8,7 @@ fn run_ui() {
     use std::rc::Rc;
 
     use musicplayer_rs::library::db::Db;
+    use musicplayer_rs::library::track::Track;
     use musicplayer_rs::player::PlaybackState;
     use musicplayer_rs::player::PlayerHandle;
     use musicplayer_rs::player::rodio::RodioAudioBackend;
@@ -26,11 +27,18 @@ fn run_ui() {
     };
 
     let (state_tx, state_rx) = async_channel::unbounded::<PlaybackState>();
-    let player = PlayerHandle::launch(RodioAudioBackend::new, move |s| {
-        let _ = state_tx.try_send(s);
-    });
+    let (queue_tx, queue_rx) = async_channel::unbounded::<Vec<Track>>();
+    let player = PlayerHandle::launch(
+        RodioAudioBackend::new,
+        move |s| {
+            let _ = state_tx.try_send(s);
+        },
+        move |tracks| {
+            let _ = queue_tx.try_send(tracks);
+        },
+    );
 
-    ui::run(db, db_path, player, state_rx);
+    ui::run(db, db_path, player, state_rx, queue_rx);
 }
 
 #[cfg(feature = "ui")]
