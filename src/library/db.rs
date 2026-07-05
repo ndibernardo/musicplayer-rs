@@ -8,6 +8,8 @@ use rusqlite::OptionalExtension;
 
 use crate::library::album::AlbumSort;
 use crate::library::album::AlbumSummary;
+use crate::library::album::ArtKey;
+use crate::library::album::CoverArt;
 use crate::library::filter::LibraryFilter;
 use crate::library::track::AlbumArtData;
 use crate::library::track::AlbumTitle;
@@ -166,15 +168,26 @@ type AlbumRow = (
 );
 
 /// Builds an `AlbumSummary` from a grouped row. All fields are infallible;
-/// NULLs map to the domain "unknown" defaults.
+/// NULLs map to the domain "unknown" defaults. `has_art` (a plain SQL `EXISTS`)
+/// is converted to `CoverArt` here — the bool never travels further than this
+/// function.
 fn build_album_summary(row: AlbumRow) -> AlbumSummary {
     let (album, artist, genre, year, has_art) = row;
+    let album = AlbumTitle::new(or_empty(album));
+    let artist = Artist::new(or_empty(artist));
+    let art = if has_art {
+        ArtKey::new(album.clone(), artist.clone())
+            .map(CoverArt::Available)
+            .unwrap_or(CoverArt::Absent)
+    } else {
+        CoverArt::Absent
+    };
     AlbumSummary {
-        album: AlbumTitle::new(or_empty(album)),
-        artist: Artist::new(or_empty(artist)),
+        album,
+        artist,
         genre: Genre::new(or_empty(genre)),
         year: Year::new(or_zero(year) as u16),
-        has_art,
+        art,
     }
 }
 
@@ -364,38 +377,26 @@ impl Db {
     /// Upserts cover art for `(album, album_artist)`. Uses the effective album artist
     /// (already COALESCEd by the caller) so it matches the JOIN key in album summaries.
     /// Does nothing when `album` is empty — art without an album cannot be keyed.
-    pub(crate) fn upsert_art(
-        conn: &Connection,
-        album: &AlbumTitle,
-        album_artist: &Artist,
-        data: &[u8],
-    ) -> Result<(), DbError> {
-        if album.as_str().is_empty() {
-            return Ok(());
-        }
+    pub(crate) fn upsert_art(conn: &Connection, key: &ArtKey, data: &[u8]) -> Result<(), DbError> {
         let mut stmt = conn.prepare_cached(
             "INSERT INTO album_art (album, album_artist, data) VALUES (?1, ?2, ?3)
              ON CONFLICT(album, album_artist) DO UPDATE SET data = excluded.data",
         )?;
         stmt.execute(rusqlite::params![
-            album.as_str(),
-            album_artist.as_str(),
+            key.album().as_str(),
+            key.album_artist().as_str(),
             data
         ])?;
         Ok(())
     }
 
-    /// Returns the cover art for the album identified by `(album, album_artist)`.
-    pub fn art_for_album(
-        &self,
-        album: &AlbumTitle,
-        album_artist: &Artist,
-    ) -> Result<Option<AlbumArtData>, DbError> {
+    /// Returns the cover art stored under `key`.
+    pub fn art_for(&self, key: &ArtKey) -> Result<Option<AlbumArtData>, DbError> {
         let data = self
             .conn
             .query_row(
                 "SELECT data FROM album_art WHERE album = ?1 AND album_artist = ?2",
-                rusqlite::params![album.as_str(), album_artist.as_str()],
+                rusqlite::params![key.album().as_str(), key.album_artist().as_str()],
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()?;
@@ -1654,23 +1655,29 @@ mod tests {
         assert_eq!(tracks[1].id, id1);
     }
 
+    fn geogaddi_key() -> ArtKey {
+        ArtKey::new(AlbumTitle::new("Geogaddi"), Artist::new("Boards of Canada")).unwrap()
+    }
+
+    fn mhtrtc_key() -> ArtKey {
+        ArtKey::new(
+            AlbumTitle::new("Music Has the Right to Children"),
+            Artist::new("Boards of Canada"),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn album_summaries_reports_has_art_when_album_art_table_has_a_row() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
             .unwrap();
         // Art is stored in album_art, not in the track row.
-        Db::upsert_art(
-            &db.conn,
-            &AlbumTitle::new("Music Has the Right to Children"),
-            &Artist::new("Boards of Canada"),
-            &[0xFF, 0xD8, 0xFF],
-        )
-        .unwrap();
+        Db::upsert_art(&db.conn, &mhtrtc_key(), &[0xFF, 0xD8, 0xFF]).unwrap();
 
         let summaries = db.album_summaries().unwrap();
         assert_eq!(summaries.len(), 1);
-        assert!(summaries[0].has_art);
+        assert_eq!(summaries[0].art, CoverArt::Available(mhtrtc_key()));
     }
 
     #[test]
@@ -1681,26 +1688,15 @@ mod tests {
 
         let summaries = db.album_summaries().unwrap();
         assert_eq!(summaries.len(), 1);
-        assert!(!summaries[0].has_art);
+        assert_eq!(summaries[0].art, CoverArt::Absent);
     }
 
     #[test]
-    fn art_for_album_returns_stored_bytes() {
+    fn art_for_returns_stored_bytes() {
         let db = Db::open_in_memory().unwrap();
-        Db::upsert_art(
-            &db.conn,
-            &AlbumTitle::new("Geogaddi"),
-            &Artist::new("Boards of Canada"),
-            &[0xFF, 0xD8, 0xFF],
-        )
-        .unwrap();
+        Db::upsert_art(&db.conn, &geogaddi_key(), &[0xFF, 0xD8, 0xFF]).unwrap();
 
-        let art = db
-            .art_for_album(
-                &AlbumTitle::new("Geogaddi"),
-                &Artist::new("Boards of Canada"),
-            )
-            .unwrap();
+        let art = db.art_for(&geogaddi_key()).unwrap();
         assert_eq!(
             art.as_ref().map(AlbumArtData::as_bytes),
             Some(&[0xFF, 0xD8, 0xFF][..])
@@ -1708,37 +1704,23 @@ mod tests {
     }
 
     #[test]
-    fn art_for_album_returns_none_for_unknown_album() {
+    fn art_for_returns_none_for_unknown_album() {
         let db = Db::open_in_memory().unwrap();
-        let art = db
-            .art_for_album(&AlbumTitle::new("Missing"), &Artist::new("Nobody"))
-            .unwrap();
+        let key = ArtKey::new(AlbumTitle::new("Missing"), Artist::new("Nobody")).unwrap();
+        let art = db.art_for(&key).unwrap();
         assert!(art.is_none());
     }
 
     #[test]
     fn prune_orphaned_art_removes_art_for_albums_with_no_surviving_tracks() {
         let db = Db::open_in_memory().unwrap();
-        Db::upsert_art(
-            &db.conn,
-            &AlbumTitle::new("Geogaddi"),
-            &Artist::new("Boards of Canada"),
-            &[0xFF, 0xD8, 0xFF],
-        )
-        .unwrap();
+        Db::upsert_art(&db.conn, &geogaddi_key(), &[0xFF, 0xD8, 0xFF]).unwrap();
         // No track references this album — the art row is orphaned from the start.
 
         let removed = db.prune_orphaned_art().unwrap();
 
         assert_eq!(removed, 1);
-        assert!(
-            db.art_for_album(
-                &AlbumTitle::new("Geogaddi"),
-                &Artist::new("Boards of Canada")
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(db.art_for(&geogaddi_key()).unwrap().is_none());
     }
 
     #[test]
@@ -1746,25 +1728,12 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
             .unwrap();
-        Db::upsert_art(
-            &db.conn,
-            &AlbumTitle::new("Music Has the Right to Children"),
-            &Artist::new("Boards of Canada"),
-            &[0xFF, 0xD8, 0xFF],
-        )
-        .unwrap();
+        Db::upsert_art(&db.conn, &mhtrtc_key(), &[0xFF, 0xD8, 0xFF]).unwrap();
 
         let removed = db.prune_orphaned_art().unwrap();
 
         assert_eq!(removed, 0);
-        assert!(
-            db.art_for_album(
-                &AlbumTitle::new("Music Has the Right to Children"),
-                &Artist::new("Boards of Canada")
-            )
-            .unwrap()
-            .is_some()
-        );
+        assert!(db.art_for(&mhtrtc_key()).unwrap().is_some());
     }
 
     #[test]
@@ -1774,24 +1743,11 @@ mod tests {
         db.add_folder(&music).unwrap();
         db.upsert_track(&full_track("/home/user/Music/boc/roygbiv.flac"))
             .unwrap();
-        Db::upsert_art(
-            &db.conn,
-            &AlbumTitle::new("Music Has the Right to Children"),
-            &Artist::new("Boards of Canada"),
-            &[0xFF, 0xD8, 0xFF],
-        )
-        .unwrap();
+        Db::upsert_art(&db.conn, &mhtrtc_key(), &[0xFF, 0xD8, 0xFF]).unwrap();
 
         db.remove_folder(&music).unwrap();
 
-        assert!(
-            db.art_for_album(
-                &AlbumTitle::new("Music Has the Right to Children"),
-                &Artist::new("Boards of Canada")
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(db.art_for(&mhtrtc_key()).unwrap().is_none());
     }
 
     #[test]
@@ -1799,24 +1755,6 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let columns = db.track_columns().unwrap();
         assert!(!columns.iter().any(|c| c == "art"));
-    }
-
-    #[test]
-    fn upsert_art_skips_empty_album() {
-        let db = Db::open_in_memory().unwrap();
-        // Empty album means no meaningful key — must not insert a row.
-        Db::upsert_art(
-            &db.conn,
-            &AlbumTitle::new(""),
-            &Artist::new("Boards of Canada"),
-            &[0xFF],
-        )
-        .unwrap();
-        let count: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM album_art", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
     }
 
     #[test]

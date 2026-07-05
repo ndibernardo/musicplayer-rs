@@ -7,6 +7,7 @@ use std::time::UNIX_EPOCH;
 use async_channel::Receiver;
 use async_channel::Sender;
 
+use crate::library::album::ArtKey;
 use crate::library::db::Db;
 use crate::library::db::DbError;
 use crate::library::db::LibraryFolder;
@@ -62,9 +63,9 @@ pub fn scan_folder_with_progress(
     let files = collect_audio_files(folder.as_path())?;
     let known = db.known_file_stats(folder)?;
     let mut seen: HashSet<PathBuf> = HashSet::with_capacity(files.len());
-    // Tracks (album, effective artist) pairs already written this scan, so a
-    // multi-track album writes its cover blob once instead of once per track.
-    let mut art_written: HashSet<(String, String)> = HashSet::new();
+    // Tracks album art keys already written this scan, so a multi-track album
+    // writes its cover blob once instead of once per track.
+    let mut art_written: HashSet<ArtKey> = HashSet::new();
     let mut count = 0u32;
 
     for chunk in files.chunks(BATCH_SIZE) {
@@ -82,21 +83,11 @@ pub fn scan_folder_with_progress(
             }
             if let Some((track, art_opt)) = read_track(&track_path) {
                 Db::upsert_one(&tx, &track, mtime, size)?;
-                if let Some(art) = art_opt {
-                    // Use the effective album artist (COALESCE logic) so the key
-                    // matches the JOIN condition in album_summaries_query.
-                    let effective_artist = if track.album_artist.is_unknown() {
-                        &track.artist
-                    } else {
-                        &track.album_artist
-                    };
-                    let key = (
-                        track.album.as_str().to_owned(),
-                        effective_artist.as_str().to_owned(),
-                    );
-                    if art_written.insert(key) {
-                        Db::upsert_art(&tx, &track.album, effective_artist, art.as_bytes())?;
-                    }
+                if let Some(art) = art_opt
+                    && let Some(key) = ArtKey::for_track(&track)
+                    && art_written.insert(key.clone())
+                {
+                    Db::upsert_art(&tx, &key, art.as_bytes())?;
                 }
                 count += 1;
                 on_progress(count);
