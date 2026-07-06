@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -11,6 +13,7 @@ use gtk4::Button;
 use gtk4::DropDown;
 use gtk4::Expander;
 use gtk4::FileDialog;
+use gtk4::GestureClick;
 use gtk4::HeaderBar;
 use gtk4::Image;
 use gtk4::Label;
@@ -19,24 +22,30 @@ use gtk4::ListBoxRow;
 use gtk4::Orientation;
 use gtk4::Overlay;
 use gtk4::Paned;
+use gtk4::PropagationPhase;
 use gtk4::Scale;
 use gtk4::ScrolledWindow;
 use gtk4::Spinner;
 use gtk4::Stack;
 use gtk4::ToggleButton;
+use gtk4::gdk::ModifierType;
 use gtk4::prelude::*;
 
 use crate::library::album::AlbumSort;
 use crate::library::album::AlbumSortField;
+use crate::library::album::ArtKey;
 use crate::library::album::SortDirection;
 use crate::library::db::Db;
 use crate::library::db::LibraryFolder;
 use crate::library::filter::LibraryFilter;
+use crate::library::metadata_edit;
+use crate::library::metadata_edit::TrackEdit;
 use crate::library::scan::ScanEvent;
 use crate::library::scan::spawn_scan;
 use crate::library::settings::COVER_SIZE_MAX;
 use crate::library::settings::COVER_SIZE_MIN;
 use crate::library::settings::Settings;
+use crate::library::track::AlbumArtData;
 use crate::library::track::Track;
 use crate::library::track::TrackId;
 use crate::library::view_mode::ViewMode;
@@ -50,6 +59,7 @@ use crate::player::PlayerCommand;
 use crate::player::PlayerHandle;
 use crate::player::SeekPosition;
 use crate::ui::album_grid::AlbumGrid;
+use crate::ui::edit_dialog;
 use crate::ui::library_view::LibraryView;
 use crate::ui::player_bar::PlayerBar;
 use crate::ui::queue_view::QueueView;
@@ -87,6 +97,9 @@ const APP_CSS: &str = "\
 .album-selected {
     background-color: rgba(0, 0, 0, 0.24);
 }
+.album-multi-selected {
+    background-color: rgba(60, 120, 220, 0.28);
+}
 .album-drawer {
     background-color: rgba(0, 0, 0, 0.24);
     border-radius: 10px;
@@ -97,6 +110,9 @@ const APP_CSS: &str = "\
 }
 .album-drawer row:hover {
     background-color: rgba(255, 255, 255, 0.12);
+}
+.album-drawer row:selected {
+    background-color: rgba(60, 120, 220, 0.35);
 }
 ";
 
@@ -179,6 +195,19 @@ impl Context {
         // with a mismatched background on focus changes; show only the close button.
         header.set_decoration_layout(Some(":close"));
 
+        // Built early (before `root` exists) so it can be passed to
+        // `wire_library_view`/`wire_album_grid`, which parent the edit
+        // dialogs on it; its child is attached later via `set_child`, once
+        // `root` is built, in place of the builder's usual `.child(&root)`.
+        let (initial_width, initial_height) = initial.window_size.unwrap_or((1200, 700));
+        let window = ApplicationWindow::builder()
+            .application(app)
+            .title("Music Player")
+            .default_width(initial_width)
+            .default_height(initial_height)
+            .maximized(initial.window_maximized)
+            .build();
+
         let add_btn = Button::from_icon_name("folder-new-symbolic");
         add_btn.set_tooltip_text(Some("Add music folder"));
         header.pack_start(&add_btn);
@@ -225,11 +254,12 @@ impl Context {
         let sidebar = build_sidebar_box(&filter_sidebar, &queue_view, &folder_list, &status_label);
 
         let library_view = LibraryView::new();
-        wire_library_view(&library_view, &tx);
+        wire_library_view(&library_view, &db, &db_path, &window, &status_label, &tx);
 
         let album_grid = AlbumGrid::new();
         wire_cover_size(&size_scale, &album_grid, initial.cover_size, &tx);
-        wire_album_grid(&album_grid, &db, &tx);
+        wire_album_grid(&album_grid, &db, &db_path, &window, &status_label, &tx);
+        wire_click_elsewhere_deselect(&window, &library_view, &album_grid);
 
         let content = Stack::new();
         content.set_hexpand(true);
@@ -264,16 +294,7 @@ impl Context {
         let root = GtkBox::new(Orientation::Vertical, 0);
         root.append(&paned);
         root.append(&player_bar.widget);
-
-        let (initial_width, initial_height) = initial.window_size.unwrap_or((1200, 700));
-        let window = ApplicationWindow::builder()
-            .application(app)
-            .title("Music Player")
-            .default_width(initial_width)
-            .default_height(initial_height)
-            .maximized(initial.window_maximized)
-            .child(&root)
-            .build();
+        window.set_child(Some(&root));
         window.set_titlebar(Some(&header));
 
         wire_window_geometry(&window, &db);
@@ -383,6 +404,34 @@ impl Context {
                 self.rewatch(watcher);
                 self.refresh_views(state);
                 self.prune_queue(state);
+            }
+            WindowMessage::EditSaved {
+                affects_art,
+                outcome,
+            } => {
+                // Only an edit that changed art bytes or ArtKey fields can
+                // stale the texture cache, and only for the album(s) actually
+                // touched — clearing the whole cache would blank every cover
+                // in the grid while they all re-decode, for a single edit.
+                if *affects_art {
+                    let keys: Vec<ArtKey> =
+                        outcome.saved.iter().filter_map(ArtKey::for_track).collect();
+                    self.album_grid.invalidate_art_for(&keys);
+                }
+                self.refresh_views(state);
+                self.sync_queue_after_edit(state, &outcome.saved);
+                match &outcome.failed {
+                    None => self
+                        .status_label
+                        .set_text(&format!("Updated {} track(s)", outcome.saved.len())),
+                    Some(e) => {
+                        tracing::error!("Edit failed: {e}");
+                        self.status_label.set_text(&format!(
+                            "Updated {} track(s), then failed: {e}",
+                            outcome.saved.len()
+                        ));
+                    }
+                }
             }
         }
     }
@@ -511,6 +560,35 @@ impl Context {
             .collect();
         if remaining.len() != state.queue.len() {
             self.player.send(PlayerCommand::SetQueue(remaining));
+        }
+    }
+
+    /// Replaces any of `state.queue`'s tracks that were just edited (matched
+    /// by id) with their saved version, and asks the player to adopt the
+    /// result if anything actually changed. Mirrors `prune_queue`'s shape:
+    /// the player is still the sole queue owner, so this is a request — the
+    /// real update arrives back through the `PlayerQueueChanged` echo.
+    /// `PlayerCommand::SetQueue` keeps playback running when the current
+    /// track's id survives the swap, so editing the playing track never
+    /// interrupts it.
+    fn sync_queue_after_edit(&self, state: &WindowState, saved: &[Track]) {
+        if saved.is_empty() {
+            return;
+        }
+        let by_id: HashMap<TrackId, &Track> = saved.iter().map(|t| (t.id, t)).collect();
+        let updated: Vec<Track> = state
+            .queue
+            .iter()
+            .map(|t| {
+                by_id
+                    .get(&t.id)
+                    .copied()
+                    .cloned()
+                    .unwrap_or_else(|| t.clone())
+            })
+            .collect();
+        if updated != state.queue {
+            self.player.send(PlayerCommand::SetQueue(updated));
         }
     }
 
@@ -739,7 +817,45 @@ fn wire_queue_view(queue_view: &QueueView, tx: &Sender<WindowMessage>) {
     });
 }
 
-fn wire_library_view(library_view: &LibraryView, tx: &Sender<WindowMessage>) {
+/// Clears both views' multi-selections on a plain left-click anywhere in the
+/// window, so a selection doesn't linger indefinitely once the user has moved
+/// on to something else. Attached in the capture phase (runs before any
+/// widget's own click handling) so it observes every press without consuming
+/// it — a click that lands on a row/cover still reaches that widget's own
+/// handler afterward and can re-establish a selection there. Restricted to
+/// the primary button (a right-click must see the selection exactly as it
+/// was, to decide single- vs batch-action) and skipped entirely when
+/// ctrl/shift is held (those are what build a multi-selection in the first
+/// place).
+fn wire_click_elsewhere_deselect(
+    window: &ApplicationWindow,
+    library_view: &LibraryView,
+    album_grid: &AlbumGrid,
+) {
+    let gesture = GestureClick::new();
+    gesture.set_propagation_phase(PropagationPhase::Capture);
+    gesture.set_button(gtk4::gdk::BUTTON_PRIMARY);
+    let library_view = library_view.clone();
+    let album_grid = album_grid.clone();
+    gesture.connect_pressed(move |gesture, _, _, _| {
+        let mods = gesture.current_event_state();
+        if mods.contains(ModifierType::CONTROL_MASK) || mods.contains(ModifierType::SHIFT_MASK) {
+            return;
+        }
+        library_view.clear_selection();
+        album_grid.clear_selection();
+    });
+    window.add_controller(gesture);
+}
+
+fn wire_library_view(
+    library_view: &LibraryView,
+    db: &Rc<Db>,
+    db_path: &Path,
+    window: &ApplicationWindow,
+    status_label: &Label,
+    tx: &Sender<WindowMessage>,
+) {
     let tx_activated = tx.clone();
     library_view.connect_track_activated(move |tracks, index| {
         if let Some(track) = tracks.get(index) {
@@ -751,12 +867,78 @@ fn wire_library_view(library_view: &LibraryView, tx: &Sender<WindowMessage>) {
     library_view.connect_track_enqueue(move |track| {
         let _ = tx_enqueue.send_blocking(WindowMessage::AppendToQueue(vec![track]));
     });
+
+    let tx_tracks_enqueue = tx.clone();
+    library_view.connect_tracks_enqueue(move |tracks| {
+        let _ = tx_tracks_enqueue.send_blocking(WindowMessage::AppendToQueue(tracks));
+    });
+
+    let db_edit = Rc::clone(db);
+    let db_path_edit = db_path.to_path_buf();
+    let window_edit = window.clone();
+    let status_edit = status_label.clone();
+    let tx_edit = tx.clone();
+    library_view.connect_track_edit_requested(move |track| {
+        let art = db_edit.art_for_track(track.id).unwrap_or_else(|e| {
+            tracing::error!("Art lookup failed: {e}");
+            None
+        });
+        let db_path = db_path_edit.clone();
+        let status = status_edit.clone();
+        let tx = tx_edit.clone();
+        let track_for_save = track.clone();
+        edit_dialog::open_track_editor(&window_edit, track, art, move |edit, art| {
+            status.set_text("Saving…");
+            spawn_edit_save(
+                db_path.clone(),
+                vec![track_for_save.clone()],
+                edit,
+                art,
+                tx.clone(),
+            );
+        });
+    });
+
+    let db_tracks_edit = Rc::clone(db);
+    let db_path_tracks_edit = db_path.to_path_buf();
+    let window_tracks_edit = window.clone();
+    let status_tracks_edit = status_label.clone();
+    let tx_tracks_edit = tx.clone();
+    library_view.connect_tracks_edit_requested(move |tracks| {
+        let art = tracks.first().and_then(|t| {
+            db_tracks_edit.art_for_track(t.id).unwrap_or_else(|e| {
+                tracing::error!("Art lookup failed: {e}");
+                None
+            })
+        });
+        let db_path = db_path_tracks_edit.clone();
+        let status = status_tracks_edit.clone();
+        let tx = tx_tracks_edit.clone();
+        let tracks_for_save = tracks.clone();
+        edit_dialog::open_album_editor(&window_tracks_edit, tracks, art, move |edit, art| {
+            status.set_text("Saving…");
+            spawn_edit_save(
+                db_path.clone(),
+                tracks_for_save.clone(),
+                edit,
+                art,
+                tx.clone(),
+            );
+        });
+    });
 }
 
 /// The album grid's track and cover-art providers (synchronous DB reads, not
 /// messages — the grid needs the answer inline to render a drawer or a cover)
-/// plus its activation/enqueue callbacks (which do go through `WindowMessage`).
-fn wire_album_grid(album_grid: &AlbumGrid, db: &Rc<Db>, tx: &Sender<WindowMessage>) {
+/// plus its activation/enqueue/edit callbacks (which do go through `WindowMessage`).
+fn wire_album_grid(
+    album_grid: &AlbumGrid,
+    db: &Rc<Db>,
+    db_path: &Path,
+    window: &ApplicationWindow,
+    status_label: &Label,
+    tx: &Sender<WindowMessage>,
+) {
     let db_tracks = Rc::clone(db);
     album_grid.set_track_provider(move |summary| {
         db_tracks
@@ -796,6 +978,119 @@ fn wire_album_grid(album_grid: &AlbumGrid, db: &Rc<Db>, tx: &Sender<WindowMessag
     let tx_track_enqueue = tx.clone();
     album_grid.connect_track_enqueue(move |track| {
         let _ = tx_track_enqueue.send_blocking(WindowMessage::AppendToQueue(vec![track]));
+    });
+
+    let db_album_edit = Rc::clone(db);
+    let db_path_album_edit = db_path.to_path_buf();
+    let window_album_edit = window.clone();
+    let status_album_edit = status_label.clone();
+    let tx_album_edit = tx.clone();
+    album_grid.connect_album_edit_requested(move |tracks| {
+        let art = tracks.first().and_then(ArtKey::for_track).and_then(|key| {
+            db_album_edit.art_for(&key).unwrap_or_else(|e| {
+                tracing::error!("Art lookup failed: {e}");
+                None
+            })
+        });
+        let db_path = db_path_album_edit.clone();
+        let status = status_album_edit.clone();
+        let tx = tx_album_edit.clone();
+        let tracks_for_save = tracks.clone();
+        edit_dialog::open_album_editor(&window_album_edit, tracks, art, move |edit, art| {
+            status.set_text("Saving…");
+            spawn_edit_save(
+                db_path.clone(),
+                tracks_for_save.clone(),
+                edit,
+                art,
+                tx.clone(),
+            );
+        });
+    });
+
+    let db_track_edit = Rc::clone(db);
+    let db_path_track_edit = db_path.to_path_buf();
+    let window_track_edit = window.clone();
+    let status_track_edit = status_label.clone();
+    let tx_track_edit = tx.clone();
+    album_grid.connect_track_edit_requested(move |track| {
+        let art = db_track_edit.art_for_track(track.id).unwrap_or_else(|e| {
+            tracing::error!("Art lookup failed: {e}");
+            None
+        });
+        let db_path = db_path_track_edit.clone();
+        let status = status_track_edit.clone();
+        let tx = tx_track_edit.clone();
+        let track_for_save = track.clone();
+        edit_dialog::open_track_editor(&window_track_edit, track, art, move |edit, art| {
+            status.set_text("Saving…");
+            spawn_edit_save(
+                db_path.clone(),
+                vec![track_for_save.clone()],
+                edit,
+                art,
+                tx.clone(),
+            );
+        });
+    });
+
+    let tx_tracks_enqueue = tx.clone();
+    album_grid.connect_tracks_enqueue(move |tracks| {
+        let _ = tx_tracks_enqueue.send_blocking(WindowMessage::AppendToQueue(tracks));
+    });
+
+    let db_tracks_edit = Rc::clone(db);
+    let db_path_tracks_edit = db_path.to_path_buf();
+    let window_tracks_edit = window.clone();
+    let status_tracks_edit = status_label.clone();
+    let tx_tracks_edit = tx.clone();
+    album_grid.connect_tracks_edit_requested(move |tracks| {
+        let art = tracks.first().and_then(|t| {
+            db_tracks_edit.art_for_track(t.id).unwrap_or_else(|e| {
+                tracing::error!("Art lookup failed: {e}");
+                None
+            })
+        });
+        let db_path = db_path_tracks_edit.clone();
+        let status = status_tracks_edit.clone();
+        let tx = tx_tracks_edit.clone();
+        let tracks_for_save = tracks.clone();
+        edit_dialog::open_album_editor(&window_tracks_edit, tracks, art, move |edit, art| {
+            status.set_text("Saving…");
+            spawn_edit_save(
+                db_path.clone(),
+                tracks_for_save.clone(),
+                edit,
+                art,
+                tx.clone(),
+            );
+        });
+    });
+}
+
+/// Spawns the background file+DB save, computes whether the edit can change
+/// which cover an album shows (before the edit itself is dropped — see
+/// `WindowMessage::EditSaved`'s doc comment), and bridges the single result
+/// into the `WindowMessage` stream. Mirrors `start_scan`'s forwarding loop,
+/// but for one value instead of a stream.
+fn spawn_edit_save(
+    db_path: PathBuf,
+    tracks: Vec<Track>,
+    edit: TrackEdit,
+    art: Option<AlbumArtData>,
+    tx: Sender<WindowMessage>,
+) {
+    let affects_art = art.is_some() || edit.affects_art_grouping();
+    let rx = metadata_edit::spawn_save_edits(db_path, tracks, edit, art);
+    glib::spawn_future_local(async move {
+        if let Ok(outcome) = rx.recv().await {
+            let _ = tx
+                .send(WindowMessage::EditSaved {
+                    affects_art,
+                    outcome,
+                })
+                .await;
+        }
     });
 }
 

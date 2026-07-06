@@ -1,5 +1,6 @@
 use std::cell::OnceCell;
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -17,6 +18,7 @@ use gtk4::SelectionMode;
 use gtk4::Widget;
 use gtk4::gdk::MemoryFormat;
 use gtk4::gdk::MemoryTexture;
+use gtk4::gdk::ModifierType;
 use gtk4::gdk::Texture;
 use gtk4::gdk_pixbuf::Pixbuf;
 use gtk4::gio::Cancellable;
@@ -28,7 +30,8 @@ use crate::library::album::ArtKey;
 use crate::library::album::CoverArt;
 use crate::library::track::AlbumArtData;
 use crate::library::track::Track;
-use crate::ui::context_menu::show_add_to_queue_menu;
+use crate::ui::context_menu::ContextAction;
+use crate::ui::context_menu::show_context_menu;
 use crate::ui::format::format_duration;
 
 /// Column count before the first width-driven reflow. The grid is hand-built
@@ -67,9 +70,16 @@ type ArtProvider = Rc<dyn Fn(&ArtKey) -> Option<AlbumArtData>>;
 
 /// The inline track drawer: closed, or open beneath exactly one album. A half-
 /// open drawer (an index with no widget, or vice versa) is unrepresentable.
+/// `list` is the drawer's own track `ListBox`, kept alongside so
+/// `clear_selection` can drop any row selection in it without a widget-tree
+/// search.
 enum DrawerState {
     Closed,
-    Open { index: usize, widget: Widget },
+    Open {
+        index: usize,
+        widget: Widget,
+        list: ListBox,
+    },
 }
 
 /// One album's grid presence: its summary and the widgets rendering it.
@@ -87,6 +97,13 @@ struct GridState {
     // count changes.
     row_boxes: Vec<GtkBox>,
     drawer: DrawerState,
+    // Cover indices multi-selected via ctrl/shift-click, independent of
+    // `drawer` — any multi-select action closes an open drawer first, so the
+    // two never mark the same cover at once (see `close_drawer`).
+    multi_selected: BTreeSet<usize>,
+    // Last definite click point, for shift-range-select; reset only when
+    // `set_albums` invalidates every index.
+    selection_anchor: Option<usize>,
     columns: usize,
     cover_size: i32,
     // Decoded, downscaled textures keyed by ArtKey. A cache hit skips both the
@@ -119,6 +136,13 @@ struct AlbumGridInner {
     on_album_activated: OnceCell<AlbumCallback>,
     on_album_enqueue: OnceCell<AlbumCallback>,
     on_track_enqueue: OnceCell<SingleTrackCallback>,
+    on_album_edit: OnceCell<AlbumCallback>,
+    on_track_edit: OnceCell<SingleTrackCallback>,
+    // Batch actions for a multi-selected subset of one open drawer's tracks.
+    // `AlbumCallback` (`Rc<dyn Fn(Vec<Track>)>`) already has the right shape —
+    // no new type needed.
+    on_tracks_enqueue: OnceCell<AlbumCallback>,
+    on_tracks_edit: OnceCell<AlbumCallback>,
 }
 
 impl AlbumGrid {
@@ -142,6 +166,8 @@ impl AlbumGrid {
                 cells: Vec::new(),
                 row_boxes: Vec::new(),
                 drawer: DrawerState::Closed,
+                multi_selected: BTreeSet::new(),
+                selection_anchor: None,
                 columns: DEFAULT_COLUMNS,
                 cover_size: DEFAULT_COVER_SIZE,
                 texture_cache: HashMap::new(),
@@ -154,6 +180,10 @@ impl AlbumGrid {
             on_album_activated: OnceCell::new(),
             on_album_enqueue: OnceCell::new(),
             on_track_enqueue: OnceCell::new(),
+            on_album_edit: OnceCell::new(),
+            on_track_edit: OnceCell::new(),
+            on_tracks_enqueue: OnceCell::new(),
+            on_tracks_edit: OnceCell::new(),
         });
 
         let grid = Self {
@@ -208,6 +238,8 @@ impl AlbumGrid {
         {
             let mut state = self.inner.state.borrow_mut();
             state.drawer = DrawerState::Closed;
+            state.multi_selected.clear();
+            state.selection_anchor = None;
             state.cells = cells;
         }
         self.lay_out(columns);
@@ -245,14 +277,7 @@ impl AlbumGrid {
             return;
         }
 
-        let previously_open = {
-            let mut state = self.inner.state.borrow_mut();
-            std::mem::replace(&mut state.drawer, DrawerState::Closed)
-        };
-        if let DrawerState::Open { widget, .. } = previously_open {
-            self.inner.grid_box.remove(&widget);
-        }
-        self.highlight(None);
+        self.close_drawer();
 
         let cell_widgets: Vec<GtkBox> = {
             let state = self.inner.state.borrow();
@@ -292,6 +317,17 @@ impl AlbumGrid {
     /// keep showing a stale cover until restart.
     pub fn invalidate_art_cache(&self) {
         self.inner.state.borrow_mut().texture_cache.clear();
+    }
+
+    /// Clears only `keys`' decoded textures, leaving every other album's cover
+    /// cached. Call after an edit that may have changed one album's art —
+    /// unlike `invalidate_art_cache`, this doesn't blank every cover in the
+    /// grid while they all re-decode, just the one(s) that actually changed.
+    pub fn invalidate_art_for(&self, keys: &[ArtKey]) {
+        let mut state = self.inner.state.borrow_mut();
+        for key in keys {
+            state.texture_cache.remove(key);
+        }
     }
 
     /// Registers `image` to receive `key`'s texture once decoded, fetching the
@@ -340,6 +376,30 @@ impl AlbumGrid {
     /// is chosen from a drawer row's right-click menu.
     pub fn connect_track_enqueue<F: Fn(Track) + 'static>(&self, f: F) {
         let _ = self.inner.on_track_enqueue.set(Rc::new(f));
+    }
+
+    /// Registers the callback invoked with an album's tracks when "Edit
+    /// Album…" is chosen from a cover's right-click menu.
+    pub fn connect_album_edit_requested<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
+        let _ = self.inner.on_album_edit.set(Rc::new(f));
+    }
+
+    /// Registers the callback invoked with a single track when "Edit Track…"
+    /// is chosen from a drawer row's right-click menu.
+    pub fn connect_track_edit_requested<F: Fn(Track) + 'static>(&self, f: F) {
+        let _ = self.inner.on_track_edit.set(Rc::new(f));
+    }
+
+    /// Registers the callback invoked with every selected track when "Add N
+    /// to Queue" is chosen from a multi-selected drawer row's right-click menu.
+    pub fn connect_tracks_enqueue<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
+        let _ = self.inner.on_tracks_enqueue.set(Rc::new(f));
+    }
+
+    /// Registers the callback invoked with every selected track when "Edit N
+    /// Tracks…" is chosen from a multi-selected drawer row's right-click menu.
+    pub fn connect_tracks_edit_requested<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
+        let _ = self.inner.on_tracks_edit.set(Rc::new(f));
     }
 
     /// Resizes every cover in place to `size` px, then reflows since a different
@@ -410,40 +470,105 @@ impl AlbumGrid {
             cell.append(&year_label);
         }
 
-        // Clicking a cover opens its track drawer without playing; the album is
-        // played from the ▶ button in that drawer's header. Only the first press
-        // toggles, so a double-click doesn't flip the drawer shut again.
+        // Plain click opens the track drawer without playing (the album is
+        // played from the ▶ button in that drawer's header); ctrl/shift-click
+        // instead manage a multi-selection, closing any open drawer first.
+        // Only the first press acts, so a double-click doesn't flip a drawer
+        // shut again or re-toggle a selection.
         let gesture = GestureClick::new();
         let this = self.clone();
-        gesture.connect_pressed(move |_, n_press, _, _| {
-            if n_press == 1 {
+        gesture.connect_pressed(move |gesture, n_press, _, _| {
+            if n_press != 1 {
+                return;
+            }
+            let mods = gesture.current_event_state();
+            if mods.contains(ModifierType::SHIFT_MASK) {
+                this.shift_select(index);
+            } else if mods.contains(ModifierType::CONTROL_MASK) {
+                this.ctrl_toggle(index);
+            } else {
+                this.clear_multi_selection(index);
                 this.toggle_drawer(index);
             }
         });
         cell.add_controller(gesture);
 
-        // Right-click offers "Add to Queue" for the whole album, fetched the
-        // same way the drawer does, without opening or closing it.
+        // Right-click offers "Add to Queue"/"Edit Album…" for the whole
+        // album, fetched the same way the drawer does, without opening or
+        // closing it — or, if this cover is part of a wider multi-selection,
+        // the same two actions for every selected album's concatenated
+        // tracks (reusing the same callbacks; a multi-album batch is just a
+        // bigger `Vec<Track>`).
         let context_gesture = GestureClick::new();
         context_gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
         let this = self.clone();
         let context_summary = summary.clone();
         let cell_widget = cell.clone().upcast::<Widget>();
         context_gesture.connect_pressed(move |_, _, x, y| {
-            let tracks = this
-                .inner
-                .track_provider
-                .get()
-                .map_or_else(Vec::new, |provide| provide(&context_summary));
+            let (tracks, album_count) = {
+                let state = this.inner.state.borrow();
+                if state.multi_selected.contains(&index) && state.multi_selected.len() > 1 {
+                    let summaries: Vec<AlbumSummary> = state
+                        .multi_selected
+                        .iter()
+                        .filter_map(|&i| state.cells.get(i).map(|c| c.summary.clone()))
+                        .collect();
+                    let n = summaries.len();
+                    let tracks: Vec<Track> = summaries
+                        .iter()
+                        .flat_map(|s| {
+                            this.inner
+                                .track_provider
+                                .get()
+                                .map_or_else(Vec::new, |provide| provide(s))
+                        })
+                        .collect();
+                    (tracks, Some(n))
+                } else {
+                    let tracks = this
+                        .inner
+                        .track_provider
+                        .get()
+                        .map_or_else(Vec::new, |provide| provide(&context_summary));
+                    (tracks, None)
+                }
+            };
             if tracks.is_empty() {
                 return;
             }
             let on_enqueue = this.inner.on_album_enqueue.get().cloned();
-            show_add_to_queue_menu(&cell_widget, x, y, move || {
-                if let Some(callback) = &on_enqueue {
-                    callback(tracks.clone());
-                }
-            });
+            let enqueue_tracks = tracks.clone();
+            let on_edit = this.inner.on_album_edit.get().cloned();
+            let (enqueue_label, edit_label) = match album_count {
+                Some(n) => (
+                    format!("Add {n} Albums to Queue"),
+                    format!("Edit {n} Albums…"),
+                ),
+                None => ("Add to Queue".to_string(), "Edit Album…".to_string()),
+            };
+            show_context_menu(
+                &cell_widget,
+                x,
+                y,
+                vec![
+                    (
+                        enqueue_label,
+                        Box::new(move || {
+                            if let Some(callback) = &on_enqueue {
+                                callback(enqueue_tracks.clone());
+                            }
+                        }) as Box<dyn Fn()>,
+                    ),
+                    (
+                        edit_label,
+                        Box::new(move || {
+                            if let Some(callback) = &on_edit {
+                                callback(tracks.clone());
+                            }
+                        }) as Box<dyn Fn()>,
+                    ),
+                ],
+            );
         });
         cell.add_controller(context_gesture);
 
@@ -469,24 +594,111 @@ impl AlbumGrid {
         }
     }
 
-    /// Opens the drawer for `index` beneath its row, or closes it if already open.
-    fn toggle_drawer(&self, index: usize) {
+    /// Closes any open drawer, removing its widget and clearing its
+    /// highlight. Returns the index that was open, if any. Shared by
+    /// `toggle_drawer` and every multi-select mutation — the two states
+    /// never overlap, since selecting starts by closing whatever is open.
+    fn close_drawer(&self) -> Option<usize> {
         let previously_open = {
             let mut state = self.inner.state.borrow_mut();
             std::mem::replace(&mut state.drawer, DrawerState::Closed)
         };
-        let previously_open_index = match previously_open {
+        match previously_open {
             DrawerState::Closed => None,
-            DrawerState::Open {
-                index: open,
-                widget,
-            } => {
+            DrawerState::Open { index, widget, .. } => {
                 self.inner.grid_box.remove(&widget);
-                Some(open)
+                self.highlight(None);
+                Some(index)
+            }
+        }
+    }
+
+    /// Toggles `index` in the multi-selection, closing any open drawer first.
+    fn ctrl_toggle(&self, index: usize) {
+        self.close_drawer();
+        {
+            let mut state = self.inner.state.borrow_mut();
+            if !state.multi_selected.remove(&index) {
+                state.multi_selected.insert(index);
+            }
+            state.selection_anchor = Some(index);
+        }
+        self.apply_multi_highlight();
+    }
+
+    /// Replaces the multi-selection with the inclusive range between the last
+    /// anchor and `index` (or starts a fresh one-cover selection if there is
+    /// no anchor yet). The anchor itself never moves, so repeated shift-clicks
+    /// re-range from the same point — standard behavior.
+    fn shift_select(&self, index: usize) {
+        self.close_drawer();
+        {
+            let mut state = self.inner.state.borrow_mut();
+            let anchor = *state.selection_anchor.get_or_insert(index);
+            let (start, end) = if anchor <= index {
+                (anchor, index)
+            } else {
+                (index, anchor)
+            };
+            state.multi_selected = (start..=end).collect();
+        }
+        self.apply_multi_highlight();
+    }
+
+    /// Clears the multi-selection, making `index` the new anchor for a future
+    /// shift-click. A plain click always means "just let me look at this one
+    /// album," so it leaves no multi-selection behind.
+    fn clear_multi_selection(&self, index: usize) {
+        {
+            let mut state = self.inner.state.borrow_mut();
+            state.multi_selected.clear();
+            state.selection_anchor = Some(index);
+        }
+        self.apply_multi_highlight();
+    }
+
+    /// Marks every multi-selected cover with `album-multi-selected`,
+    /// independent of `highlight`'s `album-selected` (which marks "this
+    /// cover's drawer is open" — the two classes never apply to the same
+    /// cover, since any multi-select action closes the open drawer first).
+    fn apply_multi_highlight(&self) {
+        let (cell_widgets, selected) = {
+            let state = self.inner.state.borrow();
+            let widgets: Vec<GtkBox> = state.cells.iter().map(|c| c.cell.clone()).collect();
+            (widgets, state.multi_selected.clone())
+        };
+        for (i, cell) in cell_widgets.iter().enumerate() {
+            if selected.contains(&i) {
+                cell.add_css_class("album-multi-selected");
+            } else {
+                cell.remove_css_class("album-multi-selected");
+            }
+        }
+    }
+
+    /// Clears any multi-selected covers and any selected rows in an open
+    /// drawer's tracklist, with no new anchor (unlike `clear_multi_selection`,
+    /// there is no clicked album here — the user clicked somewhere else in
+    /// the application entirely). Leaves the drawer itself open.
+    pub fn clear_selection(&self) {
+        let drawer_list = {
+            let mut state = self.inner.state.borrow_mut();
+            state.multi_selected.clear();
+            match &state.drawer {
+                DrawerState::Open { list, .. } => Some(list.clone()),
+                DrawerState::Closed => None,
             }
         };
+        self.apply_multi_highlight();
+        if let Some(list) = drawer_list {
+            list.unselect_all();
+        }
+    }
+
+    /// Opens the drawer for `index` beneath its row, or closes it if already open.
+    fn toggle_drawer(&self, index: usize) {
+        let previously_open_index = self.close_drawer();
         if previously_open_index == Some(index) {
-            self.highlight(None);
             return;
         }
 
@@ -512,14 +724,16 @@ impl AlbumGrid {
         let cached = art_key
             .as_ref()
             .and_then(|key| self.inner.state.borrow().texture_cache.get(key).cloned());
-        let (drawer_widget, cover) = build_drawer(
-            &summary,
-            tracks,
-            self.inner.on_track_activated.get().cloned(),
-            self.inner.on_album_activated.get().cloned(),
-            self.inner.on_track_enqueue.get().cloned(),
-            cached.as_ref(),
-        );
+        let callbacks = DrawerCallbacks {
+            on_track: self.inner.on_track_activated.get().cloned(),
+            on_album: self.inner.on_album_activated.get().cloned(),
+            on_track_enqueue: self.inner.on_track_enqueue.get().cloned(),
+            on_track_edit: self.inner.on_track_edit.get().cloned(),
+            on_tracks_enqueue: self.inner.on_tracks_enqueue.get().cloned(),
+            on_tracks_edit: self.inner.on_tracks_edit.get().cloned(),
+        };
+        let (drawer_widget, cover, drawer_list) =
+            build_drawer(&summary, tracks, callbacks, cached.as_ref());
         if cached.is_none()
             && let Some(key) = art_key
         {
@@ -541,6 +755,7 @@ impl AlbumGrid {
         self.inner.state.borrow_mut().drawer = DrawerState::Open {
             index,
             widget: drawer_widget.clone().upcast(),
+            list: drawer_list,
         };
         self.highlight(Some(index));
     }
@@ -549,18 +764,36 @@ impl AlbumGrid {
 /// Combined cover-art size shown at the left of a drawer (px).
 const DRAWER_COVER_SIZE: i32 = 160;
 
-/// Builds the inline drawer: the album cover on the left, and on the right a
-/// header (play button plus album heading) above the full track list. Returns
-/// the drawer widget together with its cover `Image`, so the caller can
-/// register the image for an async texture update on a cache miss.
-fn build_drawer(
-    summary: &AlbumSummary,
-    tracks: Vec<Track>,
+/// The callbacks a drawer's rows and header can dispatch to, grouped since
+/// `build_drawer` would otherwise take too many parameters.
+struct DrawerCallbacks {
     on_track: Option<TrackCallback>,
     on_album: Option<AlbumCallback>,
     on_track_enqueue: Option<SingleTrackCallback>,
+    on_track_edit: Option<SingleTrackCallback>,
+    on_tracks_enqueue: Option<AlbumCallback>,
+    on_tracks_edit: Option<AlbumCallback>,
+}
+
+/// Builds the inline drawer: the album cover on the left, and on the right a
+/// header (play button plus album heading) above the full track list. Returns
+/// the drawer widget, its cover `Image` (so the caller can register it for an
+/// async texture update on a cache miss), and its track `ListBox` (so the
+/// caller can drop any row selection in it from `clear_selection`).
+fn build_drawer(
+    summary: &AlbumSummary,
+    tracks: Vec<Track>,
+    callbacks: DrawerCallbacks,
     cached: Option<&Texture>,
-) -> (GtkBox, Image) {
+) -> (GtkBox, Image, ListBox) {
+    let DrawerCallbacks {
+        on_track,
+        on_album,
+        on_track_enqueue,
+        on_track_edit,
+        on_tracks_enqueue,
+        on_tracks_edit,
+    } = callbacks;
     let container = GtkBox::new(Orientation::Vertical, 0);
     container.set_hexpand(true);
 
@@ -586,19 +819,78 @@ fn build_drawer(
     container.append(&header);
 
     let list = ListBox::new();
-    list.set_selection_mode(SelectionMode::Single);
+    // Multiple gives ctrl/shift-click natively; `row-activated` (double-click
+    // to play, wired below) is unaffected — selection and activation are
+    // independent concepts in `ListBox`.
+    list.set_selection_mode(SelectionMode::Multiple);
     list.set_activate_on_single_click(false);
-    for track in &tracks {
+    for (row_index, track) in tracks.iter().enumerate() {
         let row = track_row(track);
-        if let Some(callback) = on_track_enqueue.clone() {
+        let wants_menu = on_track_enqueue.is_some()
+            || on_track_edit.is_some()
+            || on_tracks_enqueue.is_some()
+            || on_tracks_edit.is_some();
+        if wants_menu {
             let context_gesture = GestureClick::new();
             context_gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
             let track = track.clone();
+            let row_for_select = row.clone();
             let row_widget = row.clone().upcast::<Widget>();
+            let list_for_gesture = list.clone();
+            let all_tracks = tracks.clone();
+            let on_enqueue = on_track_enqueue.clone();
+            let on_edit = on_track_edit.clone();
+            let on_batch_enqueue = on_tracks_enqueue.clone();
+            let on_batch_edit = on_tracks_edit.clone();
             context_gesture.connect_pressed(move |_, _, x, y| {
-                let track = track.clone();
-                let callback = callback.clone();
-                show_add_to_queue_menu(&row_widget, x, y, move || callback(track.clone()));
+                let selected: Vec<usize> = list_for_gesture
+                    .selected_rows()
+                    .iter()
+                    .map(|r| r.index() as usize)
+                    .collect();
+                let mut actions: Vec<ContextAction> = Vec::new();
+                if selected.contains(&row_index) && selected.len() > 1 {
+                    let mut ordered = selected.clone();
+                    ordered.sort_unstable();
+                    let batch: Vec<Track> = ordered
+                        .iter()
+                        .filter_map(|&i| all_tracks.get(i).cloned())
+                        .collect();
+                    let n = batch.len();
+                    if let Some(callback) = on_batch_enqueue.clone() {
+                        let batch = batch.clone();
+                        actions.push((
+                            format!("Add {n} to Queue"),
+                            Box::new(move || callback(batch.clone())),
+                        ));
+                    }
+                    if let Some(callback) = on_batch_edit.clone() {
+                        let batch = batch.clone();
+                        actions.push((
+                            format!("Edit {n} Tracks…"),
+                            Box::new(move || callback(batch.clone())),
+                        ));
+                    }
+                } else {
+                    // Right-clicking outside the current selection collapses
+                    // it to just this row — standard file-manager convention.
+                    list_for_gesture.select_row(Some(&row_for_select));
+                    if let Some(callback) = on_enqueue.clone() {
+                        let track = track.clone();
+                        actions.push((
+                            "Add to Queue".to_string(),
+                            Box::new(move || callback(track.clone())),
+                        ));
+                    }
+                    if let Some(callback) = on_edit.clone() {
+                        let track = track.clone();
+                        actions.push((
+                            "Edit Track…".to_string(),
+                            Box::new(move || callback(track.clone())),
+                        ));
+                    }
+                }
+                show_context_menu(&row_widget, x, y, actions);
             });
             row.add_controller(context_gesture);
         }
@@ -635,7 +927,7 @@ fn build_drawer(
     outer.set_margin_bottom(2);
     outer.append(&cover);
     outer.append(&container);
-    (outer, cover)
+    (outer, cover, list)
 }
 
 fn drawer_heading(summary: &AlbumSummary) -> String {
@@ -724,7 +1016,7 @@ fn spawn_art_decoder(max_size: i32) -> ArtDecoder {
 
 /// Decodes `data` and downscales it to fit within `max_size` x `max_size`,
 /// preserving aspect ratio. `None` when the bytes aren't a decodable image.
-fn decode_and_scale(data: &AlbumArtData, max_size: i32) -> Option<Texture> {
+pub(crate) fn decode_and_scale(data: &AlbumArtData, max_size: i32) -> Option<Texture> {
     let bytes = glib::Bytes::from(data.as_bytes());
     let stream = MemoryInputStream::from_bytes(&bytes);
     let pixbuf =
