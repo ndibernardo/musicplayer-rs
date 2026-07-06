@@ -92,14 +92,33 @@ const SCHEMA: &str = "
         value TEXT NOT NULL
     );
 
-    CREATE TABLE IF NOT EXISTS album_art (
-        art_id       INTEGER PRIMARY KEY,
-        album        TEXT NOT NULL,
-        album_artist TEXT NOT NULL,
-        data         BLOB NOT NULL,
-        UNIQUE(album, album_artist)
+    CREATE TABLE IF NOT EXISTS art_blobs (
+        hash INTEGER PRIMARY KEY,
+        data BLOB NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS track_art (
+        track_id INTEGER PRIMARY KEY,
+        hash     INTEGER NOT NULL
     );
 ";
+
+/// 64-bit FNV-1a content hash of `data`, stored as SQLite's signed `INTEGER`
+/// via a bit-preserving cast. Must stay FNV-1a forever: unlike
+/// `DefaultHasher`, whose keys aren't guaranteed stable across Rust releases,
+/// this keeps existing `art_blobs` rows resolving after a toolchain upgrade.
+/// A collision only mis-displays a cover, never loses data, and is negligible
+/// over the few thousand distinct images a real library has.
+pub(crate) fn art_hash(data: &[u8]) -> i64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in data {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash as i64
+}
 
 fn or_empty(v: Option<String>) -> String {
     v.unwrap_or_default()
@@ -374,28 +393,53 @@ impl Db {
         Ok(TrackId::new(id))
     }
 
-    /// Upserts cover art for `(album, album_artist)`. Uses the effective album artist
-    /// (already COALESCEd by the caller) so it matches the JOIN key in album summaries.
-    /// Does nothing when `album` is empty — art without an album cannot be keyed.
-    pub(crate) fn upsert_art(conn: &Connection, key: &ArtKey, data: &[u8]) -> Result<(), DbError> {
-        let mut stmt = conn.prepare_cached(
-            "INSERT INTO album_art (album, album_artist, data) VALUES (?1, ?2, ?3)
-             ON CONFLICT(album, album_artist) DO UPDATE SET data = excluded.data",
-        )?;
-        stmt.execute(rusqlite::params![
-            key.album().as_str(),
-            key.album_artist().as_str(),
-            data
-        ])?;
+    /// Upserts cover art for one track, keyed on its content hash. Storing by
+    /// hash means an album whose tracks share one embedded image (the common
+    /// case) still costs one blob no matter how many tracks point at it.
+    pub(crate) fn upsert_art_for_track(
+        conn: &Connection,
+        track_id: TrackId,
+        data: &[u8],
+    ) -> Result<(), DbError> {
+        let hash = art_hash(data);
+        conn.prepare_cached("INSERT OR IGNORE INTO art_blobs (hash, data) VALUES (?1, ?2)")?
+            .execute(rusqlite::params![hash, data])?;
+        conn.prepare_cached(
+            "INSERT INTO track_art (track_id, hash) VALUES (?1, ?2)
+             ON CONFLICT(track_id) DO UPDATE SET hash = excluded.hash",
+        )?
+        .execute(rusqlite::params![track_id.value(), hash])?;
         Ok(())
     }
 
-    /// Returns the cover art stored under `key`.
+    /// Returns the cover art embedded in `id`'s own file, if any.
+    pub fn art_for_track(&self, id: TrackId) -> Result<Option<AlbumArtData>, DbError> {
+        let data = self
+            .conn
+            .query_row(
+                "SELECT ab.data FROM track_art ta
+                 JOIN art_blobs ab ON ab.hash = ta.hash
+                 WHERE ta.track_id = ?1",
+                [id.value()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?;
+        Ok(data.map(AlbumArtData::new))
+    }
+
+    /// Returns the cover art of the lowest `(disc_number, track_number)` track
+    /// in `key`'s album/artist group that has one — the album grid's
+    /// representative cover.
     pub fn art_for(&self, key: &ArtKey) -> Result<Option<AlbumArtData>, DbError> {
         let data = self
             .conn
             .query_row(
-                "SELECT data FROM album_art WHERE album = ?1 AND album_artist = ?2",
+                "SELECT ab.data FROM tracks t
+                 JOIN track_art ta ON ta.track_id = t.track_id
+                 JOIN art_blobs ab ON ab.hash = ta.hash
+                 WHERE t.album = ?1 AND COALESCE(t.album_artist, t.artist) = ?2
+                 ORDER BY t.disc_number, t.track_number
+                 LIMIT 1",
                 rusqlite::params![key.album().as_str(), key.album_artist().as_str()],
                 |row| row.get::<_, Vec<u8>>(0),
             )
@@ -484,12 +528,12 @@ impl Db {
     /// after a folder or stale-track removal). Returns the count of removed rows.
     pub fn prune_orphaned_art(&self) -> Result<u64, DbError> {
         let n = self.conn.execute(
-            "DELETE FROM album_art
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM tracks
-                 WHERE tracks.album = album_art.album
-                   AND COALESCE(tracks.album_artist, tracks.artist) = album_art.album_artist
-             )",
+            "DELETE FROM track_art WHERE track_id NOT IN (SELECT track_id FROM tracks)",
+            [],
+        )?;
+        // A blob is only orphaned once no track_art row points at its hash any more.
+        self.conn.execute(
+            "DELETE FROM art_blobs WHERE hash NOT IN (SELECT hash FROM track_art)",
             [],
         )?;
         Ok(n as u64)
@@ -723,16 +767,18 @@ impl Db {
         let order_by = sort.order_by_clause();
         // Correlated EXISTS avoids a JOIN that would make `album` and
         // `album_artist` ambiguous in GROUP BY and ORDER BY (both tables share
-        // those column names). The album_art table is small (one row per album)
-        // so the correlated lookup is cheap, and EXISTS never reads the BLOB.
+        // those column names). `SELECT 1` never reads the art_blobs BLOB —
+        // the join only needs to know a matching track_art row exists.
         let sql = format!(
             "SELECT album,
                     COALESCE(album_artist, artist) AS album_artist,
                     MAX(genre) AS album_genre,
                     MAX(year)  AS album_year,
-                    EXISTS(SELECT 1 FROM album_art aa
-                           WHERE aa.album        = tracks.album
-                             AND aa.album_artist = COALESCE(tracks.album_artist, tracks.artist))
+                    EXISTS(SELECT 1 FROM tracks t2
+                           JOIN track_art ta ON ta.track_id = t2.track_id
+                           WHERE t2.album = tracks.album
+                             AND COALESCE(t2.album_artist, t2.artist)
+                                 = COALESCE(tracks.album_artist, tracks.artist))
              FROM tracks
              {where_clause}
              GROUP BY album, album_artist
@@ -1667,13 +1713,22 @@ mod tests {
         .unwrap()
     }
 
+    fn art_blob_count(db: &Db) -> u32 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM art_blobs", [], |row| {
+                row.get::<_, u32>(0)
+            })
+            .unwrap()
+    }
+
     #[test]
-    fn album_summaries_reports_has_art_when_album_art_table_has_a_row() {
+    fn album_summaries_reports_has_art_when_a_track_has_art() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+        let id = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
             .unwrap();
-        // Art is stored in album_art, not in the track row.
-        Db::upsert_art(&db.conn, &mhtrtc_key(), &[0xFF, 0xD8, 0xFF]).unwrap();
+        // Art is stored per track, not in the track row itself.
+        Db::upsert_art_for_track(&db.conn, id, &[0xFF, 0xD8, 0xFF]).unwrap();
 
         let summaries = db.album_summaries().unwrap();
         assert_eq!(summaries.len(), 1);
@@ -1681,7 +1736,7 @@ mod tests {
     }
 
     #[test]
-    fn album_summaries_reports_no_art_when_album_art_table_is_empty() {
+    fn album_summaries_reports_no_art_when_no_track_has_art() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
             .unwrap();
@@ -1694,7 +1749,15 @@ mod tests {
     #[test]
     fn art_for_returns_stored_bytes() {
         let db = Db::open_in_memory().unwrap();
-        Db::upsert_art(&db.conn, &geogaddi_key(), &[0xFF, 0xD8, 0xFF]).unwrap();
+        let id = db
+            .upsert_track(&track_tagged(
+                "/music/boc/geogaddi.flac",
+                "Boards of Canada",
+                "Geogaddi",
+                "Electronic",
+            ))
+            .unwrap();
+        Db::upsert_art_for_track(&db.conn, id, &[0xFF, 0xD8, 0xFF]).unwrap();
 
         let art = db.art_for(&geogaddi_key()).unwrap();
         assert_eq!(
@@ -1712,23 +1775,89 @@ mod tests {
     }
 
     #[test]
+    fn art_for_track_returns_the_bytes_embedded_in_that_track() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        Db::upsert_art_for_track(&db.conn, id, &[0xFF, 0xD8, 0xFF]).unwrap();
+
+        let art = db.art_for_track(id).unwrap();
+        assert_eq!(
+            art.as_ref().map(AlbumArtData::as_bytes),
+            Some(&[0xFF, 0xD8, 0xFF][..])
+        );
+    }
+
+    #[test]
+    fn art_for_track_returns_none_when_the_track_has_no_art() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        assert!(db.art_for_track(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn art_for_returns_the_lowest_disc_and_track_number_cover() {
+        let db = Db::open_in_memory().unwrap();
+        let mut second = full_track("/music/boc/aquarius.flac");
+        second.track_number = TrackNumber::new(2);
+        let mut first = full_track("/music/boc/roygbiv.flac");
+        first.track_number = TrackNumber::new(1);
+        let second_id = db.upsert_track(&second).unwrap();
+        let first_id = db.upsert_track(&first).unwrap();
+        Db::upsert_art_for_track(&db.conn, second_id, &[0xAA]).unwrap();
+        Db::upsert_art_for_track(&db.conn, first_id, &[0xBB]).unwrap();
+
+        let art = db.art_for(&mhtrtc_key()).unwrap().unwrap();
+        assert_eq!(art.as_bytes(), &[0xBB][..]);
+    }
+
+    #[test]
+    fn upsert_art_for_track_stores_identical_bytes_once() {
+        let db = Db::open_in_memory().unwrap();
+        let id1 = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        let id2 = db
+            .upsert_track(&full_track("/music/boc/aquarius.flac"))
+            .unwrap();
+        Db::upsert_art_for_track(&db.conn, id1, &[0xFF, 0xD8, 0xFF]).unwrap();
+        Db::upsert_art_for_track(&db.conn, id2, &[0xFF, 0xD8, 0xFF]).unwrap();
+
+        assert_eq!(
+            art_blob_count(&db),
+            1,
+            "identical bytes across two tracks must share one blob row"
+        );
+    }
+
+    #[test]
+    fn art_hash_is_stable() {
+        assert_eq!(art_hash(b""), -3750763034362895579);
+        assert_eq!(art_hash(b"geogaddi"), 6552777080131098409);
+    }
+
+    #[test]
     fn prune_orphaned_art_removes_art_for_albums_with_no_surviving_tracks() {
         let db = Db::open_in_memory().unwrap();
-        Db::upsert_art(&db.conn, &geogaddi_key(), &[0xFF, 0xD8, 0xFF]).unwrap();
-        // No track references this album — the art row is orphaned from the start.
+        // A track_art row with no matching tracks row — orphaned from the start.
+        Db::upsert_art_for_track(&db.conn, TrackId::new(1), &[0xFF, 0xD8, 0xFF]).unwrap();
 
         let removed = db.prune_orphaned_art().unwrap();
 
         assert_eq!(removed, 1);
-        assert!(db.art_for(&geogaddi_key()).unwrap().is_none());
+        assert_eq!(art_blob_count(&db), 0);
     }
 
     #[test]
     fn prune_orphaned_art_keeps_art_for_albums_with_surviving_tracks() {
         let db = Db::open_in_memory().unwrap();
-        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+        let id = db
+            .upsert_track(&full_track("/music/boc/roygbiv.flac"))
             .unwrap();
-        Db::upsert_art(&db.conn, &mhtrtc_key(), &[0xFF, 0xD8, 0xFF]).unwrap();
+        Db::upsert_art_for_track(&db.conn, id, &[0xFF, 0xD8, 0xFF]).unwrap();
 
         let removed = db.prune_orphaned_art().unwrap();
 
@@ -1737,17 +1866,29 @@ mod tests {
     }
 
     #[test]
+    fn prune_orphaned_art_removes_unreferenced_blobs() {
+        let db = Db::open_in_memory().unwrap();
+        Db::upsert_art_for_track(&db.conn, TrackId::new(1), &[0xFF, 0xD8, 0xFF]).unwrap();
+
+        db.prune_orphaned_art().unwrap();
+
+        assert_eq!(art_blob_count(&db), 0);
+    }
+
+    #[test]
     fn remove_folder_prunes_orphaned_art() {
         let db = Db::open_in_memory().unwrap();
         let music = LibraryFolder::new("/home/user/Music").unwrap();
         db.add_folder(&music).unwrap();
-        db.upsert_track(&full_track("/home/user/Music/boc/roygbiv.flac"))
+        let id = db
+            .upsert_track(&full_track("/home/user/Music/boc/roygbiv.flac"))
             .unwrap();
-        Db::upsert_art(&db.conn, &mhtrtc_key(), &[0xFF, 0xD8, 0xFF]).unwrap();
+        Db::upsert_art_for_track(&db.conn, id, &[0xFF, 0xD8, 0xFF]).unwrap();
 
         db.remove_folder(&music).unwrap();
 
         assert!(db.art_for(&mhtrtc_key()).unwrap().is_none());
+        assert_eq!(art_blob_count(&db), 0);
     }
 
     #[test]

@@ -7,7 +7,6 @@ use std::time::UNIX_EPOCH;
 use async_channel::Receiver;
 use async_channel::Sender;
 
-use crate::library::album::ArtKey;
 use crate::library::db::Db;
 use crate::library::db::DbError;
 use crate::library::db::LibraryFolder;
@@ -63,9 +62,6 @@ pub fn scan_folder_with_progress(
     let files = collect_audio_files(folder.as_path())?;
     let known = db.known_file_stats(folder)?;
     let mut seen: HashSet<PathBuf> = HashSet::with_capacity(files.len());
-    // Tracks album art keys already written this scan, so a multi-track album
-    // writes its cover blob once instead of once per track.
-    let mut art_written: HashSet<ArtKey> = HashSet::new();
     let mut count = 0u32;
 
     for chunk in files.chunks(BATCH_SIZE) {
@@ -82,12 +78,9 @@ pub fn scan_folder_with_progress(
                 continue; // file unchanged — skip re-indexing
             }
             if let Some((track, art_opt)) = read_track(&track_path) {
-                Db::upsert_one(&tx, &track, mtime, size)?;
-                if let Some(art) = art_opt
-                    && let Some(key) = ArtKey::for_track(&track)
-                    && art_written.insert(key.clone())
-                {
-                    Db::upsert_art(&tx, &key, art.as_bytes())?;
+                let track_id = Db::upsert_one(&tx, &track, mtime, size)?;
+                if let Some(art) = art_opt {
+                    Db::upsert_art_for_track(&tx, track_id, art.as_bytes())?;
                 }
                 count += 1;
                 on_progress(count);
@@ -405,16 +398,24 @@ mod tests {
         );
     }
 
-    fn art_row_count(db: &Db) -> u32 {
+    fn track_art_row_count(db: &Db) -> u32 {
         db.conn
-            .query_row("SELECT COUNT(*) FROM album_art", [], |row| {
+            .query_row("SELECT COUNT(*) FROM track_art", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap() as u32
+    }
+
+    fn art_blob_count(db: &Db) -> u32 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM art_blobs", [], |row| {
                 row.get::<_, i64>(0)
             })
             .unwrap() as u32
     }
 
     #[test]
-    fn scan_folder_writes_art_once_per_album_even_with_several_tracks() {
+    fn scan_folder_writes_one_track_art_row_per_track_but_shares_one_blob() {
         let dir = tempfile::tempdir().unwrap();
         touch(&dir.path().join("track01.flac"));
         touch(&dir.path().join("track02.flac"));
@@ -426,9 +427,14 @@ mod tests {
         scan_folder(&folder, &db, |p| Some((fake_track(p), Some(art.clone())))).unwrap();
 
         assert_eq!(
-            art_row_count(&db),
+            track_art_row_count(&db),
+            3,
+            "every track that has art gets its own track_art row"
+        );
+        assert_eq!(
+            art_blob_count(&db),
             1,
-            "one album across three tracks must write one album_art row"
+            "three tracks sharing identical embedded bytes must share one blob"
         );
     }
 
@@ -442,15 +448,16 @@ mod tests {
         let folder = LibraryFolder::new(dir.path()).unwrap();
         let art = AlbumArtData::new(vec![0xFF, 0xD8, 0xFF]);
         scan_folder(&folder, &db, |p| Some((fake_track(p), Some(art.clone())))).unwrap();
-        assert_eq!(art_row_count(&db), 1);
+        assert_eq!(track_art_row_count(&db), 1);
 
         std::fs::remove_file(&file).unwrap();
         scan_folder(&folder, &db, |p| Some((fake_track(p), Some(art.clone())))).unwrap();
 
         assert_eq!(
-            art_row_count(&db),
+            track_art_row_count(&db),
             0,
-            "art for a fully-removed album must be pruned"
+            "art for a fully-removed track must be pruned"
         );
+        assert_eq!(art_blob_count(&db), 0);
     }
 }
