@@ -2,6 +2,7 @@ pub mod album;
 pub mod db;
 pub mod filter;
 pub mod metadata;
+pub mod metadata_edit;
 pub mod scan;
 pub mod settings;
 pub mod track;

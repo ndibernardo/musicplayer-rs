@@ -3,6 +3,7 @@ use crate::library::album::AlbumSortField;
 use crate::library::album::SortDirection;
 use crate::library::db::LibraryFolder;
 use crate::library::filter::LibraryFilter;
+use crate::library::metadata_edit::EditOutcome;
 use crate::library::scan::ScanEvent;
 use crate::library::track::Track;
 use crate::library::view_mode::ViewMode;
@@ -47,6 +48,13 @@ pub enum WindowMessage {
     RescanRequested,
     FolderAdded(LibraryFolder),
     FolderRemoved(LibraryFolder),
+    /// A track/album metadata edit finished saving on a background thread.
+    /// `affects_art` is computed at spawn time (the edit itself is gone by
+    /// the time the outcome arrives) — see `metadata_edit::TrackEdit::affects_art_grouping`.
+    EditSaved {
+        affects_art: bool,
+        outcome: EditOutcome,
+    },
 }
 
 /// The pure state transition for `msg`: no I/O, no GTK — fully unit-testable.
@@ -91,7 +99,8 @@ pub fn reduce(state: WindowState, msg: &WindowMessage) -> WindowState {
         | WindowMessage::ScanEvent(_)
         | WindowMessage::RescanRequested
         | WindowMessage::FolderAdded(_)
-        | WindowMessage::FolderRemoved(_) => state,
+        | WindowMessage::FolderRemoved(_)
+        | WindowMessage::EditSaved { .. } => state,
     }
 }
 
