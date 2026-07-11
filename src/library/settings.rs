@@ -32,6 +32,12 @@ const WINDOW_MAXIMIZED_KEY: &str = "window_maximized";
 
 const COLUMN_ORDER_KEY: &str = "column_order";
 
+const LEFT_SIDEBAR_OPEN_KEY: &str = "left_sidebar_open";
+const LEFT_SIDEBAR_WIDTH_KEY: &str = "left_sidebar_width";
+const RIGHT_SIDEBAR_OPEN_KEY: &str = "right_sidebar_open";
+const RIGHT_SIDEBAR_WIDTH_KEY: &str = "right_sidebar_width";
+const DEFAULT_SIDEBAR_WIDTH: i32 = 220;
+
 /// The settings key holding `field`'s format string.
 fn column_format_key(field: TrackField) -> String {
     format!("column_format_{}", field.as_key())
@@ -241,6 +247,50 @@ impl<'a> Settings<'a> {
             &column_width_key(field),
             &width.map(|w| w.to_string()).unwrap_or_default(),
         );
+    }
+
+    /// Persisted open/collapsed state of the left (filters) sidebar. Defaults
+    /// to open when unset.
+    pub fn left_sidebar_open(&self) -> bool {
+        self.get(LEFT_SIDEBAR_OPEN_KEY).as_deref() != Some("false")
+    }
+
+    pub fn set_left_sidebar_open(&self, open: bool) {
+        self.set(LEFT_SIDEBAR_OPEN_KEY, if open { "true" } else { "false" });
+    }
+
+    /// Persisted width in pixels of the left sidebar while open. Defaults to
+    /// `DEFAULT_SIDEBAR_WIDTH` when unset or unparsable.
+    pub fn left_sidebar_width(&self) -> i32 {
+        self.get(LEFT_SIDEBAR_WIDTH_KEY)
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(DEFAULT_SIDEBAR_WIDTH)
+    }
+
+    pub fn set_left_sidebar_width(&self, width: i32) {
+        self.set(LEFT_SIDEBAR_WIDTH_KEY, &width.to_string());
+    }
+
+    /// Persisted open/collapsed state of the right (queue/folders/status)
+    /// sidebar. Defaults to open when unset.
+    pub fn right_sidebar_open(&self) -> bool {
+        self.get(RIGHT_SIDEBAR_OPEN_KEY).as_deref() != Some("false")
+    }
+
+    pub fn set_right_sidebar_open(&self, open: bool) {
+        self.set(RIGHT_SIDEBAR_OPEN_KEY, if open { "true" } else { "false" });
+    }
+
+    /// Persisted width in pixels of the right sidebar while open. Defaults to
+    /// `DEFAULT_SIDEBAR_WIDTH` when unset or unparsable.
+    pub fn right_sidebar_width(&self) -> i32 {
+        self.get(RIGHT_SIDEBAR_WIDTH_KEY)
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(DEFAULT_SIDEBAR_WIDTH)
+    }
+
+    pub fn set_right_sidebar_width(&self, width: i32) {
+        self.set(RIGHT_SIDEBAR_WIDTH_KEY, &width.to_string());
     }
 
     fn get(&self, key: &str) -> Option<String> {
@@ -504,6 +554,64 @@ mod tests {
         settings.set_column_width(TrackField::Duration, Some(96));
         settings.set_column_width(TrackField::Duration, None);
         assert_eq!(settings.column_width(TrackField::Duration), None);
+    }
+
+    #[test]
+    fn left_sidebar_open_defaults_to_true_when_unset() {
+        let db = fresh();
+        assert!(Settings::new(&db).left_sidebar_open());
+    }
+
+    #[test]
+    fn left_sidebar_open_round_trips_false() {
+        let db = fresh();
+        Settings::new(&db).set_left_sidebar_open(false);
+        assert!(!Settings::new(&db).left_sidebar_open());
+    }
+
+    #[test]
+    fn left_sidebar_width_defaults_when_unset() {
+        let db = fresh();
+        assert_eq!(
+            Settings::new(&db).left_sidebar_width(),
+            DEFAULT_SIDEBAR_WIDTH
+        );
+    }
+
+    #[test]
+    fn left_sidebar_width_round_trips() {
+        let db = fresh();
+        Settings::new(&db).set_left_sidebar_width(260);
+        assert_eq!(Settings::new(&db).left_sidebar_width(), 260);
+    }
+
+    #[test]
+    fn right_sidebar_open_defaults_to_true_when_unset() {
+        let db = fresh();
+        assert!(Settings::new(&db).right_sidebar_open());
+    }
+
+    #[test]
+    fn right_sidebar_open_round_trips_false() {
+        let db = fresh();
+        Settings::new(&db).set_right_sidebar_open(false);
+        assert!(!Settings::new(&db).right_sidebar_open());
+    }
+
+    #[test]
+    fn right_sidebar_width_defaults_when_unset() {
+        let db = fresh();
+        assert_eq!(
+            Settings::new(&db).right_sidebar_width(),
+            DEFAULT_SIDEBAR_WIDTH
+        );
+    }
+
+    #[test]
+    fn right_sidebar_width_round_trips() {
+        let db = fresh();
+        Settings::new(&db).set_right_sidebar_width(300);
+        assert_eq!(Settings::new(&db).right_sidebar_width(), 300);
     }
 
     proptest::proptest! {

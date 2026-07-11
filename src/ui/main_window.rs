@@ -130,6 +130,10 @@ struct InitialSettings {
     window_size: Option<(i32, i32)>,
     window_maximized: bool,
     column_prefs: ColumnPrefs,
+    left_sidebar_open: bool,
+    left_sidebar_width: i32,
+    right_sidebar_open: bool,
+    right_sidebar_width: i32,
 }
 
 impl InitialSettings {
@@ -146,6 +150,10 @@ impl InitialSettings {
             window_size: s.window_size(),
             window_maximized: s.window_maximized(),
             column_prefs: s.column_prefs(),
+            left_sidebar_open: s.left_sidebar_open(),
+            left_sidebar_width: s.left_sidebar_width(),
+            right_sidebar_open: s.right_sidebar_open(),
+            right_sidebar_width: s.right_sidebar_width(),
         }
     }
 }
@@ -212,6 +220,22 @@ impl Context {
             .maximized(initial.window_maximized)
             .build();
 
+        // Packed first/last so the sidebar toggles stay the outermost header
+        // widgets; wiring to the paned they control happens once those exist,
+        // further down. `set_active` runs before `connect_toggled` so
+        // restoring the persisted state doesn't re-trigger a save.
+        let left_sidebar_toggle = ToggleButton::new();
+        left_sidebar_toggle.set_icon_name("sidebar-show-symbolic");
+        left_sidebar_toggle.set_tooltip_text(Some("Toggle filters sidebar"));
+        left_sidebar_toggle.set_active(initial.left_sidebar_open);
+        header.pack_start(&left_sidebar_toggle);
+
+        let right_sidebar_toggle = ToggleButton::new();
+        right_sidebar_toggle.set_icon_name("sidebar-show-right-symbolic");
+        right_sidebar_toggle.set_tooltip_text(Some("Toggle queue sidebar"));
+        right_sidebar_toggle.set_active(initial.right_sidebar_open);
+        header.pack_end(&right_sidebar_toggle);
+
         let add_btn = Button::from_icon_name("folder-new-symbolic");
         add_btn.set_tooltip_text(Some("Add music folder"));
         header.pack_start(&add_btn);
@@ -227,24 +251,35 @@ impl Context {
         let (list_toggle, grid_toggle) = build_view_toggles();
         let column_picker = ColumnPicker::new(initial.column_prefs.clone());
         wire_column_picker(&column_picker, &tx);
+
+        // One header slot generalised over both view modes: the column
+        // picker in list view, the cover-size slider in grid view — never
+        // both, so they share a single spot instead of two.
+        let view_settings = Stack::new();
+        view_settings.set_hhomogeneous(false);
+        view_settings.set_vhomogeneous(false);
+        view_settings.add_named(&column_picker.widget, Some("columns"));
+        view_settings.add_named(&size_scale, Some("cover_size"));
+
         header.pack_start(&sort_controls);
-        header.pack_end(&size_scale);
         header.pack_end(&grid_toggle);
         header.pack_end(&list_toggle);
-        header.pack_end(&column_picker.widget);
+        header.pack_end(&view_settings);
 
-        // Shows or hides both grid-only control groups together, and the
-        // list-only column picker inversely — it has nothing to configure
-        // in grid view, which shows album summaries, not table columns.
+        // Shows or hides the grid-only sort controls, and switches the
+        // shared header slot between the list-only column picker and the
+        // grid-only cover-size slider.
         let toggle_grid_controls: Rc<dyn Fn(ViewMode)> = {
             let sort_controls = sort_controls.clone();
-            let size_scale = size_scale.clone();
-            let column_picker_widget = column_picker.widget.clone();
+            let view_settings = view_settings.clone();
             Rc::new(move |mode: ViewMode| {
                 let grid_visible = matches!(mode, ViewMode::Grid);
                 sort_controls.set_visible(grid_visible);
-                size_scale.set_visible(grid_visible);
-                column_picker_widget.set_visible(!grid_visible);
+                view_settings.set_visible_child_name(if grid_visible {
+                    "cover_size"
+                } else {
+                    "columns"
+                });
             })
         };
 
@@ -262,7 +297,8 @@ impl Context {
         wire_sidebar(&filter_sidebar, &tx);
         let queue_view = QueueView::new();
         wire_queue_view(&queue_view, &tx);
-        let sidebar = build_sidebar_box(&filter_sidebar, &queue_view, &folder_list, &status_label);
+        let left_sidebar = build_left_sidebar_box(&filter_sidebar);
+        let right_sidebar = build_right_sidebar_box(&queue_view, &folder_list, &status_label);
 
         let library_view = LibraryView::new(&initial.column_prefs);
         wire_library_view(&library_view, &db, &db_path, &window, &status_label, &tx);
@@ -284,11 +320,42 @@ impl Context {
         content_overlay.set_child(Some(&content));
         content_overlay.add_overlay(&scan_indicator);
 
+        let inner_paned = Paned::new(Orientation::Horizontal);
+        inner_paned.set_start_child(Some(&content_overlay));
+        inner_paned.set_end_child(Some(&right_sidebar));
+        inner_paned.set_resize_end_child(false);
+        inner_paned.set_hexpand(true);
+        inner_paned.set_vexpand(true);
+        // The right sidebar's width is `inner_paned`'s total width minus its
+        // divider position, so before the window is first realized (no real
+        // width to measure) this is only an estimate; it self-corrects the
+        // moment the divider is dragged or the toggle is used, both of which
+        // read `inner_paned`'s actual allocated width.
+        let estimated_content_width = initial_width
+            - if initial.left_sidebar_open {
+                initial.left_sidebar_width
+            } else {
+                0
+            };
+        inner_paned.set_position(if initial.right_sidebar_open {
+            (estimated_content_width - initial.right_sidebar_width).max(0)
+        } else {
+            estimated_content_width
+        });
+
         let paned = Paned::new(Orientation::Horizontal);
-        paned.set_start_child(Some(&sidebar));
-        paned.set_end_child(Some(&content_overlay));
-        paned.set_position(220);
+        paned.set_start_child(Some(&left_sidebar));
+        paned.set_end_child(Some(&inner_paned));
+        paned.set_position(if initial.left_sidebar_open {
+            initial.left_sidebar_width
+        } else {
+            0
+        });
+        paned.set_hexpand(true);
         paned.set_vexpand(true);
+
+        wire_left_sidebar_toggle(&left_sidebar_toggle, &paned, Rc::clone(&db));
+        wire_right_sidebar_toggle(&right_sidebar_toggle, &inner_paned, Rc::clone(&db));
 
         wire_view_toggles(
             &list_toggle,
@@ -1296,8 +1363,14 @@ fn build_scan_indicator() -> (Spinner, Label, GtkBox) {
     (scan_spinner, scan_status, scan_indicator)
 }
 
-fn build_sidebar_box(
-    filter_sidebar: &Sidebar,
+fn build_left_sidebar_box(filter_sidebar: &Sidebar) -> GtkBox {
+    let sidebar = GtkBox::new(Orientation::Vertical, 0);
+    sidebar.set_width_request(220);
+    sidebar.append(&filter_sidebar.widget);
+    sidebar
+}
+
+fn build_right_sidebar_box(
     queue_view: &QueueView,
     folder_list: &ListBox,
     status_label: &Label,
@@ -1309,13 +1382,77 @@ fn build_sidebar_box(
     folders_expander.set_margin_start(4);
     folders_expander.set_child(Some(&folders_scrolled));
 
+    // The queue expands to fill leftover height, which pins watched folders
+    // and status to the bottom of the sidebar rather than right below it.
+    queue_view.widget.set_vexpand(true);
+
     let sidebar = GtkBox::new(Orientation::Vertical, 0);
     sidebar.set_width_request(220);
-    sidebar.append(&filter_sidebar.widget);
+    sidebar.set_vexpand(true);
     sidebar.append(&queue_view.widget);
     sidebar.append(&folders_expander);
     sidebar.append(status_label);
     sidebar
+}
+
+/// Links the left-sidebar toggle to `paned`'s divider and persists both the
+/// open state and, while open, the dragged width — so the sidebar reopens
+/// (this session or a future one) at the size it was last left at. A
+/// `Revealer` here would leave the paned's fixed `position` allocating full
+/// width to an empty child, so the divider itself is the collapse mechanism.
+fn wire_left_sidebar_toggle(toggle: &ToggleButton, paned: &Paned, db: Rc<Db>) {
+    let paned_for_toggle = paned.clone();
+    let db_for_toggle = Rc::clone(&db);
+    toggle.connect_toggled(move |btn| {
+        let settings = Settings::new(&db_for_toggle);
+        let open = btn.is_active();
+        settings.set_left_sidebar_open(open);
+        paned_for_toggle.set_position(if open {
+            settings.left_sidebar_width()
+        } else {
+            0
+        });
+    });
+
+    let toggle_for_drag = toggle.clone();
+    paned.connect_position_notify(move |paned| {
+        if toggle_for_drag.is_active() && paned.position() > 0 {
+            Settings::new(&db).set_left_sidebar_width(paned.position());
+        }
+    });
+}
+
+/// Links the right-sidebar toggle to `paned`'s divider and persists both the
+/// open state and, while open, the dragged width. The right sidebar is the
+/// *end* child, so its width is `paned`'s total allocated width minus the
+/// divider position — read at toggle/drag time, once the widget is realized
+/// and that width is accurate (see `estimated_content_width` at construction
+/// for the one case where it isn't yet).
+fn wire_right_sidebar_toggle(toggle: &ToggleButton, paned: &Paned, db: Rc<Db>) {
+    let paned_for_toggle = paned.clone();
+    let db_for_toggle = Rc::clone(&db);
+    toggle.connect_toggled(move |btn| {
+        let settings = Settings::new(&db_for_toggle);
+        let open = btn.is_active();
+        settings.set_right_sidebar_open(open);
+        let total_width = paned_for_toggle.width();
+        paned_for_toggle.set_position(if open {
+            (total_width - settings.right_sidebar_width()).max(0)
+        } else {
+            total_width
+        });
+    });
+
+    let toggle_for_drag = toggle.clone();
+    paned.connect_position_notify(move |paned| {
+        if !toggle_for_drag.is_active() {
+            return;
+        }
+        let width = paned.width() - paned.position();
+        if width > 0 {
+            Settings::new(&db).set_right_sidebar_width(width);
+        }
+    });
 }
 
 pub fn build(
