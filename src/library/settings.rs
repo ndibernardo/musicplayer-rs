@@ -334,4 +334,13 @@ mod tests {
         Settings::new(&db).set_window_maximized(true);
         assert!(Settings::new(&db).window_maximized());
     }
+
+    proptest::proptest! {
+        #[test]
+        fn volume_round_trips_for_any_value_in_the_valid_range(v in 0.0f64..=100.0) {
+            let db = fresh();
+            Settings::new(&db).set_volume(v);
+            proptest::prop_assert_eq!(Settings::new(&db).volume(), v);
+        }
+    }
 }

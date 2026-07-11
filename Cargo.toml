@@ -25,3 +25,4 @@ rodio = { version = "0.22.2", features = ["symphonia-all", "symphonia-simd"], op
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"
