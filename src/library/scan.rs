@@ -25,24 +25,39 @@ pub enum ScanError {
     Database(#[from] DbError),
 }
 
+/// One successfully read audio file: its tags, and its embedded cover if any.
+/// `art` stays an `Option` because absence is a legitimate, meaningful state.
+#[derive(Debug, Clone)]
+pub struct ScannedFile {
+    pub track: Track,
+    pub art: Option<AlbumArtData>,
+}
+
+/// Counts reported by a finished scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScanSummary {
+    pub indexed: u32,
+    pub unchanged: u32,
+    pub removed: u64,
+}
+
 /// A message sent from the background scan to the UI over the scan channel.
 #[derive(Debug)]
 pub enum ScanEvent {
     /// Running count of files indexed so far, across all folders.
     Progress(u32),
-    /// The scan finished: total indexed, or the first error encountered.
-    Finished(Result<u32, ScanError>),
+    /// The scan finished: its summary, or the first error encountered.
+    Finished(Result<ScanSummary, ScanError>),
 }
 
 /// Walks `folder` recursively, reads each audio file with `read_track`, and upserts to `db`.
 ///
-/// `read_track` returns `None` to skip a file (e.g. format error). Returns the count of
-/// successfully indexed tracks.
+/// `read_track` returns `None` to skip a file (e.g. format error).
 pub fn scan_folder(
     folder: &LibraryFolder,
     db: &Db,
-    read_track: impl Fn(&TrackPath) -> Option<(Track, Option<AlbumArtData>)>,
-) -> Result<u32, ScanError> {
+    read_track: impl Fn(&TrackPath) -> Option<ScannedFile>,
+) -> Result<ScanSummary, ScanError> {
     scan_folder_with_progress(folder, db, read_track, |_| {})
 }
 
@@ -55,14 +70,15 @@ pub fn scan_folder(
 pub fn scan_folder_with_progress(
     folder: &LibraryFolder,
     db: &Db,
-    read_track: impl Fn(&TrackPath) -> Option<(Track, Option<AlbumArtData>)>,
+    read_track: impl Fn(&TrackPath) -> Option<ScannedFile>,
     mut on_progress: impl FnMut(u32),
-) -> Result<u32, ScanError> {
+) -> Result<ScanSummary, ScanError> {
     const BATCH_SIZE: usize = 200;
     let files = collect_audio_files(folder.as_path())?;
     let known = db.known_file_stats(folder)?;
     let mut seen: HashSet<PathBuf> = HashSet::with_capacity(files.len());
-    let mut count = 0u32;
+    let mut indexed = 0u32;
+    let mut unchanged = 0u32;
 
     for chunk in files.chunks(BATCH_SIZE) {
         let tx = db.conn.unchecked_transaction().map_err(DbError::from)?;
@@ -73,23 +89,28 @@ pub fn scan_folder_with_progress(
             };
             let stamp = std::fs::metadata(path).ok().map(|m| FileStamp::of(&m));
             if known.get(path) == stamp.as_ref() {
+                unchanged += 1;
                 continue; // file unchanged — skip re-indexing
             }
-            if let Some((track, art_opt)) = read_track(&track_path) {
-                let track_id = Db::upsert_one(&tx, &track, stamp)?;
-                if let Some(art) = art_opt {
+            if let Some(scanned) = read_track(&track_path) {
+                let track_id = Db::upsert_one(&tx, &scanned.track, stamp)?;
+                if let Some(art) = scanned.art {
                     Db::upsert_art_for_track(&tx, track_id, art.as_bytes())?;
                 }
-                count += 1;
-                on_progress(count);
+                indexed += 1;
+                on_progress(indexed);
             }
         }
         tx.commit().map_err(DbError::from)?;
     }
 
-    db.remove_stale_tracks(folder, &seen)?;
+    let removed = db.remove_stale_tracks(folder, &seen)?;
     db.prune_orphaned_art()?;
-    Ok(count)
+    Ok(ScanSummary {
+        indexed,
+        unchanged,
+        removed,
+    })
 }
 
 /// Scans `folders` on a background thread with its own DB connection (WAL mode
@@ -107,20 +128,28 @@ pub fn spawn_scan(db_path: PathBuf, folders: Vec<LibraryFolder>) -> Receiver<Sca
             }
         };
 
-        let mut total = 0u32;
+        let mut total = ScanSummary::default();
         for folder in &folders {
-            let base = total;
+            let base = total.indexed;
             let progress_tx: Sender<ScanEvent> = tx.clone();
             let result = scan_folder_with_progress(
                 folder,
                 &db,
-                |p| crate::library::metadata::read(p).ok(),
+                |p| {
+                    crate::library::metadata::read(p)
+                        .ok()
+                        .map(|(track, art)| ScannedFile { track, art })
+                },
                 |n| {
                     let _ = progress_tx.try_send(ScanEvent::Progress(base + n));
                 },
             );
             match result {
-                Ok(n) => total += n,
+                Ok(summary) => {
+                    total.indexed += summary.indexed;
+                    total.unchanged += summary.unchanged;
+                    total.removed += summary.removed;
+                }
                 Err(e) => {
                     let _ = tx.try_send(ScanEvent::Finished(Err(e)));
                     return;
@@ -203,6 +232,13 @@ mod tests {
         std::fs::write(path, b"").unwrap();
     }
 
+    fn scanned(path: &TrackPath) -> ScannedFile {
+        ScannedFile {
+            track: fake_track(path),
+            art: None,
+        }
+    }
+
     #[test]
     fn scan_folder_indexes_audio_files() {
         let dir = tempfile::tempdir().unwrap();
@@ -211,9 +247,9 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        let summary = scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
 
-        assert_eq!(count, 2);
+        assert_eq!(summary.indexed, 2);
         assert_eq!(db.track_count().unwrap(), 2);
     }
 
@@ -226,9 +262,9 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        let summary = scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
 
-        assert_eq!(count, 1);
+        assert_eq!(summary.indexed, 1);
     }
 
     #[test]
@@ -241,9 +277,9 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        let summary = scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
 
-        assert_eq!(count, 2);
+        assert_eq!(summary.indexed, 2);
     }
 
     #[test]
@@ -255,16 +291,16 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
 
-        let count = scan_folder(&folder, &db, |p| {
+        let summary = scan_folder(&folder, &db, |p| {
             if p.as_path().file_name() == Some(OsStr::new("corrupt.flac")) {
                 None
             } else {
-                Some((fake_track(p), None))
+                Some(scanned(p))
             }
         })
         .unwrap();
 
-        assert_eq!(count, 1);
+        assert_eq!(summary.indexed, 1);
         assert_eq!(db.track_count().unwrap(), 1);
     }
 
@@ -277,16 +313,16 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        let count = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        let summary = scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
 
-        assert_eq!(count, 1);
+        assert_eq!(summary.indexed, 1);
     }
 
     #[test]
     fn scan_folder_returns_error_for_nonexistent_directory() {
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new("/nonexistent/path/that/does/not/exist").unwrap();
-        let result = scan_folder(&folder, &db, |p| Some((fake_track(p), None)));
+        let result = scan_folder(&folder, &db, |p| Some(scanned(p)));
         assert!(matches!(result, Err(ScanError::ReadDir { .. })));
     }
 
@@ -301,15 +337,11 @@ mod tests {
         let folder = LibraryFolder::new(dir.path()).unwrap();
 
         let mut seen = Vec::new();
-        let total = scan_folder_with_progress(
-            &folder,
-            &db,
-            |p| Some((fake_track(p), None)),
-            |n| seen.push(n),
-        )
-        .unwrap();
+        let summary =
+            scan_folder_with_progress(&folder, &db, |p| Some(scanned(p)), |n| seen.push(n))
+                .unwrap();
 
-        assert_eq!(total, 3);
+        assert_eq!(summary.indexed, 3);
         assert_eq!(seen, vec![1, 2, 3], "progress is the running indexed count");
     }
 
@@ -320,8 +352,8 @@ mod tests {
 
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
-        scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
-        scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
+        scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
 
         assert_eq!(
             db.track_count().unwrap(),
@@ -338,12 +370,16 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
 
-        let first = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
-        assert_eq!(first, 1);
+        let first = scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
+        assert_eq!(first.indexed, 1);
 
         // File unchanged on disk: mtime and size are the same.
-        let second = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
-        assert_eq!(second, 0, "unchanged file must be skipped");
+        let second = scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
+        assert_eq!(second.indexed, 0, "unchanged file must be skipped");
+        assert_eq!(
+            second.unchanged, 1,
+            "unchanged file is counted, not silently dropped"
+        );
         assert_eq!(db.track_count().unwrap(), 1, "track must still exist");
     }
 
@@ -356,12 +392,15 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
 
-        scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
 
         // Write more bytes so the file size changes, triggering re-indexing.
         std::fs::write(&file, b"updated with different byte length").unwrap();
-        let count = scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
-        assert_eq!(count, 1, "file with changed size must be re-indexed");
+        let summary = scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
+        assert_eq!(
+            summary.indexed, 1,
+            "file with changed size must be re-indexed"
+        );
     }
 
     #[test]
@@ -373,17 +412,18 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
 
-        scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
         assert_eq!(db.track_count().unwrap(), 1);
 
         std::fs::remove_file(&file).unwrap();
 
-        scan_folder(&folder, &db, |p| Some((fake_track(p), None))).unwrap();
+        let summary = scan_folder(&folder, &db, |p| Some(scanned(p))).unwrap();
         assert_eq!(
             db.track_count().unwrap(),
             0,
             "deleted file must be removed from DB"
         );
+        assert_eq!(summary.removed, 1, "removed count reflects the pruned row");
     }
 
     fn track_art_row_count(db: &Db) -> u32 {
@@ -412,7 +452,13 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
         let art = AlbumArtData::new(vec![0xFF, 0xD8, 0xFF]);
-        scan_folder(&folder, &db, |p| Some((fake_track(p), Some(art.clone())))).unwrap();
+        scan_folder(&folder, &db, |p| {
+            Some(ScannedFile {
+                track: fake_track(p),
+                art: Some(art.clone()),
+            })
+        })
+        .unwrap();
 
         assert_eq!(
             track_art_row_count(&db),
@@ -435,11 +481,23 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let folder = LibraryFolder::new(dir.path()).unwrap();
         let art = AlbumArtData::new(vec![0xFF, 0xD8, 0xFF]);
-        scan_folder(&folder, &db, |p| Some((fake_track(p), Some(art.clone())))).unwrap();
+        scan_folder(&folder, &db, |p| {
+            Some(ScannedFile {
+                track: fake_track(p),
+                art: Some(art.clone()),
+            })
+        })
+        .unwrap();
         assert_eq!(track_art_row_count(&db), 1);
 
         std::fs::remove_file(&file).unwrap();
-        scan_folder(&folder, &db, |p| Some((fake_track(p), Some(art.clone())))).unwrap();
+        scan_folder(&folder, &db, |p| {
+            Some(ScannedFile {
+                track: fake_track(p),
+                art: Some(art.clone()),
+            })
+        })
+        .unwrap();
 
         assert_eq!(
             track_art_row_count(&db),

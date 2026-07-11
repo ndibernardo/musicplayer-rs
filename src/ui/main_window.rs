@@ -629,8 +629,11 @@ impl Context {
                 self.status_label.set_text(&msg);
                 self.scan_status.set_text(&msg);
             }
-            ScanEvent::Finished(Ok(n)) => {
-                self.status_label.set_text(&format!("Indexed {n} tracks"));
+            ScanEvent::Finished(Ok(summary)) => {
+                self.status_label.set_text(&format!(
+                    "Indexed {} tracks, removed {}",
+                    summary.indexed, summary.removed
+                ));
                 self.scan_spinner.stop();
                 self.scan_indicator.set_visible(false);
                 // A rescan may have changed an album's embedded art; the
