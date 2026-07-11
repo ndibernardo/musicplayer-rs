@@ -128,70 +128,131 @@ fn or_zero(v: Option<i64>) -> i64 {
     v.unwrap_or(0)
 }
 
-/// Raw column values of a `tracks` row, before domain validation.
-type TrackRow = (
-    i64,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-    Option<i64>,
-    Option<String>,
-    Option<String>,
-);
+/// The change-detection fingerprint of an on-disk file: mtime seconds and
+/// byte size. Two files with equal stamps are assumed unchanged. `None`
+/// (rather than a `0, 0` sentinel) is how the scanner represents "no stat
+/// information was available for this file."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    mtime_secs: u64,
+    size: u64,
+}
 
-/// Builds a domain `Track` from a raw row, validating the path.
+impl FileStamp {
+    pub fn of(meta: &std::fs::Metadata) -> Self {
+        let mtime_secs = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Self {
+            mtime_secs,
+            size: meta.len(),
+        }
+    }
+}
+
+/// Raw column values of a `tracks` row, before domain validation.
+struct TrackRow {
+    id: i64,
+    path: String,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    genre: Option<String>,
+    duration_ms: Option<i64>,
+    track_number: Option<i64>,
+    disc_number: Option<i64>,
+    year: Option<i64>,
+    album_artist: Option<String>,
+    composer: Option<String>,
+}
+
+impl TrackRow {
+    /// Reads a `TrackRow` by column name, not position — swapping two columns
+    /// in the `SELECT` list can no longer silently transpose two fields.
+    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get("track_id")?,
+            path: row.get("path")?,
+            title: row.get("title")?,
+            artist: row.get("artist")?,
+            album: row.get("album")?,
+            genre: row.get("genre")?,
+            duration_ms: row.get("duration_ms")?,
+            track_number: row.get("track_number")?,
+            disc_number: row.get("disc_number")?,
+            year: row.get("year")?,
+            album_artist: row.get("album_artist")?,
+            composer: row.get("composer")?,
+        })
+    }
+}
+
+/// Builds a domain `Track` from a raw row, validating the path and narrowing
+/// every numeric column with `try_from` — a corrupt row (e.g. a negative
+/// `track_number` written by a foreign tool) surfaces as `InvalidData`
+/// instead of silently wrapping via `as`.
 fn build_track(row: TrackRow) -> Result<Track, DbError> {
-    let (
-        id,
-        path,
-        title,
-        artist,
-        album,
-        genre,
-        duration_ms,
-        track_num,
-        disc_num,
-        year,
-        album_artist,
-        composer,
-    ) = row;
-    let path = TrackPath::new(path).map_err(|e| DbError::InvalidData(e.to_string()))?;
+    let path = TrackPath::new(row.path).map_err(|e| DbError::InvalidData(e.to_string()))?;
+    let duration_ms = u64::try_from(or_zero(row.duration_ms))
+        .map_err(|e| DbError::InvalidData(format!("duration_ms out of range: {e}")))?;
+    let track_number = u32::try_from(or_zero(row.track_number))
+        .map_err(|e| DbError::InvalidData(format!("track_number out of range: {e}")))?;
+    let disc_number = u32::try_from(or_zero(row.disc_number))
+        .map_err(|e| DbError::InvalidData(format!("disc_number out of range: {e}")))?;
+    let year = u16::try_from(or_zero(row.year))
+        .map_err(|e| DbError::InvalidData(format!("year out of range: {e}")))?;
     Ok(Track {
-        id: TrackId::new(id),
+        id: TrackId::new(row.id),
         path,
-        title: Title::new(or_empty(title)),
-        artist: Artist::new(or_empty(artist)),
-        album_artist: Artist::new(or_empty(album_artist)),
-        album: AlbumTitle::new(or_empty(album)),
-        genre: Genre::new(or_empty(genre)),
-        composer: Composer::new(or_empty(composer)),
-        duration: TrackDuration::from_millis(or_zero(duration_ms) as u64),
-        track_number: TrackNumber::new(or_zero(track_num) as u32),
-        disc_number: DiscNumber::new(or_zero(disc_num) as u32),
-        year: Year::new(or_zero(year) as u16),
+        title: Title::new(or_empty(row.title)),
+        artist: Artist::new(or_empty(row.artist)),
+        album_artist: Artist::new(or_empty(row.album_artist)),
+        album: AlbumTitle::new(or_empty(row.album)),
+        genre: Genre::new(or_empty(row.genre)),
+        composer: Composer::new(or_empty(row.composer)),
+        duration: TrackDuration::from_millis(duration_ms),
+        track_number: TrackNumber::new(track_number),
+        disc_number: DiscNumber::new(disc_number),
+        year: Year::new(year),
     })
 }
 
 /// Raw columns of one grouped album row: album, artist, genre, year, has_art.
-type AlbumRow = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    bool,
-);
+struct AlbumRow {
+    album: Option<String>,
+    artist: Option<String>,
+    genre: Option<String>,
+    year: Option<i64>,
+    has_art: bool,
+}
+
+impl AlbumRow {
+    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            album: row.get("album")?,
+            artist: row.get("album_artist")?,
+            genre: row.get("album_genre")?,
+            year: row.get("album_year")?,
+            has_art: row.get("has_art")?,
+        })
+    }
+}
 
 /// Builds an `AlbumSummary` from a grouped row. All fields are infallible;
 /// NULLs map to the domain "unknown" defaults. `has_art` (a plain SQL `EXISTS`)
 /// is converted to `CoverArt` here — the bool never travels further than this
 /// function.
 fn build_album_summary(row: AlbumRow) -> AlbumSummary {
-    let (album, artist, genre, year, has_art) = row;
+    let AlbumRow {
+        album,
+        artist,
+        genre,
+        year,
+        has_art,
+    } = row;
     let album = AlbumTitle::new(or_empty(album));
     let artist = Artist::new(or_empty(artist));
     let art = if has_art {
@@ -331,8 +392,7 @@ impl Db {
     pub(crate) fn upsert_one(
         conn: &Connection,
         track: &Track,
-        mtime: u64,
-        size: u64,
+        stamp: Option<FileStamp>,
     ) -> Result<TrackId, DbError> {
         let path = track.path.as_path().to_string_lossy();
         let title = (!track.title.is_unknown()).then(|| track.title.as_str().to_owned());
@@ -351,8 +411,8 @@ impl Db {
 
         // RETURNING yields the row's id on both the insert and the update path;
         // last_insert_rowid() would be stale after ON CONFLICT DO UPDATE.
-        let mtime = mtime as i64;
-        let size = size as i64;
+        let mtime = stamp.map(|s| s.mtime_secs as i64);
+        let size = stamp.map(|s| s.size as i64);
         let mut stmt = conn.prepare_cached(
             "INSERT INTO tracks (path, title, artist, album, genre, duration_ms, track_number, disc_number, year, album_artist, composer, mtime, size)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
@@ -449,7 +509,7 @@ impl Db {
 
     /// Inserts or updates a track keyed on its path. Returns the assigned track_id.
     pub fn upsert_track(&self, track: &Track) -> Result<TrackId, DbError> {
-        Self::upsert_one(&self.conn, track, 0, 0)
+        Self::upsert_one(&self.conn, track, None)
     }
 
     /// Upserts all `tracks` in a single transaction. Prefer this over calling
@@ -458,18 +518,18 @@ impl Db {
     pub fn upsert_tracks(&self, tracks: &[Track]) -> Result<(), DbError> {
         let tx = self.conn.unchecked_transaction()?;
         for track in tracks {
-            Self::upsert_one(&tx, track, 0, 0)?;
+            Self::upsert_one(&tx, track, None)?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Returns the `(mtime, size)` pair for every track path under `folder`.
-    /// Used by the scanner to decide whether a file needs re-indexing.
+    /// Returns the [`FileStamp`] for every track path under `folder` that has
+    /// one. Used by the scanner to decide whether a file needs re-indexing.
     pub(crate) fn known_file_stats(
         &self,
         folder: &LibraryFolder,
-    ) -> Result<HashMap<PathBuf, (u64, u64)>, DbError> {
+    ) -> Result<HashMap<PathBuf, FileStamp>, DbError> {
         let prefix = format!("{}/", folder.as_path().to_string_lossy());
         let mut stmt = self.conn.prepare_cached(
             "SELECT path, mtime, size FROM tracks WHERE substr(path, 1, length(?1)) = ?1",
@@ -483,11 +543,12 @@ impl Db {
                 ))
             })?
             .filter_map(|r| r.ok())
-            .map(|(path, mtime, size)| {
-                (
-                    PathBuf::from(path),
-                    (mtime.unwrap_or(0) as u64, size.unwrap_or(0) as u64),
-                )
+            .filter_map(|(path, mtime, size)| {
+                let stamp = FileStamp {
+                    mtime_secs: mtime? as u64,
+                    size: size? as u64,
+                };
+                Some((PathBuf::from(path), stamp))
             })
             .collect();
         Ok(map)
@@ -614,22 +675,7 @@ impl Db {
              FROM tracks {filter_and_order}"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params, |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<i64>>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, Option<i64>>(8)?,
-                row.get::<_, Option<i64>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<String>>(11)?,
-            ))
-        })?;
+        let rows = stmt.query_map(params, TrackRow::from_row)?;
         rows.map(|r| build_track(r.map_err(DbError::from)?))
             .collect()
     }
@@ -778,24 +824,16 @@ impl Db {
                            JOIN track_art ta ON ta.track_id = t2.track_id
                            WHERE t2.album = tracks.album
                              AND COALESCE(t2.album_artist, t2.artist)
-                                 = COALESCE(tracks.album_artist, tracks.artist))
+                                 = COALESCE(tracks.album_artist, tracks.artist)) AS has_art
              FROM tracks
              {where_clause}
              GROUP BY album, album_artist
              {order_by}"
         );
         let mut stmt = self.conn.prepare_cached(&sql)?;
-        stmt.query_map(params, |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, bool>(4)?,
-            ))
-        })?
-        .map(|r| r.map(build_album_summary).map_err(DbError::from))
-        .collect()
+        stmt.query_map(params, AlbumRow::from_row)?
+            .map(|r| r.map(build_album_summary).map_err(DbError::from))
+            .collect()
     }
 
     /// Stores `value` under `key`, overwriting any existing value.
@@ -1186,6 +1224,23 @@ mod tests {
         let columns = db.track_columns().unwrap();
         assert!(columns.iter().any(|c| c == "album_artist"));
         assert!(columns.iter().any(|c| c == "composer"));
+    }
+
+    #[test]
+    fn list_tracks_returns_invalid_data_for_out_of_range_track_number() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        // A foreign tool (or a hand-edited row) can write a value the domain
+        // newtype cannot hold; try_from must catch it instead of wrapping.
+        db.conn
+            .execute(
+                "UPDATE tracks SET track_number = -1 WHERE path = ?1",
+                ["/music/boc/roygbiv.flac"],
+            )
+            .unwrap();
+
+        assert!(matches!(db.list_tracks(), Err(DbError::InvalidData(_))));
     }
 
     #[test]
@@ -1902,22 +1957,39 @@ mod tests {
     fn known_file_stats_returns_mtime_and_size_for_indexed_paths() {
         let db = Db::open_in_memory().unwrap();
         let track = full_track("/music/boc/roygbiv.flac");
-        Db::upsert_one(&db.conn, &track, 1_700_000_000, 4096).unwrap();
+        let stamp = FileStamp {
+            mtime_secs: 1_700_000_000,
+            size: 4096,
+        };
+        Db::upsert_one(&db.conn, &track, Some(stamp)).unwrap();
 
         let folder = LibraryFolder::new("/music/boc").unwrap();
         let stats = db.known_file_stats(&folder).unwrap();
 
         assert_eq!(
             stats.get(&PathBuf::from("/music/boc/roygbiv.flac")),
-            Some(&(1_700_000_000, 4096))
+            Some(&stamp)
         );
     }
 
     #[test]
     fn known_file_stats_excludes_paths_outside_the_folder() {
         let db = Db::open_in_memory().unwrap();
-        Db::upsert_one(&db.conn, &full_track("/music/boc/roygbiv.flac"), 100, 200).unwrap();
-        Db::upsert_one(&db.conn, &full_track("/other/track.flac"), 300, 400).unwrap();
+        let stamp_a = FileStamp {
+            mtime_secs: 100,
+            size: 200,
+        };
+        let stamp_b = FileStamp {
+            mtime_secs: 300,
+            size: 400,
+        };
+        Db::upsert_one(
+            &db.conn,
+            &full_track("/music/boc/roygbiv.flac"),
+            Some(stamp_a),
+        )
+        .unwrap();
+        Db::upsert_one(&db.conn, &full_track("/other/track.flac"), Some(stamp_b)).unwrap();
 
         let folder = LibraryFolder::new("/music/boc").unwrap();
         let stats = db.known_file_stats(&folder).unwrap();

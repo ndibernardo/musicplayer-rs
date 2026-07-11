@@ -2,13 +2,13 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
 
 use async_channel::Receiver;
 use async_channel::Sender;
 
 use crate::library::db::Db;
 use crate::library::db::DbError;
+use crate::library::db::FileStamp;
 use crate::library::db::LibraryFolder;
 use crate::library::track::AlbumArtData;
 use crate::library::track::Track;
@@ -71,14 +71,12 @@ pub fn scan_folder_with_progress(
             let Ok(track_path) = TrackPath::new(path) else {
                 continue;
             };
-            let meta = std::fs::metadata(path).ok();
-            let mtime = meta.as_ref().map(file_mtime).unwrap_or(0);
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-            if known.get(path) == Some(&(mtime, size)) {
+            let stamp = std::fs::metadata(path).ok().map(|m| FileStamp::of(&m));
+            if known.get(path) == stamp.as_ref() {
                 continue; // file unchanged — skip re-indexing
             }
             if let Some((track, art_opt)) = read_track(&track_path) {
-                let track_id = Db::upsert_one(&tx, &track, mtime, size)?;
+                let track_id = Db::upsert_one(&tx, &track, stamp)?;
                 if let Some(art) = art_opt {
                     Db::upsert_art_for_track(&tx, track_id, art.as_bytes())?;
                 }
@@ -92,16 +90,6 @@ pub fn scan_folder_with_progress(
     db.remove_stale_tracks(folder, &seen)?;
     db.prune_orphaned_art()?;
     Ok(count)
-}
-
-/// Returns the file's last-modified timestamp as seconds since Unix epoch.
-/// Returns 0 on any error (causes the file to be re-indexed on the next scan).
-fn file_mtime(meta: &std::fs::Metadata) -> u64 {
-    meta.modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Scans `folders` on a background thread with its own DB connection (WAL mode

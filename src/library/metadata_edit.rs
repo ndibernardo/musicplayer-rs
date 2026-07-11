@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::library::db::Db;
 use crate::library::db::DbError;
+use crate::library::db::FileStamp;
 use crate::library::metadata;
 use crate::library::metadata::MetadataError;
 use crate::library::track::AlbumArtData;
@@ -111,15 +112,15 @@ pub fn save_edits(
     edit: &TrackEdit,
     art: Option<&AlbumArtData>,
 ) -> EditOutcome {
-    let mut stamped: Vec<(Track, u64, u64)> = Vec::with_capacity(tracks.len());
+    let mut stamped: Vec<(Track, Option<FileStamp>)> = Vec::with_capacity(tracks.len());
     let mut failed = None;
 
     for track in tracks {
         let edited = edit.apply(track.clone());
         match metadata::write(&edited, art) {
             Ok(()) => {
-                let (mtime, size) = file_stamp(edited.path.as_path());
-                stamped.push((edited, mtime, size));
+                let stamp = file_stamp(edited.path.as_path());
+                stamped.push((edited, stamp));
             }
             Err(source) => {
                 failed = Some(EditError::Metadata {
@@ -142,12 +143,12 @@ pub fn save_edits(
 
 /// One transaction covering every stamped track (and, if `art` changed, its
 /// art) — one WAL commit for a whole album instead of one per track. The
-/// fresh `(mtime, size)` stamps mean the next scan's `known_file_stats`
-/// comparison sees these files as already up to date, instead of re-parsing
-/// (lofty read, art extraction included) every file this edit touched.
+/// fresh `FileStamp`s mean the next scan's `known_file_stats` comparison sees
+/// these files as already up to date, instead of re-parsing (lofty read, art
+/// extraction included) every file this edit touched.
 fn commit(
     db: &Db,
-    stamped: &[(Track, u64, u64)],
+    stamped: &[(Track, Option<FileStamp>)],
     art: Option<&AlbumArtData>,
 ) -> Result<Vec<Track>, EditError> {
     if stamped.is_empty() {
@@ -155,8 +156,8 @@ fn commit(
     }
     let tx = db.conn.unchecked_transaction().map_err(DbError::from)?;
     let mut saved = Vec::with_capacity(stamped.len());
-    for (track, mtime, size) in stamped {
-        let id = Db::upsert_one(&tx, track, *mtime, *size)?;
+    for (track, stamp) in stamped {
+        let id = Db::upsert_one(&tx, track, *stamp)?;
         if let Some(art) = art {
             Db::upsert_art_for_track(&tx, id, art.as_bytes())?;
         }
@@ -166,20 +167,11 @@ fn commit(
     Ok(saved)
 }
 
-/// The track's fresh `(mtime_secs, size)` after `metadata::write` touched it.
-/// Returns `(0, 0)` on a stat failure, matching `scan.rs`'s own fallback —
-/// worst case the file is simply re-indexed on the next scan.
-fn file_stamp(path: &Path) -> (u64, u64) {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return (0, 0);
-    };
-    let mtime = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    (mtime, meta.len())
+/// The track's fresh `FileStamp` after `metadata::write` touched it. `None`
+/// on a stat failure, matching `scan.rs`'s own fallback — worst case the file
+/// is simply re-indexed on the next scan.
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    std::fs::metadata(path).ok().map(|m| FileStamp::of(&m))
 }
 
 /// Runs [`save_edits`] on a background thread with its own `Db` connection —
