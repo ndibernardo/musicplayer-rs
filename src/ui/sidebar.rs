@@ -42,7 +42,7 @@ struct SidebarInner {
 
 impl Sidebar {
     pub fn new() -> Self {
-        let all_btn = Button::with_label("All Tracks");
+        let all_btn = Button::with_label("Library");
         all_btn.add_css_class("flat");
         all_btn.set_margin_start(4);
         all_btn.set_margin_end(4);

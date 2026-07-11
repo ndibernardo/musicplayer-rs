@@ -35,6 +35,7 @@ use crate::library::album::AlbumSort;
 use crate::library::album::AlbumSortField;
 use crate::library::album::ArtKey;
 use crate::library::album::SortDirection;
+use crate::library::column::ColumnPrefs;
 use crate::library::db::Db;
 use crate::library::db::LibraryFolder;
 use crate::library::filter::LibraryFilter;
@@ -59,6 +60,7 @@ use crate::player::PlayerCommand;
 use crate::player::PlayerHandle;
 use crate::player::SeekPosition;
 use crate::ui::album_grid::AlbumGrid;
+use crate::ui::column_picker::ColumnPicker;
 use crate::ui::edit_dialog;
 use crate::ui::library_view::LibraryView;
 use crate::ui::player_bar::PlayerBar;
@@ -127,6 +129,7 @@ struct InitialSettings {
     queue_position_ms: u64,
     window_size: Option<(i32, i32)>,
     window_maximized: bool,
+    column_prefs: ColumnPrefs,
 }
 
 impl InitialSettings {
@@ -142,6 +145,7 @@ impl InitialSettings {
             queue_position_ms: s.queue_position_millis(),
             window_size: s.window_size(),
             window_maximized: s.window_maximized(),
+            column_prefs: s.column_prefs(),
         }
     }
 }
@@ -221,19 +225,26 @@ impl Context {
         wire_sort_controls(&sort_field, &sort_dir, initial.sort, &tx);
         let size_scale = build_size_scale();
         let (list_toggle, grid_toggle) = build_view_toggles();
+        let column_picker = ColumnPicker::new(initial.column_prefs.clone());
+        wire_column_picker(&column_picker, &tx);
         header.pack_start(&sort_controls);
         header.pack_end(&size_scale);
         header.pack_end(&grid_toggle);
         header.pack_end(&list_toggle);
+        header.pack_end(&column_picker.widget);
 
-        // Shows or hides both grid-only control groups together.
+        // Shows or hides both grid-only control groups together, and the
+        // list-only column picker inversely — it has nothing to configure
+        // in grid view, which shows album summaries, not table columns.
         let toggle_grid_controls: Rc<dyn Fn(ViewMode)> = {
             let sort_controls = sort_controls.clone();
             let size_scale = size_scale.clone();
+            let column_picker_widget = column_picker.widget.clone();
             Rc::new(move |mode: ViewMode| {
-                let visible = matches!(mode, ViewMode::Grid);
-                sort_controls.set_visible(visible);
-                size_scale.set_visible(visible);
+                let grid_visible = matches!(mode, ViewMode::Grid);
+                sort_controls.set_visible(grid_visible);
+                size_scale.set_visible(grid_visible);
+                column_picker_widget.set_visible(!grid_visible);
             })
         };
 
@@ -253,7 +264,7 @@ impl Context {
         wire_queue_view(&queue_view, &tx);
         let sidebar = build_sidebar_box(&filter_sidebar, &queue_view, &folder_list, &status_label);
 
-        let library_view = LibraryView::new();
+        let library_view = LibraryView::new(&initial.column_prefs);
         wire_library_view(&library_view, &db, &db_path, &window, &status_label, &tx);
 
         let album_grid = AlbumGrid::new();
@@ -361,6 +372,15 @@ impl Context {
             WindowMessage::CoverSizeChanged(size) => {
                 self.album_grid.set_cover_size(*size);
                 self.settings().set_cover_size(*size);
+            }
+            WindowMessage::ColumnPrefsChanged(prefs) => {
+                self.library_view.set_column_prefs(prefs);
+                self.settings().set_column_prefs(prefs);
+            }
+            WindowMessage::ColumnWidthChanged(field, width) => {
+                // The header drag already resized the column natively — no
+                // need to rebuild `library_view`, just persist the result.
+                self.settings().set_column_width(*field, Some(*width));
             }
             WindowMessage::VolumeChanged(percent) => {
                 self.settings().set_volume(*percent);
@@ -781,6 +801,14 @@ fn wire_cover_size(
     });
 }
 
+/// Wires the column picker's change callback to send the new prefs onward.
+fn wire_column_picker(column_picker: &ColumnPicker, tx: &Sender<WindowMessage>) {
+    let tx = tx.clone();
+    column_picker.connect_changed(move |prefs| {
+        let _ = tx.send_blocking(WindowMessage::ColumnPrefsChanged(prefs));
+    });
+}
+
 /// Restores the active view and wires the list/grid toggle buttons.
 fn wire_view_toggles(
     list_toggle: &ToggleButton,
@@ -887,6 +915,11 @@ fn wire_library_view(
     let tx_tracks_enqueue = tx.clone();
     library_view.connect_tracks_enqueue(move |tracks| {
         let _ = tx_tracks_enqueue.send_blocking(WindowMessage::AppendToQueue(tracks));
+    });
+
+    let tx_resized = tx.clone();
+    library_view.connect_column_resized(move |field, width| {
+        let _ = tx_resized.send_blocking(WindowMessage::ColumnWidthChanged(field, width));
     });
 
     let db_edit = Rc::clone(db);

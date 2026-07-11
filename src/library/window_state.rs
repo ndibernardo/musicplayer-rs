@@ -1,8 +1,10 @@
 use crate::library::album::AlbumSort;
 use crate::library::album::AlbumSortField;
 use crate::library::album::SortDirection;
+use crate::library::column::ColumnPrefs;
 use crate::library::db::LibraryFolder;
 use crate::library::filter::LibraryFilter;
+use crate::library::format::TrackField;
 use crate::library::metadata_edit::EditOutcome;
 use crate::library::scan::ScanEvent;
 use crate::library::track::Track;
@@ -32,6 +34,9 @@ pub enum WindowMessage {
     SortDirectionChanged(SortDirection),
     ViewModeChanged(ViewMode),
     CoverSizeChanged(i32),
+    ColumnPrefsChanged(ColumnPrefs),
+    /// A column header was dragged to a new width.
+    ColumnWidthChanged(TrackField, i32),
     VolumeChanged(f64),
     /// Replaces the queue with `Vec<Track>` at the given start index and plays it.
     Enqueue(Vec<Track>, usize),
@@ -90,6 +95,8 @@ pub fn reduce(state: WindowState, msg: &WindowMessage) -> WindowState {
         // follows a PlayerCommand — see Context::apply.
         WindowMessage::ViewModeChanged(_)
         | WindowMessage::CoverSizeChanged(_)
+        | WindowMessage::ColumnPrefsChanged(_)
+        | WindowMessage::ColumnWidthChanged(_, _)
         | WindowMessage::VolumeChanged(_)
         | WindowMessage::Enqueue(_, _)
         | WindowMessage::AppendToQueue(_)
@@ -196,6 +203,17 @@ mod tests {
     fn reduce_volume_changed_leaves_state_unchanged() {
         let state = initial_state();
         let next = reduce(state.clone(), &WindowMessage::VolumeChanged(42.0));
+
+        assert_eq!(next, state);
+    }
+
+    #[test]
+    fn reduce_column_width_changed_leaves_state_unchanged() {
+        let state = initial_state();
+        let next = reduce(
+            state.clone(),
+            &WindowMessage::ColumnWidthChanged(TrackField::Duration, 96),
+        );
 
         assert_eq!(next, state);
     }

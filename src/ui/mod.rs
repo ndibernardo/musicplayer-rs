@@ -1,5 +1,6 @@
 mod album_grid;
 mod app;
+mod column_picker;
 mod context_menu;
 mod edit_dialog;
 mod format;

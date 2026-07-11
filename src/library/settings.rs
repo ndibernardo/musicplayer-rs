@@ -1,7 +1,12 @@
 use crate::library::album::AlbumSort;
 use crate::library::album::AlbumSortField;
 use crate::library::album::SortDirection;
+use crate::library::column::ColumnConfig;
+use crate::library::column::ColumnPrefs;
 use crate::library::db::Db;
+use crate::library::format;
+use crate::library::format::FormatExpr;
+use crate::library::format::TrackField;
 use crate::library::track::TrackId;
 use crate::library::view_mode::ViewMode;
 
@@ -24,6 +29,18 @@ pub const VIEW_MODE_KEY: &str = "view_mode";
 const WINDOW_WIDTH_KEY: &str = "window_width";
 const WINDOW_HEIGHT_KEY: &str = "window_height";
 const WINDOW_MAXIMIZED_KEY: &str = "window_maximized";
+
+const COLUMN_ORDER_KEY: &str = "column_order";
+
+/// The settings key holding `field`'s format string.
+fn column_format_key(field: TrackField) -> String {
+    format!("column_format_{}", field.as_key())
+}
+
+/// The settings key holding `field`'s fixed column width in pixels.
+fn column_width_key(field: TrackField) -> String {
+    format!("column_width_{}", field.as_key())
+}
 
 /// A typed façade over the persisted application settings stored in `Db`.
 /// All methods return domain-appropriate defaults when the setting is absent
@@ -154,6 +171,75 @@ impl<'a> Settings<'a> {
         self.set(
             WINDOW_MAXIMIZED_KEY,
             if maximized { "true" } else { "false" },
+        );
+    }
+
+    /// Persisted track-list column preferences: which fields are visible, in
+    /// what order, and each column's format string. Falls back to
+    /// `ColumnPrefs::default()` when unset, when every listed field key is
+    /// unrecognised (forward/backward compat), or when the stored order
+    /// names no field at all.
+    pub fn column_prefs(&self) -> ColumnPrefs {
+        let Some(order) = self.get(COLUMN_ORDER_KEY) else {
+            return ColumnPrefs::default();
+        };
+        let columns: Vec<ColumnConfig> = order
+            .split(',')
+            .filter_map(TrackField::from_key)
+            .map(|field| {
+                let format = self
+                    .get(&column_format_key(field))
+                    .and_then(|raw| format::parse(&raw).ok())
+                    .unwrap_or_else(|| FormatExpr::field_only(field));
+                let width = self.column_width(field);
+                ColumnConfig {
+                    field,
+                    format,
+                    width,
+                }
+            })
+            .collect();
+        if columns.is_empty() {
+            ColumnPrefs::default()
+        } else {
+            ColumnPrefs::new(columns)
+        }
+    }
+
+    /// Persists `prefs`: the visible field order, and every column's format
+    /// string and width — written unconditionally rather than only when
+    /// customized, since comparing against "the default" would need its own
+    /// drift-prone bookkeeping for no real benefit at this scale.
+    pub fn set_column_prefs(&self, prefs: &ColumnPrefs) {
+        let order = prefs
+            .columns()
+            .iter()
+            .map(|c| c.field.as_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.set(COLUMN_ORDER_KEY, &order);
+        for column in prefs.columns() {
+            self.set(&column_format_key(column.field), &column.format.to_string());
+            self.set_column_width(column.field, column.width);
+        }
+    }
+
+    /// Persisted fixed width for `field`'s column, or `None` for GTK's
+    /// natural size (unset, or a stored value that no longer parses).
+    fn column_width(&self, field: TrackField) -> Option<i32> {
+        self.get(&column_width_key(field))
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<i32>().ok())
+    }
+
+    /// Persists `field`'s fixed column width in isolation — used when the
+    /// user drags a header to resize it, so that one change doesn't need a
+    /// full `ColumnPrefs` snapshot (and the caller doesn't need to rebuild
+    /// the column view just to save a width it already applied natively).
+    pub fn set_column_width(&self, field: TrackField, width: Option<i32>) {
+        self.set(
+            &column_width_key(field),
+            &width.map(|w| w.to_string()).unwrap_or_default(),
         );
     }
 
@@ -333,6 +419,91 @@ mod tests {
         let db = fresh();
         Settings::new(&db).set_window_maximized(true);
         assert!(Settings::new(&db).window_maximized());
+    }
+
+    #[test]
+    fn column_prefs_defaults_to_the_original_six_columns_when_unset() {
+        let db = fresh();
+        assert_eq!(Settings::new(&db).column_prefs(), ColumnPrefs::default());
+    }
+
+    #[test]
+    fn column_prefs_round_trips_order_custom_format_and_width() {
+        let db = fresh();
+        let prefs = ColumnPrefs::new(vec![
+            ColumnConfig {
+                field: TrackField::Artist,
+                format: format::parse("%artist% \u{2013} %album%").unwrap(),
+                width: Some(280),
+            },
+            ColumnConfig::default_for(TrackField::Title),
+        ]);
+        Settings::new(&db).set_column_prefs(&prefs);
+        assert_eq!(Settings::new(&db).column_prefs(), prefs);
+    }
+
+    #[test]
+    fn column_prefs_skips_unrecognised_field_keys_in_the_stored_order() {
+        let db = fresh();
+        db.set_setting(COLUMN_ORDER_KEY, "title,not_a_real_field,artist")
+            .unwrap();
+        let fields: Vec<TrackField> = Settings::new(&db)
+            .column_prefs()
+            .columns()
+            .iter()
+            .map(|c| c.field)
+            .collect();
+        assert_eq!(fields, vec![TrackField::Title, TrackField::Artist]);
+    }
+
+    #[test]
+    fn column_prefs_falls_back_to_default_format_when_stored_format_does_not_parse() {
+        let db = fresh();
+        db.set_setting(COLUMN_ORDER_KEY, "title").unwrap();
+        db.set_setting("column_format_title", "%unterminated")
+            .unwrap();
+        let prefs = Settings::new(&db).column_prefs();
+        assert_eq!(
+            prefs.columns()[0].format,
+            ColumnConfig::default_for(TrackField::Title).format
+        );
+    }
+
+    #[test]
+    fn column_prefs_falls_back_to_default_when_every_stored_key_is_unrecognised() {
+        let db = fresh();
+        db.set_setting(COLUMN_ORDER_KEY, "not_a_real_field")
+            .unwrap();
+        assert_eq!(Settings::new(&db).column_prefs(), ColumnPrefs::default());
+    }
+
+    #[test]
+    fn column_prefs_defaults_to_natural_width_when_stored_width_does_not_parse() {
+        let db = fresh();
+        db.set_setting(COLUMN_ORDER_KEY, "title").unwrap();
+        db.set_setting("column_width_title", "not_a_number")
+            .unwrap();
+        let prefs = Settings::new(&db).column_prefs();
+        assert_eq!(prefs.columns()[0].width, None);
+    }
+
+    #[test]
+    fn set_column_width_persists_in_isolation() {
+        let db = fresh();
+        Settings::new(&db).set_column_width(TrackField::Duration, Some(96));
+        assert_eq!(
+            Settings::new(&db).column_width(TrackField::Duration),
+            Some(96)
+        );
+    }
+
+    #[test]
+    fn set_column_width_none_clears_a_previously_stored_width() {
+        let db = fresh();
+        let settings = Settings::new(&db);
+        settings.set_column_width(TrackField::Duration, Some(96));
+        settings.set_column_width(TrackField::Duration, None);
+        assert_eq!(settings.column_width(TrackField::Duration), None);
     }
 
     proptest::proptest! {

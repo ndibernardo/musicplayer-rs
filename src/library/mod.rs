@@ -1,6 +1,8 @@
 pub mod album;
+pub mod column;
 pub mod db;
 pub mod filter;
+pub mod format;
 pub mod metadata;
 pub mod metadata_edit;
 pub mod scan;
