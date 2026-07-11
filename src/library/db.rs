@@ -639,7 +639,7 @@ impl Db {
     }
 
     /// Returns tracks whose genre equals `genre`, ordered by artist, then album, then track number.
-    pub fn tracks_by_genre(&self, genre: &Genre) -> Result<Vec<Track>, DbError> {
+    pub(crate) fn tracks_by_genre(&self, genre: &Genre) -> Result<Vec<Track>, DbError> {
         self.query_tracks(
             "WHERE genre = ?1 ORDER BY artist, album, track_number",
             [genre.as_str()],
@@ -647,7 +647,7 @@ impl Db {
     }
 
     /// Returns tracks by `artist`, ordered by album, then track number.
-    pub fn tracks_by_artist(&self, artist: &Artist) -> Result<Vec<Track>, DbError> {
+    pub(crate) fn tracks_by_artist(&self, artist: &Artist) -> Result<Vec<Track>, DbError> {
         self.query_tracks(
             "WHERE artist = ?1 ORDER BY album, track_number",
             [artist.as_str()],
@@ -655,7 +655,7 @@ impl Db {
     }
 
     /// Returns tracks on `album`, ordered by disc, then track number.
-    pub fn tracks_by_album(&self, album: &AlbumTitle) -> Result<Vec<Track>, DbError> {
+    pub(crate) fn tracks_by_album(&self, album: &AlbumTitle) -> Result<Vec<Track>, DbError> {
         self.query_tracks(
             "WHERE album = ?1 ORDER BY disc_number, track_number",
             [album.as_str()],
@@ -710,30 +710,23 @@ impl Db {
             .collect()
     }
 
-    /// Returns one summary per (album, album artist) pair for the album grid,
-    /// ordered by album artist then album. The album artist is
+    /// Album summaries in `sort` order — one summary per (album, album
+    /// artist) pair for the album grid. The album artist is
     /// `COALESCE(album_artist, artist)`, so a compilation credited to one album
     /// artist collapses to a single entry even when its tracks name different
     /// performers, and a track without an album-artist tag falls back to its own
     /// artist. Genre, year, and cover art are aggregated with `MAX`, which skips
     /// NULLs — so a summary carries art from any track in the group that has it,
     /// even when others don't.
-    pub fn album_summaries(&self) -> Result<Vec<AlbumSummary>, DbError> {
-        self.album_summaries_sorted(&AlbumSort::default())
-    }
-
-    /// Album summaries in `sort` order.
-    pub fn album_summaries_sorted(&self, sort: &AlbumSort) -> Result<Vec<AlbumSummary>, DbError> {
+    pub(crate) fn album_summaries_sorted(
+        &self,
+        sort: &AlbumSort,
+    ) -> Result<Vec<AlbumSummary>, DbError> {
         self.album_summaries_query("", [], sort)
     }
 
-    /// Album summaries whose genre equals `genre`.
-    pub fn album_summaries_by_genre(&self, genre: &Genre) -> Result<Vec<AlbumSummary>, DbError> {
-        self.album_summaries_by_genre_sorted(genre, &AlbumSort::default())
-    }
-
     /// Album summaries whose genre equals `genre`, in `sort` order.
-    pub fn album_summaries_by_genre_sorted(
+    pub(crate) fn album_summaries_by_genre_sorted(
         &self,
         genre: &Genre,
         sort: &AlbumSort,
@@ -741,13 +734,8 @@ impl Db {
         self.album_summaries_query("WHERE genre = ?1", [genre.as_str()], sort)
     }
 
-    /// Album summaries by `artist`.
-    pub fn album_summaries_by_artist(&self, artist: &Artist) -> Result<Vec<AlbumSummary>, DbError> {
-        self.album_summaries_by_artist_sorted(artist, &AlbumSort::default())
-    }
-
     /// Album summaries by `artist`, in `sort` order.
-    pub fn album_summaries_by_artist_sorted(
+    pub(crate) fn album_summaries_by_artist_sorted(
         &self,
         artist: &Artist,
         sort: &AlbumSort,
@@ -755,16 +743,8 @@ impl Db {
         self.album_summaries_query("WHERE artist = ?1", [artist.as_str()], sort)
     }
 
-    /// Album summaries whose album title equals `album`.
-    pub fn album_summaries_by_album(
-        &self,
-        album: &AlbumTitle,
-    ) -> Result<Vec<AlbumSummary>, DbError> {
-        self.album_summaries_by_album_sorted(album, &AlbumSort::default())
-    }
-
     /// Album summaries whose album title equals `album`, in `sort` order.
-    pub fn album_summaries_by_album_sorted(
+    pub(crate) fn album_summaries_by_album_sorted(
         &self,
         album: &AlbumTitle,
         sort: &AlbumSort,
@@ -1446,7 +1426,11 @@ mod tests {
     #[test]
     fn album_summaries_empty_for_fresh_db() {
         let db = Db::open_in_memory().unwrap();
-        assert!(db.album_summaries().unwrap().is_empty());
+        assert!(
+            db.album_summaries_sorted(&AlbumSort::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1457,7 +1441,7 @@ mod tests {
         db.upsert_track(&full_track("/music/boc/aquarius.flac"))
             .unwrap();
 
-        let summaries = db.album_summaries().unwrap();
+        let summaries = db.album_summaries_sorted(&AlbumSort::default()).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(
             summaries[0].album.as_str(),
@@ -1486,7 +1470,12 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(db.album_summaries().unwrap().len(), 2);
+        assert_eq!(
+            db.album_summaries_sorted(&AlbumSort::default())
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -1507,7 +1496,7 @@ mod tests {
         ))
         .unwrap();
 
-        let summaries = db.album_summaries().unwrap();
+        let summaries = db.album_summaries_sorted(&AlbumSort::default()).unwrap();
         assert_eq!(summaries[0].artist.as_str(), "Aphex Twin");
         assert_eq!(summaries[1].artist.as_str(), "Boards of Canada");
     }
@@ -1539,7 +1528,7 @@ mod tests {
         ))
         .unwrap();
 
-        let summaries = db.album_summaries().unwrap();
+        let summaries = db.album_summaries_sorted(&AlbumSort::default()).unwrap();
         assert_eq!(
             summaries.len(),
             1,
@@ -1558,7 +1547,7 @@ mod tests {
         };
         db.upsert_track(&track).unwrap();
 
-        let summaries = db.album_summaries().unwrap();
+        let summaries = db.album_summaries_sorted(&AlbumSort::default()).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].artist.as_str(), "Boards of Canada");
     }
@@ -1581,7 +1570,9 @@ mod tests {
         ))
         .unwrap();
 
-        let jazz = db.album_summaries_by_genre(&Genre::new("Jazz")).unwrap();
+        let jazz = db
+            .album_summaries_by_genre_sorted(&Genre::new("Jazz"), &AlbumSort::default())
+            .unwrap();
         assert_eq!(jazz.len(), 1);
         assert_eq!(jazz[0].album.as_str(), "Kind of Blue");
     }
@@ -1612,7 +1603,10 @@ mod tests {
         .unwrap();
 
         let boc = db
-            .album_summaries_by_artist(&Artist::new("Boards of Canada"))
+            .album_summaries_by_artist_sorted(
+                &Artist::new("Boards of Canada"),
+                &AlbumSort::default(),
+            )
             .unwrap();
         assert_eq!(boc.len(), 2);
     }
@@ -1636,7 +1630,7 @@ mod tests {
         .unwrap();
 
         let geogaddi = db
-            .album_summaries_by_album(&AlbumTitle::new("Geogaddi"))
+            .album_summaries_by_album_sorted(&AlbumTitle::new("Geogaddi"), &AlbumSort::default())
             .unwrap();
         assert_eq!(geogaddi.len(), 1);
         assert_eq!(geogaddi[0].album.as_str(), "Geogaddi");
@@ -1785,7 +1779,7 @@ mod tests {
         // Art is stored per track, not in the track row itself.
         Db::upsert_art_for_track(&db.conn, id, &[0xFF, 0xD8, 0xFF]).unwrap();
 
-        let summaries = db.album_summaries().unwrap();
+        let summaries = db.album_summaries_sorted(&AlbumSort::default()).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].art, CoverArt::Available(mhtrtc_key()));
     }
@@ -1796,7 +1790,7 @@ mod tests {
         db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
             .unwrap();
 
-        let summaries = db.album_summaries().unwrap();
+        let summaries = db.album_summaries_sorted(&AlbumSort::default()).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].art, CoverArt::Absent);
     }
