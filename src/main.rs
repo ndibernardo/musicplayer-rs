@@ -46,7 +46,8 @@ fn data_dir() -> std::path::PathBuf {
     let base = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/share")
+            let home = std::env::var("HOME").expect("HOME or XDG_DATA_HOME must be set");
+            std::path::PathBuf::from(home).join(".local/share")
         });
     let dir = base.join("musicplayer-rs");
     let _ = std::fs::create_dir_all(&dir);
