@@ -530,7 +530,13 @@ impl Context {
     /// Re-arms the folder watcher for the current folder set.
     fn rewatch(&self, watcher: &mut Option<FolderWatcher>) {
         *watcher = None;
-        let folders = self.db.list_folders().unwrap_or_default();
+        let folders = match self.db.list_folders() {
+            Ok(f) => f,
+            Err(e) => {
+                self.status_label.set_text(&format!("Error: {e}"));
+                return;
+            }
+        };
         if folders.is_empty() {
             return;
         }
@@ -655,7 +661,14 @@ impl Context {
         while let Some(child) = list.first_child() {
             list.remove(&child);
         }
-        for folder in self.db.list_folders().unwrap_or_default() {
+        let folders = match self.db.list_folders() {
+            Ok(f) => f,
+            Err(e) => {
+                self.status_label.set_text(&format!("Error: {e}"));
+                return;
+            }
+        };
+        for folder in folders {
             list.append(&folder_row(folder, &self.tx));
         }
     }
