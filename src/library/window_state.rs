@@ -3,6 +3,7 @@ use crate::library::album::AlbumSortField;
 use crate::library::album::SortDirection;
 use crate::library::column::ColumnPrefs;
 use crate::library::db::LibraryFolder;
+use crate::library::filter::FilterField;
 use crate::library::filter::LibraryFilter;
 use crate::library::format::TrackField;
 use crate::library::metadata_edit::EditOutcome;
@@ -30,6 +31,9 @@ pub struct WindowState {
 #[derive(Debug)]
 pub enum WindowMessage {
     FilterSelected(LibraryFilter),
+    /// The user added or removed a browsable filter category in the sidebar's
+    /// filter picker.
+    SidebarFieldsChanged(Vec<FilterField>),
     SortFieldChanged(AlbumSortField),
     SortDirectionChanged(SortDirection),
     ViewModeChanged(ViewMode),
@@ -93,7 +97,8 @@ pub fn reduce(state: WindowState, msg: &WindowMessage) -> WindowState {
         // (cover size, volume, view mode, scan/folder events) or is applied to
         // WindowState.queue indirectly via the PlayerQueueChanged echo that
         // follows a PlayerCommand — see Context::apply.
-        WindowMessage::ViewModeChanged(_)
+        WindowMessage::SidebarFieldsChanged(_)
+        | WindowMessage::ViewModeChanged(_)
         | WindowMessage::CoverSizeChanged(_)
         | WindowMessage::ColumnPrefsChanged(_)
         | WindowMessage::ColumnWidthChanged(_, _)
@@ -203,6 +208,17 @@ mod tests {
     fn reduce_volume_changed_leaves_state_unchanged() {
         let state = initial_state();
         let next = reduce(state.clone(), &WindowMessage::VolumeChanged(42.0));
+
+        assert_eq!(next, state);
+    }
+
+    #[test]
+    fn reduce_sidebar_fields_changed_leaves_state_unchanged() {
+        let state = initial_state();
+        let next = reduce(
+            state.clone(),
+            &WindowMessage::SidebarFieldsChanged(vec![FilterField::Genre, FilterField::Year]),
+        );
 
         assert_eq!(next, state);
     }

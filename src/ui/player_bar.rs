@@ -10,7 +10,6 @@ use gtk4::Image;
 use gtk4::Label;
 use gtk4::Orientation;
 use gtk4::Scale;
-use gtk4::glib::markup_escape_text;
 use gtk4::prelude::*;
 
 use crate::library::track::Track;
@@ -19,8 +18,11 @@ use crate::player::PlayerCommand;
 use crate::player::PlayerHandle;
 use crate::player::SeekPosition;
 use crate::player::Volume;
-use crate::ui::format::display_title;
 use crate::ui::format::format_duration_secs;
+use crate::ui::format::track_markup;
+use crate::ui::style;
+use crate::ui::style::StyleClass;
+use crate::ui::widgets::AppIcon;
 
 /// Bar containing transport controls, track info, and volume.
 #[derive(Clone)]
@@ -45,11 +47,11 @@ pub struct PlayerBar {
 impl PlayerBar {
     /// `initial_volume` is a 0–100 percentage restored from settings.
     pub fn new(player: PlayerHandle, initial_volume: f64) -> Self {
-        let prev_btn = Button::from_icon_name("media-skip-backward-symbolic");
+        let prev_btn = Button::from_icon_name(AppIcon::MediaSkipBackward.name());
         prev_btn.set_tooltip_text(Some("Previous track"));
-        let play_pause_btn = Button::from_icon_name("media-playback-start-symbolic");
-        let stop_btn = Button::from_icon_name("media-playback-stop-symbolic");
-        let next_btn = Button::from_icon_name("media-skip-forward-symbolic");
+        let play_pause_btn = Button::from_icon_name(AppIcon::MediaPlaybackStart.name());
+        let stop_btn = Button::from_icon_name(AppIcon::MediaPlaybackStop.name());
+        let next_btn = Button::from_icon_name(AppIcon::MediaSkipForward.name());
         next_btn.set_tooltip_text(Some("Next track"));
 
         let track_label = Label::new(None);
@@ -90,7 +92,7 @@ impl PlayerBar {
         // exact clicked fraction of the track, so it jumps both forward and back
         // (a plain trough click only page-steps, which playback overtakes).
         let progress = Scale::with_range(Orientation::Horizontal, 0.0, 1.0, 1000.0);
-        progress.add_css_class("seek");
+        style::add_class(&progress, StyleClass::Seek);
         progress.set_hexpand(true);
         progress.set_draw_value(false);
         progress.set_valign(gtk4::Align::Center);
@@ -113,7 +115,7 @@ impl PlayerBar {
             progress.add_controller(click);
         }
 
-        let vol_icon = Image::from_icon_name("audio-volume-medium-symbolic");
+        let vol_icon = Image::from_icon_name(AppIcon::AudioVolumeMedium.name());
         let vol_box = GtkBox::new(Orientation::Horizontal, 4);
         vol_box.set_valign(gtk4::Align::Center);
         vol_box.append(&vol_icon);
@@ -137,7 +139,7 @@ impl PlayerBar {
         let widget = GtkBox::new(Orientation::Vertical, 4);
         widget.set_height_request(112);
         widget.add_css_class("toolbar");
-        widget.add_css_class("player-bar");
+        style::add_class(&widget, StyleClass::PlayerBar);
         widget.append(&track_label);
         widget.append(&bottom);
 
@@ -234,7 +236,7 @@ impl PlayerBar {
         match state {
             PlaybackState::Stopped => {
                 self.play_pause_btn
-                    .set_icon_name("media-playback-start-symbolic");
+                    .set_icon_name(AppIcon::MediaPlaybackStart.name());
                 self.track_label.set_text("");
                 self.time_label.set_text("0:00");
                 self.total_label.set_text("0:00");
@@ -242,17 +244,17 @@ impl PlayerBar {
             }
             PlaybackState::Playing { position, .. } => {
                 self.play_pause_btn
-                    .set_icon_name("media-playback-pause-symbolic");
+                    .set_icon_name(AppIcon::MediaPlaybackPause.name());
                 self.show_position(*position);
             }
             PlaybackState::Paused { position, .. } => {
                 self.play_pause_btn
-                    .set_icon_name("media-playback-start-symbolic");
+                    .set_icon_name(AppIcon::MediaPlaybackStart.name());
                 self.show_position(*position);
             }
             PlaybackState::Failed { .. } => {
                 self.play_pause_btn
-                    .set_icon_name("media-playback-start-symbolic");
+                    .set_icon_name(AppIcon::MediaPlaybackStart.name());
             }
         }
     }
@@ -264,21 +266,5 @@ impl PlayerBar {
             .set_text(&format_duration_secs(position.as_secs()));
         self.progress
             .set_value(position.as_duration().as_millis() as f64);
-    }
-}
-
-/// Pango markup showing the title large and bold with the artist dimmed beside
-/// it, so the now-playing track stands out. Falls back to the filename when the
-/// title tag is absent.
-fn track_markup(track: &Track) -> String {
-    let raw = display_title(track);
-    let title = markup_escape_text(&raw);
-    if track.artist.is_unknown() {
-        format!("<span size='large' weight='bold'>{title}</span>")
-    } else {
-        let artist = markup_escape_text(track.artist.as_str());
-        format!(
-            "<span size='large' weight='bold'>{title}</span>  <span size='large' alpha='70%'>{artist}</span>"
-        )
     }
 }

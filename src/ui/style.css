@@ -1,0 +1,88 @@
+/* Application stylesheet — the single source of every app-defined CSS class.
+   Class names here must stay in sync with ui::style::StyleClass. */
+
+/* One overlay tint shared by the player bar, an open album's highlight, and
+   the drawer background, so "raised dark surface" is a single color. */
+@define-color app_overlay_bg rgba(0, 0, 0, 0.24);
+
+/* Flat list inside an indented sidebar section. The themed card background
+   never reaches the sidebar's left edge there, so it reads as cut off —
+   stripped here, with the selected row tinted from the theme instead.
+   No :backdrop variant: this app's active GTK theme defines the unfocused
+   selection colors identically to the focused ones, so a rule built on them
+   would parse fine and do nothing visible. */
+list.app-section-list,
+list.app-section-list row {
+    background: none;
+    box-shadow: none;
+}
+list.app-section-list row:hover {
+    background-color: alpha(currentColor, 0.07);
+}
+list.app-section-list row:selected {
+    background-color: @theme_selected_bg_color;
+}
+list.app-section-list row:selected label {
+    font-weight: bold;
+    color: @theme_selected_fg_color;
+}
+
+/* Collapsible section title — bold, so it reads apart from its rows. */
+.app-section-name {
+    font-weight: bold;
+}
+
+/* Sidebar panel title — a size step above the section names under it. */
+.app-sidebar-title {
+    font-weight: bold;
+    font-size: 1.15em;
+}
+
+/* Sidebar panels get a whisper of tint so they read as panels against the
+   content area — currentColor-based, so it adapts to light and dark themes. */
+.app-sidebar {
+    background-color: alpha(currentColor, 0.04);
+}
+
+.player-bar {
+    background-color: @app_overlay_bg;
+}
+.player-bar scale trough {
+    background-color: alpha(currentColor, 0.22);
+    min-height: 6px;
+}
+.player-bar scale.seek slider {
+    min-width: 0;
+    min-height: 0;
+    margin: 0;
+    background: none;
+    border: none;
+    box-shadow: none;
+}
+
+.album-cell {
+    padding: 10px;
+    border-radius: 10px;
+}
+.album-selected {
+    background-color: @app_overlay_bg;
+}
+/* Multi-selection derives from the theme's selection color everywhere —
+   never a hard-coded blue. */
+.album-multi-selected {
+    background-color: alpha(@theme_selected_bg_color, 0.35);
+}
+.album-drawer {
+    background-color: @app_overlay_bg;
+    border-radius: 10px;
+}
+.album-drawer list,
+.album-drawer row {
+    background-color: transparent;
+}
+.album-drawer row:hover {
+    background-color: alpha(currentColor, 0.12);
+}
+.album-drawer row:selected {
+    background-color: alpha(@theme_selected_bg_color, 0.35);
+}

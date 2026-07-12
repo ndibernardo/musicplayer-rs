@@ -1,4 +1,3 @@
-use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -19,17 +18,9 @@ use crate::library::column::ColumnPrefs;
 use crate::library::format;
 use crate::library::format::TrackField;
 use crate::library::track::Track;
-use crate::ui::context_menu::ContextAction;
+use crate::ui::context_menu;
 use crate::ui::context_menu::show_context_menu;
-
-/// Invoked with a single track chosen from a row's "add to queue" context menu.
-type SingleTrackCallback = Rc<dyn Fn(Track)>;
-/// Invoked with every selected track when a batch action is chosen from a
-/// multi-selected row's context menu.
-type MultiTrackCallback = Rc<dyn Fn(Vec<Track>)>;
-/// Invoked with a field and its new fixed width (in px) after the user drags
-/// that column's header to resize it.
-type ColumnResizedCallback = Rc<dyn Fn(TrackField, i32)>;
+use crate::ui::widgets::Callback;
 
 #[derive(Clone)]
 pub struct LibraryView {
@@ -37,11 +28,10 @@ pub struct LibraryView {
     column_view: ColumnView,
     store: ListStore,
     selection: MultiSelection,
-    on_track_enqueue: Rc<OnceCell<SingleTrackCallback>>,
-    on_track_edit: Rc<OnceCell<SingleTrackCallback>>,
-    on_tracks_enqueue: Rc<OnceCell<MultiTrackCallback>>,
-    on_tracks_edit: Rc<OnceCell<MultiTrackCallback>>,
-    on_column_resized: Rc<OnceCell<ColumnResizedCallback>>,
+    on_enqueue: Rc<Callback<Vec<Track>>>,
+    on_edit_requested: Rc<Callback<Vec<Track>>>,
+    /// Fired with a field and its new fixed width (px) after a header drag.
+    on_column_resized: Rc<Callback<(TrackField, i32)>>,
     /// The columns currently appended to `column_view`, so a later
     /// `set_column_prefs` call knows what to remove before rebuilding.
     columns: Rc<RefCell<Vec<ColumnViewColumn>>>,
@@ -82,11 +72,9 @@ impl LibraryView {
             column_view,
             store,
             selection,
-            on_track_enqueue: Rc::new(OnceCell::new()),
-            on_track_edit: Rc::new(OnceCell::new()),
-            on_tracks_enqueue: Rc::new(OnceCell::new()),
-            on_tracks_edit: Rc::new(OnceCell::new()),
-            on_column_resized: Rc::new(OnceCell::new()),
+            on_enqueue: Rc::new(Callback::new()),
+            on_edit_requested: Rc::new(Callback::new()),
+            on_column_resized: Rc::new(Callback::new()),
             columns: Rc::new(RefCell::new(Vec::new())),
         };
         view.set_column_prefs(prefs);
@@ -108,10 +96,8 @@ impl LibraryView {
                 config.field.label(),
                 move |t| format::render(&format_expr, t),
                 &self.selection,
-                Rc::clone(&self.on_track_enqueue),
-                Rc::clone(&self.on_track_edit),
-                Rc::clone(&self.on_tracks_enqueue),
-                Rc::clone(&self.on_tracks_edit),
+                Rc::clone(&self.on_enqueue),
+                Rc::clone(&self.on_edit_requested),
             );
             // Exactly one column — the *last* in the user's order — expands
             // to absorb whatever width the others don't use, so the table
@@ -138,9 +124,7 @@ impl LibraryView {
             let field = config.field;
             let on_column_resized = Rc::clone(&self.on_column_resized);
             column.connect_fixed_width_notify(move |column| {
-                if let Some(callback) = on_column_resized.get() {
-                    callback(field, column.fixed_width());
-                }
+                on_column_resized.emit((field, column.fixed_width()));
             });
             self.column_view.append_column(&column);
             columns.push(column);
@@ -171,34 +155,27 @@ impl LibraryView {
         });
     }
 
-    /// Registers the callback invoked with a single track when "Add to Queue"
-    /// is chosen from a row's right-click menu.
-    pub fn connect_track_enqueue<F: Fn(Track) + 'static>(&self, f: F) {
-        let _ = self.on_track_enqueue.set(Rc::new(f));
+    /// Registers the callback invoked when "Add to Queue" (or, for a
+    /// multi-selected row, "Add N to Queue") is chosen from a row's
+    /// right-click menu — the selected tracks, one element for the singular
+    /// case.
+    pub fn connect_track_enqueue<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
+        self.on_enqueue.set(f);
     }
 
-    /// Registers the callback invoked with a single track when "Edit Track…"
-    /// is chosen from a row's right-click menu.
-    pub fn connect_track_edit_requested<F: Fn(Track) + 'static>(&self, f: F) {
-        let _ = self.on_track_edit.set(Rc::new(f));
-    }
-
-    /// Registers the callback invoked with every selected track when "Add N
-    /// to Queue" is chosen from a multi-selected row's right-click menu.
-    pub fn connect_tracks_enqueue<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
-        let _ = self.on_tracks_enqueue.set(Rc::new(f));
-    }
-
-    /// Registers the callback invoked with every selected track when "Edit N
-    /// Tracks…" is chosen from a multi-selected row's right-click menu.
-    pub fn connect_tracks_edit_requested<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
-        let _ = self.on_tracks_edit.set(Rc::new(f));
+    /// Registers the callback invoked when "Edit Track…" (or, for a
+    /// multi-selected row, "Edit N Tracks…") is chosen from a row's
+    /// right-click menu — the selected tracks, one element for the singular
+    /// case.
+    pub fn connect_track_edit_requested<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
+        self.on_edit_requested.set(f);
     }
 
     /// Registers the callback invoked with a field and its new fixed width
     /// after the user drags that column's header to resize it.
     pub fn connect_column_resized<F: Fn(TrackField, i32) + 'static>(&self, f: F) {
-        let _ = self.on_column_resized.set(Rc::new(f));
+        self.on_column_resized
+            .set(move |(field, width)| f(field, width));
     }
 }
 
@@ -225,10 +202,8 @@ fn text_column<F>(
     title: &str,
     extract: F,
     selection: &MultiSelection,
-    on_enqueue: Rc<OnceCell<SingleTrackCallback>>,
-    on_edit: Rc<OnceCell<SingleTrackCallback>>,
-    on_tracks_enqueue: Rc<OnceCell<MultiTrackCallback>>,
-    on_tracks_edit: Rc<OnceCell<MultiTrackCallback>>,
+    on_enqueue: Rc<Callback<Vec<Track>>>,
+    on_edit: Rc<Callback<Vec<Track>>>,
 ) -> ColumnViewColumn
 where
     F: Fn(&Track) -> String + 'static,
@@ -255,8 +230,6 @@ where
         let selection = selection.clone();
         let on_enqueue = Rc::clone(&on_enqueue);
         let on_edit = Rc::clone(&on_edit);
-        let on_tracks_enqueue = Rc::clone(&on_tracks_enqueue);
-        let on_tracks_edit = Rc::clone(&on_tracks_edit);
         let label_widget = label.clone().upcast::<Widget>();
         gesture.connect_pressed(move |_, _, x, y| {
             let Some(item) = item_weak.upgrade() else {
@@ -267,38 +240,16 @@ where
             };
             let track = data.borrow::<Track>().clone();
             let position = item.position();
-            let mut actions: Vec<ContextAction> = Vec::new();
-            if selection.is_selected(position) && selection.selection().size() > 1 {
-                let tracks = selected_tracks(&selection);
-                if let Some(callback) = on_tracks_enqueue.get().cloned() {
-                    let tracks = tracks.clone();
-                    let label = format!("Add {} to Queue", tracks.len());
-                    actions.push((label, Box::new(move || callback(tracks.clone()))));
-                }
-                if let Some(callback) = on_tracks_edit.get().cloned() {
-                    let tracks = tracks.clone();
-                    let label = format!("Edit {} Tracks…", tracks.len());
-                    actions.push((label, Box::new(move || callback(tracks.clone()))));
-                }
+            let batch = if selection.is_selected(position) && selection.selection().size() > 1 {
+                Some(selected_tracks(&selection))
             } else {
                 // Right-clicking outside the current selection collapses it
                 // to just this row — standard file-manager convention.
                 selection.select_item(position, true);
-                if let Some(callback) = on_enqueue.get().cloned() {
-                    let track = track.clone();
-                    actions.push((
-                        "Add to Queue".to_string(),
-                        Box::new(move || callback(track.clone())),
-                    ));
-                }
-                if let Some(callback) = on_edit.get().cloned() {
-                    let track = track.clone();
-                    actions.push((
-                        "Edit Track…".to_string(),
-                        Box::new(move || callback(track.clone())),
-                    ));
-                }
-            }
+                None
+            };
+            let actions =
+                context_menu::track_actions(&track, batch, on_enqueue.handler(), on_edit.handler());
             show_context_menu(&label_widget, x, y, actions);
         });
         label.add_controller(gesture);

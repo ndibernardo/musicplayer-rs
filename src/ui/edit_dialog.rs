@@ -26,6 +26,9 @@ use crate::library::track::Track;
 use crate::library::track::TrackNumber;
 use crate::library::track::Year;
 use crate::ui::album_grid::decode_and_scale;
+use crate::ui::style;
+use crate::ui::style::Margins;
+use crate::ui::style::spacing;
 
 /// Side length (px) the preview cover is decoded and shown at. A one-off
 /// main-thread decode is fine here — a single image, on explicit user action.
@@ -85,10 +88,7 @@ fn open_editor(
         .build();
 
     let root = GtkBox::new(Orientation::Vertical, 12);
-    root.set_margin_top(16);
-    root.set_margin_bottom(16);
-    root.set_margin_start(16);
-    root.set_margin_end(16);
+    style::set_margins(&root, Margins::all(spacing::XL));
 
     let cover = Image::new();
     cover.set_pixel_size(PREVIEW_COVER_SIZE);

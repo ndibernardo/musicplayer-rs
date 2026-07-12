@@ -6,7 +6,6 @@ use std::rc::Rc;
 
 use gtk4::Align;
 use gtk4::Box as GtkBox;
-use gtk4::Button;
 use gtk4::GestureClick;
 use gtk4::Image;
 use gtk4::Label;
@@ -30,9 +29,19 @@ use crate::library::album::ArtKey;
 use crate::library::album::CoverArt;
 use crate::library::track::AlbumArtData;
 use crate::library::track::Track;
-use crate::ui::context_menu::ContextAction;
+use crate::ui::context_menu;
 use crate::ui::context_menu::show_context_menu;
+use crate::ui::format;
 use crate::ui::format::format_duration;
+use crate::ui::style;
+use crate::ui::style::StyleClass;
+use crate::ui::widgets::AppIcon;
+use crate::ui::widgets::Callback;
+use crate::ui::widgets::body_label;
+use crate::ui::widgets::caption_label;
+use crate::ui::widgets::flat_icon_button;
+use crate::ui::widgets::numeric_dim_label;
+use crate::ui::widgets::remove_all_children;
 
 /// Column count before the first width-driven reflow. The grid is hand-built
 /// (not a `GridView`) so a full-width track drawer can be inserted between rows;
@@ -58,13 +67,11 @@ const DEFAULT_COVER_SIZE: i32 = 200;
 const COVER_DECODE_SIZE: i32 = crate::library::settings::COVER_SIZE_MAX;
 
 type TrackProvider = Rc<dyn Fn(&AlbumSummary) -> Vec<Track>>;
-/// Invoked with the album's full track list and the index of the activated one,
-/// so the caller can enqueue the whole album starting at that track.
-type TrackCallback = Rc<dyn Fn(Vec<Track>, usize)>;
-/// Invoked with an album's full track list when its cover is opened.
-type AlbumCallback = Rc<dyn Fn(Vec<Track>)>;
-/// Invoked with a single track chosen from a "add to queue" context menu.
-type SingleTrackCallback = Rc<dyn Fn(Track)>;
+/// A registered handler for "the album's full track list plus the index of
+/// the activated track", as handed out by `Callback::handler`.
+type TrackHandler = Rc<dyn Fn((Vec<Track>, usize))>;
+/// A registered handler for an album's full track list.
+type AlbumHandler = Rc<dyn Fn(Vec<Track>)>;
 /// Fetches an album's cover art bytes, called only on a texture-cache miss.
 type ArtProvider = Rc<dyn Fn(&ArtKey) -> Option<AlbumArtData>>;
 
@@ -132,17 +139,15 @@ struct AlbumGridInner {
     art_request_tx: async_channel::Sender<(ArtKey, AlbumArtData)>,
     art_provider: OnceCell<ArtProvider>,
     track_provider: OnceCell<TrackProvider>,
-    on_track_activated: OnceCell<TrackCallback>,
-    on_album_activated: OnceCell<AlbumCallback>,
-    on_album_enqueue: OnceCell<AlbumCallback>,
-    on_track_enqueue: OnceCell<SingleTrackCallback>,
-    on_album_edit: OnceCell<AlbumCallback>,
-    on_track_edit: OnceCell<SingleTrackCallback>,
-    // Batch actions for a multi-selected subset of one open drawer's tracks.
-    // `AlbumCallback` (`Rc<dyn Fn(Vec<Track>)>`) already has the right shape —
-    // no new type needed.
-    on_tracks_enqueue: OnceCell<AlbumCallback>,
-    on_tracks_edit: OnceCell<AlbumCallback>,
+    on_track_activated: Callback<(Vec<Track>, usize)>,
+    on_album_activated: Callback<Vec<Track>>,
+    on_album_enqueue: Callback<Vec<Track>>,
+    on_album_edit: Callback<Vec<Track>>,
+    // A drawer row's enqueue/edit action — the selected tracks, one element
+    // for a singular click, the whole multi-selection for a batch one. See
+    // `context_menu::track_actions`.
+    on_track_enqueue: Callback<Vec<Track>>,
+    on_track_edit: Callback<Vec<Track>>,
 }
 
 impl AlbumGrid {
@@ -176,14 +181,12 @@ impl AlbumGrid {
             art_request_tx,
             art_provider: OnceCell::new(),
             track_provider: OnceCell::new(),
-            on_track_activated: OnceCell::new(),
-            on_album_activated: OnceCell::new(),
-            on_album_enqueue: OnceCell::new(),
-            on_track_enqueue: OnceCell::new(),
-            on_album_edit: OnceCell::new(),
-            on_track_edit: OnceCell::new(),
-            on_tracks_enqueue: OnceCell::new(),
-            on_tracks_edit: OnceCell::new(),
+            on_track_activated: Callback::new(),
+            on_album_activated: Callback::new(),
+            on_album_enqueue: Callback::new(),
+            on_album_edit: Callback::new(),
+            on_track_enqueue: Callback::new(),
+            on_track_edit: Callback::new(),
         });
 
         let grid = Self {
@@ -225,9 +228,7 @@ impl AlbumGrid {
 
     /// Rebuilds the cover grid and closes any open drawer.
     pub fn set_albums(&self, albums: Vec<AlbumSummary>) {
-        while let Some(child) = self.inner.grid_box.first_child() {
-            self.inner.grid_box.remove(&child);
-        }
+        remove_all_children(&self.inner.grid_box);
 
         let cells: Vec<AlbumCell> = albums
             .into_iter()
@@ -286,9 +287,7 @@ impl AlbumGrid {
         for cell in &cell_widgets {
             cell.unparent();
         }
-        while let Some(child) = self.inner.grid_box.first_child() {
-            self.inner.grid_box.remove(&child);
-        }
+        remove_all_children(&self.inner.grid_box);
         self.lay_out(columns);
     }
 
@@ -357,49 +356,43 @@ impl AlbumGrid {
     /// Registers the callback invoked when a track inside a drawer is activated.
     /// It receives the album's full track list and the activated track's index.
     pub fn connect_track_activated<F: Fn(Vec<Track>, usize) + 'static>(&self, f: F) {
-        let _ = self.inner.on_track_activated.set(Rc::new(f));
+        self.inner
+            .on_track_activated
+            .set(move |(tracks, index)| f(tracks, index));
     }
 
     /// Registers the callback invoked with an album's tracks when its cover is
     /// opened, so the caller can enqueue the whole album.
     pub fn connect_album_activated<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
-        let _ = self.inner.on_album_activated.set(Rc::new(f));
+        self.inner.on_album_activated.set(f);
     }
 
     /// Registers the callback invoked with an album's tracks when "Add to
     /// Queue" is chosen from a cover's right-click menu.
     pub fn connect_album_enqueue<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
-        let _ = self.inner.on_album_enqueue.set(Rc::new(f));
+        self.inner.on_album_enqueue.set(f);
     }
 
-    /// Registers the callback invoked with a single track when "Add to Queue"
-    /// is chosen from a drawer row's right-click menu.
-    pub fn connect_track_enqueue<F: Fn(Track) + 'static>(&self, f: F) {
-        let _ = self.inner.on_track_enqueue.set(Rc::new(f));
+    /// Registers the callback invoked when "Add to Queue" (or, for a
+    /// multi-selected row, "Add N to Queue") is chosen from a drawer row's
+    /// right-click menu — the selected tracks, one element for the singular
+    /// case.
+    pub fn connect_track_enqueue<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
+        self.inner.on_track_enqueue.set(f);
     }
 
     /// Registers the callback invoked with an album's tracks when "Edit
     /// Album…" is chosen from a cover's right-click menu.
     pub fn connect_album_edit_requested<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
-        let _ = self.inner.on_album_edit.set(Rc::new(f));
+        self.inner.on_album_edit.set(f);
     }
 
-    /// Registers the callback invoked with a single track when "Edit Track…"
-    /// is chosen from a drawer row's right-click menu.
-    pub fn connect_track_edit_requested<F: Fn(Track) + 'static>(&self, f: F) {
-        let _ = self.inner.on_track_edit.set(Rc::new(f));
-    }
-
-    /// Registers the callback invoked with every selected track when "Add N
-    /// to Queue" is chosen from a multi-selected drawer row's right-click menu.
-    pub fn connect_tracks_enqueue<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
-        let _ = self.inner.on_tracks_enqueue.set(Rc::new(f));
-    }
-
-    /// Registers the callback invoked with every selected track when "Edit N
-    /// Tracks…" is chosen from a multi-selected drawer row's right-click menu.
-    pub fn connect_tracks_edit_requested<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
-        let _ = self.inner.on_tracks_edit.set(Rc::new(f));
+    /// Registers the callback invoked when "Edit Track…" (or, for a
+    /// multi-selected row, "Edit N Tracks…") is chosen from a drawer row's
+    /// right-click menu — the selected tracks, one element for the singular
+    /// case.
+    pub fn connect_track_edit_requested<F: Fn(Vec<Track>) + 'static>(&self, f: F) {
+        self.inner.on_track_edit.set(f);
     }
 
     /// Resizes every cover in place to `size` px, then reflows since a different
@@ -439,23 +432,19 @@ impl AlbumGrid {
             }
         }
 
-        let album_label = Label::new(Some(summary.album.as_str()));
-        album_label.set_xalign(0.0);
+        let album_label = body_label(summary.album.as_str());
         album_label.set_max_width_chars(16);
-        album_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         album_label.add_css_class("heading");
 
         // Full opacity (no dim-label) so the artist reads clearly under the album.
-        let artist_label = Label::new(Some(summary.artist.as_str()));
-        artist_label.set_xalign(0.0);
+        let artist_label = body_label(summary.artist.as_str());
         artist_label.set_max_width_chars(16);
-        artist_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
         let cell = GtkBox::new(Orientation::Vertical, 4);
         cell.add_css_class("activatable");
-        // Padding is reserved unconditionally so toggling `album-selected` only
+        // Padding is reserved unconditionally so toggling `AlbumSelected` only
         // repaints the background — it never resizes the cell and shifts the grid.
-        cell.add_css_class("album-cell");
+        style::add_class(&cell, StyleClass::AlbumCell);
         // Pin the cell to the cover width so labels ellipsize instead of widening it.
         cell.set_width_request(size);
         cell.set_halign(Align::Start);
@@ -463,11 +452,7 @@ impl AlbumGrid {
         cell.append(&album_label);
         cell.append(&artist_label);
         if !summary.year.is_unknown() {
-            let year_label = Label::new(Some(&summary.year.value().to_string()));
-            year_label.set_xalign(0.0);
-            year_label.add_css_class("dim-label");
-            year_label.add_css_class("caption");
-            cell.append(&year_label);
+            cell.append(&caption_label(&summary.year.value().to_string()));
         }
 
         // Plain click opens the track drawer without playing (the album is
@@ -536,9 +521,9 @@ impl AlbumGrid {
             if tracks.is_empty() {
                 return;
             }
-            let on_enqueue = this.inner.on_album_enqueue.get().cloned();
+            let on_enqueue = this.inner.on_album_enqueue.handler();
             let enqueue_tracks = tracks.clone();
-            let on_edit = this.inner.on_album_edit.get().cloned();
+            let on_edit = this.inner.on_album_edit.handler();
             let (enqueue_label, edit_label) = match album_count {
                 Some(n) => (
                     format!("Add {n} Albums to Queue"),
@@ -587,9 +572,9 @@ impl AlbumGrid {
         };
         for (i, cell) in cell_widgets.iter().enumerate() {
             if Some(i) == index {
-                cell.add_css_class("album-selected");
+                style::add_class(cell, StyleClass::AlbumSelected);
             } else {
-                cell.remove_css_class("album-selected");
+                style::remove_class(cell, StyleClass::AlbumSelected);
             }
         }
     }
@@ -669,9 +654,9 @@ impl AlbumGrid {
         };
         for (i, cell) in cell_widgets.iter().enumerate() {
             if selected.contains(&i) {
-                cell.add_css_class("album-multi-selected");
+                style::add_class(cell, StyleClass::AlbumMultiSelected);
             } else {
-                cell.remove_css_class("album-multi-selected");
+                style::remove_class(cell, StyleClass::AlbumMultiSelected);
             }
         }
     }
@@ -725,12 +710,10 @@ impl AlbumGrid {
             .as_ref()
             .and_then(|key| self.inner.state.borrow().texture_cache.get(key).cloned());
         let callbacks = DrawerCallbacks {
-            on_track: self.inner.on_track_activated.get().cloned(),
-            on_album: self.inner.on_album_activated.get().cloned(),
-            on_track_enqueue: self.inner.on_track_enqueue.get().cloned(),
-            on_track_edit: self.inner.on_track_edit.get().cloned(),
-            on_tracks_enqueue: self.inner.on_tracks_enqueue.get().cloned(),
-            on_tracks_edit: self.inner.on_tracks_edit.get().cloned(),
+            on_track: self.inner.on_track_activated.handler(),
+            on_album: self.inner.on_album_activated.handler(),
+            on_enqueue: self.inner.on_track_enqueue.handler(),
+            on_edit: self.inner.on_track_edit.handler(),
         };
         let (drawer_widget, cover, drawer_list) =
             build_drawer(&summary, tracks, callbacks, cached.as_ref());
@@ -767,12 +750,13 @@ const DRAWER_COVER_SIZE: i32 = 160;
 /// The callbacks a drawer's rows and header can dispatch to, grouped since
 /// `build_drawer` would otherwise take too many parameters.
 struct DrawerCallbacks {
-    on_track: Option<TrackCallback>,
-    on_album: Option<AlbumCallback>,
-    on_track_enqueue: Option<SingleTrackCallback>,
-    on_track_edit: Option<SingleTrackCallback>,
-    on_tracks_enqueue: Option<AlbumCallback>,
-    on_tracks_edit: Option<AlbumCallback>,
+    on_track: Option<TrackHandler>,
+    on_album: Option<AlbumHandler>,
+    // A row's enqueue/edit action — the selected tracks, one element for a
+    // singular click, the whole multi-selection for a batch one. See
+    // `context_menu::track_actions`.
+    on_enqueue: Option<AlbumHandler>,
+    on_edit: Option<AlbumHandler>,
 }
 
 /// Builds the inline drawer: the album cover on the left, and on the right a
@@ -789,24 +773,20 @@ fn build_drawer(
     let DrawerCallbacks {
         on_track,
         on_album,
-        on_track_enqueue,
-        on_track_edit,
-        on_tracks_enqueue,
-        on_tracks_edit,
+        on_enqueue,
+        on_edit,
     } = callbacks;
     let container = GtkBox::new(Orientation::Vertical, 0);
     container.set_hexpand(true);
 
-    let play_btn = Button::from_icon_name("media-playback-start-symbolic");
-    play_btn.add_css_class("flat");
-    play_btn.set_tooltip_text(Some("Play album"));
+    let play_btn = flat_icon_button(AppIcon::MediaPlaybackStart, "Play album");
     play_btn.set_valign(Align::Center);
     if let Some(callback) = on_album {
         let album_tracks = tracks.clone();
         play_btn.connect_clicked(move |_| callback(album_tracks.clone()));
     }
 
-    let heading = Label::new(Some(&drawer_heading(summary)));
+    let heading = Label::new(Some(&format::drawer_heading(summary)));
     heading.set_xalign(0.0);
     heading.add_css_class("heading");
 
@@ -826,10 +806,7 @@ fn build_drawer(
     list.set_activate_on_single_click(false);
     for (row_index, track) in tracks.iter().enumerate() {
         let row = track_row(track);
-        let wants_menu = on_track_enqueue.is_some()
-            || on_track_edit.is_some()
-            || on_tracks_enqueue.is_some()
-            || on_tracks_edit.is_some();
+        let wants_menu = on_enqueue.is_some() || on_edit.is_some();
         if wants_menu {
             let context_gesture = GestureClick::new();
             context_gesture.set_button(gtk4::gdk::BUTTON_SECONDARY);
@@ -838,58 +815,31 @@ fn build_drawer(
             let row_widget = row.clone().upcast::<Widget>();
             let list_for_gesture = list.clone();
             let all_tracks = tracks.clone();
-            let on_enqueue = on_track_enqueue.clone();
-            let on_edit = on_track_edit.clone();
-            let on_batch_enqueue = on_tracks_enqueue.clone();
-            let on_batch_edit = on_tracks_edit.clone();
+            let on_enqueue = on_enqueue.clone();
+            let on_edit = on_edit.clone();
             context_gesture.connect_pressed(move |_, _, x, y| {
                 let selected: Vec<usize> = list_for_gesture
                     .selected_rows()
                     .iter()
                     .map(|r| r.index() as usize)
                     .collect();
-                let mut actions: Vec<ContextAction> = Vec::new();
-                if selected.contains(&row_index) && selected.len() > 1 {
+                let batch = if selected.contains(&row_index) && selected.len() > 1 {
                     let mut ordered = selected.clone();
                     ordered.sort_unstable();
-                    let batch: Vec<Track> = ordered
-                        .iter()
-                        .filter_map(|&i| all_tracks.get(i).cloned())
-                        .collect();
-                    let n = batch.len();
-                    if let Some(callback) = on_batch_enqueue.clone() {
-                        let batch = batch.clone();
-                        actions.push((
-                            format!("Add {n} to Queue"),
-                            Box::new(move || callback(batch.clone())),
-                        ));
-                    }
-                    if let Some(callback) = on_batch_edit.clone() {
-                        let batch = batch.clone();
-                        actions.push((
-                            format!("Edit {n} Tracks…"),
-                            Box::new(move || callback(batch.clone())),
-                        ));
-                    }
+                    Some(
+                        ordered
+                            .iter()
+                            .filter_map(|&i| all_tracks.get(i).cloned())
+                            .collect(),
+                    )
                 } else {
                     // Right-clicking outside the current selection collapses
                     // it to just this row — standard file-manager convention.
                     list_for_gesture.select_row(Some(&row_for_select));
-                    if let Some(callback) = on_enqueue.clone() {
-                        let track = track.clone();
-                        actions.push((
-                            "Add to Queue".to_string(),
-                            Box::new(move || callback(track.clone())),
-                        ));
-                    }
-                    if let Some(callback) = on_edit.clone() {
-                        let track = track.clone();
-                        actions.push((
-                            "Edit Track…".to_string(),
-                            Box::new(move || callback(track.clone())),
-                        ));
-                    }
-                }
+                    None
+                };
+                let actions =
+                    context_menu::track_actions(&track, batch, on_enqueue.clone(), on_edit.clone());
                 show_context_menu(&row_widget, x, y, actions);
             });
             row.add_controller(context_gesture);
@@ -900,7 +850,7 @@ fn build_drawer(
         list.connect_row_activated(move |_, row| {
             let index = row.index() as usize;
             if index < tracks.len() {
-                callback(tracks.clone(), index);
+                callback((tracks.clone(), index));
             }
         });
     }
@@ -922,7 +872,7 @@ fn build_drawer(
     let outer = GtkBox::new(Orientation::Horizontal, 8);
     // Same dark tint as the selected cover, so the open album and its track list
     // read as one continuous selection.
-    outer.add_css_class("album-drawer");
+    style::add_class(&outer, StyleClass::AlbumDrawer);
     outer.set_margin_top(2);
     outer.set_margin_bottom(2);
     outer.append(&cover);
@@ -930,29 +880,14 @@ fn build_drawer(
     (outer, cover, list)
 }
 
-fn drawer_heading(summary: &AlbumSummary) -> String {
-    let title = format!("{} — {}", summary.album.as_str(), summary.artist.as_str());
-    if summary.year.is_unknown() {
-        title
-    } else {
-        format!("{title} ({})", summary.year.value())
-    }
-}
-
 fn track_row(track: &Track) -> ListBoxRow {
-    let number = Label::new(Some(&track_number(track)));
+    let number = numeric_dim_label(&format::track_number(track));
     number.set_width_chars(5);
-    number.set_xalign(1.0);
-    number.add_css_class("dim-label");
-    number.add_css_class("numeric");
 
-    let title = Label::new(Some(track.title.as_str()));
-    title.set_xalign(0.0);
+    let title = body_label(track.title.as_str());
     title.set_hexpand(true);
-    title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
 
-    let duration = Label::new(Some(&format_duration(track.duration)));
-    duration.add_css_class("dim-label");
+    let duration = numeric_dim_label(&format_duration(track.duration));
 
     let row_box = GtkBox::new(Orientation::Horizontal, 8);
     row_box.set_margin_start(8);
@@ -966,25 +901,6 @@ fn track_row(track: &Track) -> ListBoxRow {
     let row = ListBoxRow::new();
     row.set_child(Some(&row_box));
     row
-}
-
-/// The track's position label. With a disc number it reads `disc.track` with the
-/// track zero-padded to two digits (so an album sorts and reads as 1.01, 1.10,
-/// 2.01); without one it is just the track number, and it is empty when neither
-/// tag is present.
-fn track_number(track: &Track) -> String {
-    let track_num = track.track_number;
-    if track.disc_number.is_unknown() {
-        if track_num.is_unknown() {
-            String::new()
-        } else {
-            track_num.value().to_string()
-        }
-    } else if track_num.is_unknown() {
-        format!("{}.", track.disc_number.value())
-    } else {
-        format!("{}.{:02}", track.disc_number.value(), track_num.value())
-    }
 }
 
 /// Channel endpoints returned by `spawn_art_decoder`: the request sender and

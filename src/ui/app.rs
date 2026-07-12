@@ -21,6 +21,8 @@ pub fn run(
         .build();
 
     app.connect_activate(move |app| {
+        // The one stylesheet install — before any widget is built.
+        crate::ui::style::install();
         crate::ui::main_window::build(
             app,
             Rc::clone(&db),

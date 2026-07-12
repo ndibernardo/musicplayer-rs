@@ -1,4 +1,3 @@
-use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -15,13 +14,14 @@ use gtk4::prelude::*;
 use crate::library::column::ColumnConfig;
 use crate::library::column::ColumnPrefs;
 use crate::library::format::TrackField;
-
-type ChangeCallback = Rc<dyn Fn(ColumnPrefs)>;
+use crate::ui::widgets::AppIcon;
+use crate::ui::widgets::Callback;
+use crate::ui::widgets::remove_all_children;
 
 struct Inner {
     list_box: GtkBox,
     state: RefCell<ColumnPrefs>,
-    on_change: OnceCell<ChangeCallback>,
+    on_change: Callback<ColumnPrefs>,
 }
 
 /// A header-bar button whose popover lists every [`TrackField`] with a
@@ -47,7 +47,7 @@ impl ColumnPicker {
         popover.set_child(Some(&list_box));
 
         let widget = MenuButton::new();
-        widget.set_icon_name("open-menu-symbolic");
+        widget.set_icon_name(AppIcon::OpenMenu.name());
         widget.set_tooltip_text(Some("Choose columns"));
         widget.set_popover(Some(&popover));
 
@@ -56,7 +56,7 @@ impl ColumnPicker {
             inner: Rc::new(Inner {
                 list_box,
                 state: RefCell::new(initial),
-                on_change: OnceCell::new(),
+                on_change: Callback::new(),
             }),
         };
         picker.rebuild_rows();
@@ -65,13 +65,11 @@ impl ColumnPicker {
 
     /// Registers the callback invoked with the new prefs after every change.
     pub fn connect_changed<F: Fn(ColumnPrefs) + 'static>(&self, f: F) {
-        let _ = self.inner.on_change.set(Rc::new(f));
+        self.inner.on_change.set(f);
     }
 
     fn rebuild_rows(&self) {
-        while let Some(child) = self.inner.list_box.first_child() {
-            self.inner.list_box.remove(&child);
-        }
+        remove_all_children(&self.inner.list_box);
         let visible: Vec<TrackField> = self
             .inner
             .state
@@ -106,7 +104,7 @@ impl ColumnPicker {
         row.append(&check);
 
         if visible {
-            let handle = Image::from_icon_name("list-drag-handle-symbolic");
+            let handle = Image::from_icon_name(AppIcon::ListDragHandle.name());
             handle.set_tooltip_text(Some("Drag to reorder"));
             row.append(&handle);
 
@@ -176,8 +174,6 @@ impl ColumnPicker {
     fn replace_state(&self, prefs: ColumnPrefs) {
         *self.inner.state.borrow_mut() = prefs;
         self.rebuild_rows();
-        if let Some(callback) = self.inner.on_change.get() {
-            callback(self.inner.state.borrow().clone());
-        }
+        self.inner.on_change.emit(self.inner.state.borrow().clone());
     }
 }

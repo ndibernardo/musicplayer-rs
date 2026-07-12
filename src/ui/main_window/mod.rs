@@ -1,6 +1,9 @@
+mod editing;
+mod header;
+mod sidebars;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -10,21 +13,13 @@ use gtk4::Application;
 use gtk4::ApplicationWindow;
 use gtk4::Box as GtkBox;
 use gtk4::Button;
-use gtk4::DropDown;
-use gtk4::Expander;
-use gtk4::FileDialog;
 use gtk4::GestureClick;
 use gtk4::HeaderBar;
-use gtk4::Image;
 use gtk4::Label;
-use gtk4::ListBox;
-use gtk4::ListBoxRow;
 use gtk4::Orientation;
 use gtk4::Overlay;
 use gtk4::Paned;
 use gtk4::PropagationPhase;
-use gtk4::Scale;
-use gtk4::ScrolledWindow;
 use gtk4::Spinner;
 use gtk4::Stack;
 use gtk4::ToggleButton;
@@ -32,21 +27,15 @@ use gtk4::gdk::ModifierType;
 use gtk4::prelude::*;
 
 use crate::library::album::AlbumSort;
-use crate::library::album::AlbumSortField;
 use crate::library::album::ArtKey;
-use crate::library::album::SortDirection;
 use crate::library::column::ColumnPrefs;
 use crate::library::db::Db;
-use crate::library::db::LibraryFolder;
+use crate::library::filter::FilterField;
 use crate::library::filter::LibraryFilter;
-use crate::library::metadata_edit;
-use crate::library::metadata_edit::TrackEdit;
 use crate::library::scan::ScanEvent;
 use crate::library::scan::spawn_scan;
-use crate::library::settings::COVER_SIZE_MAX;
-use crate::library::settings::COVER_SIZE_MIN;
 use crate::library::settings::Settings;
-use crate::library::track::AlbumArtData;
+use crate::library::settings::SidebarEdge;
 use crate::library::track::Track;
 use crate::library::track::TrackId;
 use crate::library::view_mode::ViewMode;
@@ -61,62 +50,15 @@ use crate::player::PlayerHandle;
 use crate::player::SeekPosition;
 use crate::ui::album_grid::AlbumGrid;
 use crate::ui::column_picker::ColumnPicker;
-use crate::ui::edit_dialog;
+use crate::ui::folder_list::FolderList;
 use crate::ui::library_view::LibraryView;
 use crate::ui::player_bar::PlayerBar;
 use crate::ui::queue_view::QueueView;
 use crate::ui::sidebar::Sidebar;
-
-/// The album-grid sort fields in dropdown order.
-const SORT_FIELDS: [AlbumSortField; 4] = [
-    AlbumSortField::AlbumArtist,
-    AlbumSortField::Year,
-    AlbumSortField::Genre,
-    AlbumSortField::Album,
-];
-/// Human labels for `SORT_FIELDS`, in the same order.
-const SORT_FIELD_LABELS: [&str; 4] = ["Album Artist", "Year", "Genre", "Album"];
-
-/// Application-wide styling.
-const APP_CSS: &str = "\
-.player-bar { background-color: rgba(0, 0, 0, 0.25); }
-.player-bar scale trough {
-    background-color: alpha(currentColor, 0.22);
-    min-height: 6px;
-}
-.player-bar scale.seek slider {
-    min-width: 0;
-    min-height: 0;
-    margin: 0;
-    background: none;
-    border: none;
-    box-shadow: none;
-}
-.album-cell {
-    padding: 10px;
-    border-radius: 10px;
-}
-.album-selected {
-    background-color: rgba(0, 0, 0, 0.24);
-}
-.album-multi-selected {
-    background-color: rgba(60, 120, 220, 0.28);
-}
-.album-drawer {
-    background-color: rgba(0, 0, 0, 0.24);
-    border-radius: 10px;
-}
-.album-drawer list,
-.album-drawer row {
-    background-color: transparent;
-}
-.album-drawer row:hover {
-    background-color: rgba(255, 255, 255, 0.12);
-}
-.album-drawer row:selected {
-    background-color: rgba(60, 120, 220, 0.35);
-}
-";
+use crate::ui::style;
+use crate::ui::style::Margins;
+use crate::ui::style::spacing;
+use crate::ui::widgets::AppIcon;
 
 /// Every persisted setting read once at startup, before `db` moves into `Context`.
 struct InitialSettings {
@@ -134,6 +76,7 @@ struct InitialSettings {
     left_sidebar_width: i32,
     right_sidebar_open: bool,
     right_sidebar_width: i32,
+    sidebar_fields: Vec<FilterField>,
 }
 
 impl InitialSettings {
@@ -150,10 +93,11 @@ impl InitialSettings {
             window_size: s.window_size(),
             window_maximized: s.window_maximized(),
             column_prefs: s.column_prefs(),
-            left_sidebar_open: s.left_sidebar_open(),
-            left_sidebar_width: s.left_sidebar_width(),
-            right_sidebar_open: s.right_sidebar_open(),
-            right_sidebar_width: s.right_sidebar_width(),
+            left_sidebar_open: s.sidebar_open(SidebarEdge::Start),
+            left_sidebar_width: s.sidebar_width(SidebarEdge::Start),
+            right_sidebar_open: s.sidebar_open(SidebarEdge::End),
+            right_sidebar_width: s.sidebar_width(SidebarEdge::End),
+            sidebar_fields: s.sidebar_fields(),
         }
     }
 }
@@ -172,7 +116,7 @@ struct Context {
     queue_view: QueueView,
     player_bar: PlayerBar,
     window: ApplicationWindow,
-    folder_list: ListBox,
+    folder_list: FolderList,
     status_label: Label,
     scan_spinner: Spinner,
     scan_status: Label,
@@ -200,17 +144,16 @@ impl Context {
         initial: &InitialSettings,
         tx: Sender<WindowMessage>,
     ) -> (Self, async_channel::Receiver<()>) {
-        install_styles();
-
         let header = HeaderBar::new();
         // Under a tiling WM the minimize/maximize buttons are unusable and render
         // with a mismatched background on focus changes; show only the close button.
         header.set_decoration_layout(Some(":close"));
 
         // Built early (before `root` exists) so it can be passed to
-        // `wire_library_view`/`wire_album_grid`, which parent the edit
-        // dialogs on it; its child is attached later via `set_child`, once
-        // `root` is built, in place of the builder's usual `.child(&root)`.
+        // `editing::wire_library_view`/`editing::wire_album_grid`, which
+        // parent the edit dialogs on it; its child is attached later via
+        // `set_child`, once `root` is built, in place of the builder's usual
+        // `.child(&root)`.
         let (initial_width, initial_height) = initial.window_size.unwrap_or((1200, 700));
         let window = ApplicationWindow::builder()
             .application(app)
@@ -225,32 +168,32 @@ impl Context {
         // further down. `set_active` runs before `connect_toggled` so
         // restoring the persisted state doesn't re-trigger a save.
         let left_sidebar_toggle = ToggleButton::new();
-        left_sidebar_toggle.set_icon_name("sidebar-show-symbolic");
+        left_sidebar_toggle.set_icon_name(AppIcon::SidebarShow.name());
         left_sidebar_toggle.set_tooltip_text(Some("Toggle filters sidebar"));
         left_sidebar_toggle.set_active(initial.left_sidebar_open);
         header.pack_start(&left_sidebar_toggle);
 
         let right_sidebar_toggle = ToggleButton::new();
-        right_sidebar_toggle.set_icon_name("sidebar-show-right-symbolic");
+        right_sidebar_toggle.set_icon_name(AppIcon::SidebarShowRight.name());
         right_sidebar_toggle.set_tooltip_text(Some("Toggle queue sidebar"));
         right_sidebar_toggle.set_active(initial.right_sidebar_open);
         header.pack_end(&right_sidebar_toggle);
 
-        let add_btn = Button::from_icon_name("folder-new-symbolic");
+        let add_btn = Button::from_icon_name(AppIcon::FolderNew.name());
         add_btn.set_tooltip_text(Some("Add music folder"));
         header.pack_start(&add_btn);
 
-        let scan_btn = Button::from_icon_name("view-refresh-symbolic");
+        let scan_btn = Button::from_icon_name(AppIcon::ViewRefresh.name());
         scan_btn.set_tooltip_text(Some("Scan library"));
         header.pack_start(&scan_btn);
-        wire_scan_button(&scan_btn, &tx);
+        header::wire_scan_button(&scan_btn, &tx);
 
-        let (sort_controls, sort_field, sort_dir) = build_sort_controls();
-        wire_sort_controls(&sort_field, &sort_dir, initial.sort, &tx);
-        let size_scale = build_size_scale();
-        let (list_toggle, grid_toggle) = build_view_toggles();
+        let (sort_controls, sort_field, sort_dir) = header::build_sort_controls();
+        header::wire_sort_controls(&sort_field, &sort_dir, initial.sort, &tx);
+        let size_scale = header::build_size_scale();
+        let (list_toggle, grid_toggle) = header::build_view_toggles();
         let column_picker = ColumnPicker::new(initial.column_prefs.clone());
-        wire_column_picker(&column_picker, &tx);
+        header::wire_column_picker(&column_picker, &tx);
 
         // One header slot generalised over both view modes: the column
         // picker in list view, the cover-size slider in grid view — never
@@ -283,29 +226,43 @@ impl Context {
             })
         };
 
-        let folder_list = ListBox::new();
-        folder_list.set_selection_mode(gtk4::SelectionMode::None);
+        let folder_list = FolderList::new();
+        sidebars::wire_folder_list(&folder_list, &tx);
 
         let status_label = Label::new(Some("Ready"));
         status_label.set_xalign(0.0);
-        status_label.set_margin_start(8);
-        status_label.set_margin_end(8);
-        status_label.set_margin_top(4);
-        status_label.set_margin_bottom(4);
+        style::set_margins(
+            &status_label,
+            Margins::horizontal(spacing::M)
+                .top(spacing::S)
+                .bottom(spacing::S),
+        );
 
-        let filter_sidebar = Sidebar::new();
-        wire_sidebar(&filter_sidebar, &tx);
+        let filter_sidebar = Sidebar::new(&initial.sidebar_fields);
+        sidebars::wire_sidebar(&filter_sidebar, &tx);
         let queue_view = QueueView::new();
-        wire_queue_view(&queue_view, &tx);
-        let left_sidebar = build_left_sidebar_box(&filter_sidebar);
-        let right_sidebar = build_right_sidebar_box(&queue_view, &folder_list, &status_label);
+        sidebars::wire_queue_view(&queue_view, &tx);
+
+        let (left_panel, right_panel) = sidebars::build_sidebar_panels(
+            &filter_sidebar,
+            &queue_view,
+            &folder_list,
+            &status_label,
+        );
+
+        let edit_requester = Rc::new(editing::EditRequester::new(
+            db_path.clone(),
+            window.clone(),
+            status_label.clone(),
+            tx.clone(),
+        ));
 
         let library_view = LibraryView::new(&initial.column_prefs);
-        wire_library_view(&library_view, &db, &db_path, &window, &status_label, &tx);
+        editing::wire_library_view(&library_view, &db, &edit_requester, &tx);
 
         let album_grid = AlbumGrid::new();
-        wire_cover_size(&size_scale, &album_grid, initial.cover_size, &tx);
-        wire_album_grid(&album_grid, &db, &db_path, &window, &status_label, &tx);
+        header::wire_cover_size(&size_scale, &album_grid, initial.cover_size, &tx);
+        editing::wire_album_grid(&album_grid, &db, &edit_requester, &tx);
         wire_click_elsewhere_deselect(&window, &library_view, &album_grid);
 
         let content = Stack::new();
@@ -314,7 +271,7 @@ impl Context {
         content.add_named(&library_view.widget, Some(ViewMode::List.child_name()));
         content.add_named(&album_grid.widget, Some(ViewMode::Grid.child_name()));
 
-        let (scan_spinner, scan_status, scan_indicator) = build_scan_indicator();
+        let (scan_spinner, scan_status, scan_indicator) = header::build_scan_indicator();
 
         let content_overlay = Overlay::new();
         content_overlay.set_child(Some(&content));
@@ -322,7 +279,7 @@ impl Context {
 
         let inner_paned = Paned::new(Orientation::Horizontal);
         inner_paned.set_start_child(Some(&content_overlay));
-        inner_paned.set_end_child(Some(&right_sidebar));
+        inner_paned.set_end_child(Some(right_panel.widget()));
         inner_paned.set_resize_end_child(false);
         inner_paned.set_hexpand(true);
         inner_paned.set_vexpand(true);
@@ -344,7 +301,7 @@ impl Context {
         });
 
         let paned = Paned::new(Orientation::Horizontal);
-        paned.set_start_child(Some(&left_sidebar));
+        paned.set_start_child(Some(left_panel.widget()));
         paned.set_end_child(Some(&inner_paned));
         paned.set_position(if initial.left_sidebar_open {
             initial.left_sidebar_width
@@ -354,10 +311,20 @@ impl Context {
         paned.set_hexpand(true);
         paned.set_vexpand(true);
 
-        wire_left_sidebar_toggle(&left_sidebar_toggle, &paned, Rc::clone(&db));
-        wire_right_sidebar_toggle(&right_sidebar_toggle, &inner_paned, Rc::clone(&db));
+        sidebars::wire_sidebar_toggle(
+            &left_sidebar_toggle,
+            &paned,
+            SidebarEdge::Start,
+            Rc::clone(&db),
+        );
+        sidebars::wire_sidebar_toggle(
+            &right_sidebar_toggle,
+            &inner_paned,
+            SidebarEdge::End,
+            Rc::clone(&db),
+        );
 
-        wire_view_toggles(
+        header::wire_view_toggles(
             &list_toggle,
             &grid_toggle,
             &content,
@@ -367,7 +334,7 @@ impl Context {
         );
 
         let player_bar = PlayerBar::new(player.clone(), initial.volume);
-        wire_volume(&player_bar, &tx);
+        header::wire_volume(&player_bar, &tx);
 
         let root = GtkBox::new(Orientation::Vertical, 0);
         root.append(&paned);
@@ -376,7 +343,7 @@ impl Context {
         window.set_titlebar(Some(&header));
 
         wire_window_geometry(&window, &db);
-        wire_add_folder_button(&add_btn, &window, &tx);
+        header::wire_add_folder_button(&add_btn, &window, &tx);
 
         let (watch_tx, watch_rx) = async_channel::unbounded::<()>();
 
@@ -443,6 +410,10 @@ impl Context {
             WindowMessage::ColumnPrefsChanged(prefs) => {
                 self.library_view.set_column_prefs(prefs);
                 self.settings().set_column_prefs(prefs);
+            }
+            WindowMessage::SidebarFieldsChanged(fields) => {
+                self.settings().set_sidebar_fields(fields);
+                self.refresh_sidebar();
             }
             WindowMessage::ColumnWidthChanged(field, width) => {
                 // The header drag already resized the column natively — no
@@ -596,15 +567,12 @@ impl Context {
     }
 
     fn refresh_sidebar(&self) {
-        let genres = match self.db.distinct_genres() {
-            Ok(v) => v,
-            Err(e) => return self.status_label.set_text(&format!("Error: {e}")),
-        };
-        let artists = match self.db.distinct_artists() {
-            Ok(v) => v,
-            Err(e) => return self.status_label.set_text(&format!("Error: {e}")),
-        };
-        self.filter_sidebar.populate(genres, artists);
+        for field in self.settings().sidebar_fields() {
+            match self.db.distinct_values_for(field) {
+                Ok(values) => self.filter_sidebar.populate(field, values),
+                Err(e) => return self.status_label.set_text(&format!("Error: {e}")),
+            }
+        }
     }
 
     fn refresh_album_grid_with(&self, filter: &LibraryFilter, sort: AlbumSort) {
@@ -744,10 +712,6 @@ impl Context {
     }
 
     fn refresh_folder_list(&self) {
-        let list = &self.folder_list;
-        while let Some(child) = list.first_child() {
-            list.remove(&child);
-        }
         let folders = match self.db.list_folders() {
             Ok(f) => f,
             Err(e) => {
@@ -755,9 +719,7 @@ impl Context {
                 return;
             }
         };
-        for folder in folders {
-            list.append(&folder_row(folder, &self.tx));
-        }
+        self.folder_list.set_folders(folders);
     }
 
     /// Restores the queue from the previous session, paused at its saved
@@ -795,139 +757,6 @@ impl Context {
     }
 }
 
-fn folder_row(folder: LibraryFolder, tx: &Sender<WindowMessage>) -> ListBoxRow {
-    let path_label = Label::new(folder.as_path().to_str());
-    path_label.set_hexpand(true);
-    path_label.set_xalign(0.0);
-    path_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-    path_label.set_margin_start(8);
-
-    let remove_btn = Button::from_icon_name("list-remove-symbolic");
-    remove_btn.add_css_class("flat");
-    remove_btn.set_margin_end(4);
-
-    let row_box = GtkBox::new(Orientation::Horizontal, 0);
-    row_box.set_margin_top(2);
-    row_box.set_margin_bottom(2);
-    row_box.append(&path_label);
-    row_box.append(&remove_btn);
-
-    let tx = tx.clone();
-    remove_btn.connect_clicked(move |_| {
-        let _ = tx.send_blocking(WindowMessage::FolderRemoved(folder.clone()));
-    });
-
-    let row = ListBoxRow::new();
-    row.set_child(Some(&row_box));
-    row
-}
-
-/// Restores the sort controls and wires further changes to send `WindowMessage`s.
-fn wire_sort_controls(
-    sort_field: &DropDown,
-    sort_dir: &ToggleButton,
-    initial: AlbumSort,
-    tx: &Sender<WindowMessage>,
-) {
-    sort_field.set_selected(sort_field_index(initial.field));
-    sort_dir.set_active(matches!(initial.direction, SortDirection::Descending));
-    sort_dir.set_icon_name(direction_icon(initial.direction));
-
-    let tx_field = tx.clone();
-    sort_field.connect_selected_notify(move |dropdown| {
-        let _ = tx_field.send_blocking(WindowMessage::SortFieldChanged(sort_field_at(
-            dropdown.selected(),
-        )));
-    });
-
-    let tx_dir = tx.clone();
-    sort_dir.connect_toggled(move |btn| {
-        let direction = if btn.is_active() {
-            SortDirection::Descending
-        } else {
-            SortDirection::Ascending
-        };
-        btn.set_icon_name(direction_icon(direction));
-        let _ = tx_dir.send_blocking(WindowMessage::SortDirectionChanged(direction));
-    });
-}
-
-/// Restores the cover-size slider and wires further changes to send `WindowMessage`s.
-fn wire_cover_size(
-    size_scale: &Scale,
-    album_grid: &AlbumGrid,
-    initial_cover_size: i32,
-    tx: &Sender<WindowMessage>,
-) {
-    size_scale.set_value(initial_cover_size as f64);
-    album_grid.set_cover_size(initial_cover_size);
-
-    let tx = tx.clone();
-    size_scale.connect_value_changed(move |scale| {
-        let _ = tx.send_blocking(WindowMessage::CoverSizeChanged(scale.value() as i32));
-    });
-}
-
-/// Wires the column picker's change callback to send the new prefs onward.
-fn wire_column_picker(column_picker: &ColumnPicker, tx: &Sender<WindowMessage>) {
-    let tx = tx.clone();
-    column_picker.connect_changed(move |prefs| {
-        let _ = tx.send_blocking(WindowMessage::ColumnPrefsChanged(prefs));
-    });
-}
-
-/// Restores the active view and wires the list/grid toggle buttons.
-fn wire_view_toggles(
-    list_toggle: &ToggleButton,
-    grid_toggle: &ToggleButton,
-    content: &Stack,
-    toggle_grid_controls: Rc<dyn Fn(ViewMode)>,
-    initial_view_mode: ViewMode,
-    tx: &Sender<WindowMessage>,
-) {
-    match initial_view_mode {
-        ViewMode::List => list_toggle.set_active(true),
-        ViewMode::Grid => grid_toggle.set_active(true),
-    }
-    content.set_visible_child_name(initial_view_mode.child_name());
-    toggle_grid_controls(initial_view_mode);
-
-    let tx_list = tx.clone();
-    list_toggle.connect_toggled(move |btn| {
-        if btn.is_active() {
-            let _ = tx_list.send_blocking(WindowMessage::ViewModeChanged(ViewMode::List));
-        }
-    });
-
-    let tx_grid = tx.clone();
-    grid_toggle.connect_toggled(move |btn| {
-        if btn.is_active() {
-            let _ = tx_grid.send_blocking(WindowMessage::ViewModeChanged(ViewMode::Grid));
-        }
-    });
-}
-
-fn wire_volume(player_bar: &PlayerBar, tx: &Sender<WindowMessage>) {
-    let tx = tx.clone();
-    player_bar.connect_volume_changed(move |percent| {
-        let _ = tx.send_blocking(WindowMessage::VolumeChanged(percent));
-    });
-}
-
-fn wire_sidebar(filter_sidebar: &Sidebar, tx: &Sender<WindowMessage>) {
-    let tx = tx.clone();
-    filter_sidebar.connect_filter_selected(move |filter| {
-        let _ = tx.send_blocking(WindowMessage::FilterSelected(filter));
-    });
-}
-
-fn wire_queue_view(queue_view: &QueueView, tx: &Sender<WindowMessage>) {
-    let tx = tx.clone();
-    queue_view.connect_track_selected(move |index| {
-        let _ = tx.send_blocking(WindowMessage::QueueTrackSelected(index));
-    });
-}
-
 /// Clears both views' multi-selections on a plain left-click anywhere in the
 /// window, so a selection doesn't linger indefinitely once the user has moved
 /// on to something else. Attached in the capture phase (runs before any
@@ -957,292 +786,6 @@ fn wire_click_elsewhere_deselect(
         album_grid.clear_selection();
     });
     window.add_controller(gesture);
-}
-
-fn wire_library_view(
-    library_view: &LibraryView,
-    db: &Rc<Db>,
-    db_path: &Path,
-    window: &ApplicationWindow,
-    status_label: &Label,
-    tx: &Sender<WindowMessage>,
-) {
-    let tx_activated = tx.clone();
-    library_view.connect_track_activated(move |tracks, index| {
-        if let Some(track) = tracks.get(index) {
-            let _ = tx_activated.send_blocking(WindowMessage::Enqueue(vec![track.clone()], 0));
-        }
-    });
-
-    let tx_enqueue = tx.clone();
-    library_view.connect_track_enqueue(move |track| {
-        let _ = tx_enqueue.send_blocking(WindowMessage::AppendToQueue(vec![track]));
-    });
-
-    let tx_tracks_enqueue = tx.clone();
-    library_view.connect_tracks_enqueue(move |tracks| {
-        let _ = tx_tracks_enqueue.send_blocking(WindowMessage::AppendToQueue(tracks));
-    });
-
-    let tx_resized = tx.clone();
-    library_view.connect_column_resized(move |field, width| {
-        let _ = tx_resized.send_blocking(WindowMessage::ColumnWidthChanged(field, width));
-    });
-
-    let db_edit = Rc::clone(db);
-    let db_path_edit = db_path.to_path_buf();
-    let window_edit = window.clone();
-    let status_edit = status_label.clone();
-    let tx_edit = tx.clone();
-    library_view.connect_track_edit_requested(move |track| {
-        let art = db_edit.art_for_track(track.id).unwrap_or_else(|e| {
-            tracing::error!("Art lookup failed: {e}");
-            None
-        });
-        let db_path = db_path_edit.clone();
-        let status = status_edit.clone();
-        let tx = tx_edit.clone();
-        let track_for_save = track.clone();
-        edit_dialog::open_track_editor(&window_edit, track, art, move |edit, art| {
-            status.set_text("Saving…");
-            spawn_edit_save(
-                db_path.clone(),
-                vec![track_for_save.clone()],
-                edit,
-                art,
-                tx.clone(),
-            );
-        });
-    });
-
-    let db_tracks_edit = Rc::clone(db);
-    let db_path_tracks_edit = db_path.to_path_buf();
-    let window_tracks_edit = window.clone();
-    let status_tracks_edit = status_label.clone();
-    let tx_tracks_edit = tx.clone();
-    library_view.connect_tracks_edit_requested(move |tracks| {
-        let art = tracks.first().and_then(|t| {
-            db_tracks_edit.art_for_track(t.id).unwrap_or_else(|e| {
-                tracing::error!("Art lookup failed: {e}");
-                None
-            })
-        });
-        let db_path = db_path_tracks_edit.clone();
-        let status = status_tracks_edit.clone();
-        let tx = tx_tracks_edit.clone();
-        let tracks_for_save = tracks.clone();
-        edit_dialog::open_album_editor(&window_tracks_edit, tracks, art, move |edit, art| {
-            status.set_text("Saving…");
-            spawn_edit_save(
-                db_path.clone(),
-                tracks_for_save.clone(),
-                edit,
-                art,
-                tx.clone(),
-            );
-        });
-    });
-}
-
-/// The album grid's track and cover-art providers (synchronous DB reads, not
-/// messages — the grid needs the answer inline to render a drawer or a cover)
-/// plus its activation/enqueue/edit callbacks (which do go through `WindowMessage`).
-fn wire_album_grid(
-    album_grid: &AlbumGrid,
-    db: &Rc<Db>,
-    db_path: &Path,
-    window: &ApplicationWindow,
-    status_label: &Label,
-    tx: &Sender<WindowMessage>,
-) {
-    let db_tracks = Rc::clone(db);
-    album_grid.set_track_provider(move |summary| {
-        db_tracks
-            .tracks_for(&LibraryFilter::ByAlbum(summary.album.clone()))
-            .unwrap_or_else(|e| {
-                tracing::error!("Album query failed: {e}");
-                Vec::new()
-            })
-    });
-
-    let db_art = Rc::clone(db);
-    album_grid.set_art_provider(move |key| {
-        db_art.art_for(key).unwrap_or_else(|e| {
-            tracing::error!("Art lookup failed: {e}");
-            None
-        })
-    });
-
-    let tx_activated = tx.clone();
-    album_grid.connect_album_activated(move |tracks| {
-        let _ = tx_activated.send_blocking(WindowMessage::Enqueue(tracks, 0));
-    });
-
-    let tx_track_activated = tx.clone();
-    album_grid.connect_track_activated(move |tracks, index| {
-        if let Some(track) = tracks.get(index) {
-            let _ =
-                tx_track_activated.send_blocking(WindowMessage::Enqueue(vec![track.clone()], 0));
-        }
-    });
-
-    let tx_album_enqueue = tx.clone();
-    album_grid.connect_album_enqueue(move |tracks| {
-        let _ = tx_album_enqueue.send_blocking(WindowMessage::AppendToQueue(tracks));
-    });
-
-    let tx_track_enqueue = tx.clone();
-    album_grid.connect_track_enqueue(move |track| {
-        let _ = tx_track_enqueue.send_blocking(WindowMessage::AppendToQueue(vec![track]));
-    });
-
-    let db_album_edit = Rc::clone(db);
-    let db_path_album_edit = db_path.to_path_buf();
-    let window_album_edit = window.clone();
-    let status_album_edit = status_label.clone();
-    let tx_album_edit = tx.clone();
-    album_grid.connect_album_edit_requested(move |tracks| {
-        let art = tracks.first().and_then(ArtKey::for_track).and_then(|key| {
-            db_album_edit.art_for(&key).unwrap_or_else(|e| {
-                tracing::error!("Art lookup failed: {e}");
-                None
-            })
-        });
-        let db_path = db_path_album_edit.clone();
-        let status = status_album_edit.clone();
-        let tx = tx_album_edit.clone();
-        let tracks_for_save = tracks.clone();
-        edit_dialog::open_album_editor(&window_album_edit, tracks, art, move |edit, art| {
-            status.set_text("Saving…");
-            spawn_edit_save(
-                db_path.clone(),
-                tracks_for_save.clone(),
-                edit,
-                art,
-                tx.clone(),
-            );
-        });
-    });
-
-    let db_track_edit = Rc::clone(db);
-    let db_path_track_edit = db_path.to_path_buf();
-    let window_track_edit = window.clone();
-    let status_track_edit = status_label.clone();
-    let tx_track_edit = tx.clone();
-    album_grid.connect_track_edit_requested(move |track| {
-        let art = db_track_edit.art_for_track(track.id).unwrap_or_else(|e| {
-            tracing::error!("Art lookup failed: {e}");
-            None
-        });
-        let db_path = db_path_track_edit.clone();
-        let status = status_track_edit.clone();
-        let tx = tx_track_edit.clone();
-        let track_for_save = track.clone();
-        edit_dialog::open_track_editor(&window_track_edit, track, art, move |edit, art| {
-            status.set_text("Saving…");
-            spawn_edit_save(
-                db_path.clone(),
-                vec![track_for_save.clone()],
-                edit,
-                art,
-                tx.clone(),
-            );
-        });
-    });
-
-    let tx_tracks_enqueue = tx.clone();
-    album_grid.connect_tracks_enqueue(move |tracks| {
-        let _ = tx_tracks_enqueue.send_blocking(WindowMessage::AppendToQueue(tracks));
-    });
-
-    let db_tracks_edit = Rc::clone(db);
-    let db_path_tracks_edit = db_path.to_path_buf();
-    let window_tracks_edit = window.clone();
-    let status_tracks_edit = status_label.clone();
-    let tx_tracks_edit = tx.clone();
-    album_grid.connect_tracks_edit_requested(move |tracks| {
-        let art = tracks.first().and_then(|t| {
-            db_tracks_edit.art_for_track(t.id).unwrap_or_else(|e| {
-                tracing::error!("Art lookup failed: {e}");
-                None
-            })
-        });
-        let db_path = db_path_tracks_edit.clone();
-        let status = status_tracks_edit.clone();
-        let tx = tx_tracks_edit.clone();
-        let tracks_for_save = tracks.clone();
-        edit_dialog::open_album_editor(&window_tracks_edit, tracks, art, move |edit, art| {
-            status.set_text("Saving…");
-            spawn_edit_save(
-                db_path.clone(),
-                tracks_for_save.clone(),
-                edit,
-                art,
-                tx.clone(),
-            );
-        });
-    });
-}
-
-/// Spawns the background file+DB save, computes whether the edit can change
-/// which cover an album shows (before the edit itself is dropped — see
-/// `WindowMessage::EditSaved`'s doc comment), and bridges the single result
-/// into the `WindowMessage` stream. Mirrors `start_scan`'s forwarding loop,
-/// but for one value instead of a stream.
-fn spawn_edit_save(
-    db_path: PathBuf,
-    tracks: Vec<Track>,
-    edit: TrackEdit,
-    art: Option<AlbumArtData>,
-    tx: Sender<WindowMessage>,
-) {
-    let affects_art = art.is_some() || edit.affects_art_grouping();
-    let rx = metadata_edit::spawn_save_edits(db_path, tracks, edit, art);
-    glib::spawn_future_local(async move {
-        if let Ok(outcome) = rx.recv().await {
-            let _ = tx
-                .send(WindowMessage::EditSaved {
-                    affects_art,
-                    outcome,
-                })
-                .await;
-        }
-    });
-}
-
-fn wire_scan_button(scan_btn: &Button, tx: &Sender<WindowMessage>) {
-    let tx = tx.clone();
-    scan_btn.connect_clicked(move |_| {
-        let _ = tx.send_blocking(WindowMessage::ScanRequested);
-    });
-}
-
-/// Add-folder button: pick a folder, then dispatch `WindowMessage::FolderAdded`. The DB
-/// write itself happens in `Context::apply` — this only handles the async
-/// file-dialog interaction, which doesn't belong in a state transition.
-fn wire_add_folder_button(
-    add_btn: &Button,
-    window: &ApplicationWindow,
-    tx: &Sender<WindowMessage>,
-) {
-    let window = window.clone();
-    let tx = tx.clone();
-    add_btn.connect_clicked(move |_| {
-        let window = window.clone();
-        let tx = tx.clone();
-        glib::spawn_future_local(async move {
-            let dialog = FileDialog::new();
-            dialog.set_title("Add Music Folder");
-            let Ok(file) = dialog.select_folder_future(Some(&window)).await else {
-                return;
-            };
-            let Some(path) = file.path() else { return };
-            let Ok(folder) = LibraryFolder::new(path) else {
-                return;
-            };
-            let _ = tx.send(WindowMessage::FolderAdded(folder)).await;
-        });
-    });
 }
 
 /// Persist window geometry so the next launch reopens at the same size.
@@ -1300,161 +843,6 @@ fn spawn_forward<T: 'static>(
     });
 }
 
-fn build_sort_controls() -> (GtkBox, DropDown, ToggleButton) {
-    let sort_icon = Image::from_icon_name("view-sort-descending-symbolic");
-    let sort_field = DropDown::from_strings(&SORT_FIELD_LABELS);
-    sort_field.set_tooltip_text(Some("Sort albums by"));
-    sort_field.set_valign(gtk4::Align::Center);
-    let sort_dir = ToggleButton::new();
-    sort_dir.set_tooltip_text(Some("Sort direction"));
-    sort_dir.set_valign(gtk4::Align::Center);
-    let sort_controls = GtkBox::new(Orientation::Horizontal, 6);
-    sort_controls.set_valign(gtk4::Align::Center);
-    sort_controls.set_margin_start(18);
-    sort_controls.append(&sort_icon);
-    sort_controls.append(&sort_field);
-    sort_controls.append(&sort_dir);
-    (sort_controls, sort_field, sort_dir)
-}
-
-fn build_size_scale() -> Scale {
-    let size_scale = Scale::with_range(
-        Orientation::Horizontal,
-        COVER_SIZE_MIN as f64,
-        COVER_SIZE_MAX as f64,
-        10.0,
-    );
-    size_scale.set_size_request(120, -1);
-    size_scale.set_draw_value(false);
-    size_scale.set_tooltip_text(Some("Album art size"));
-    size_scale.set_valign(gtk4::Align::Center);
-    size_scale.set_margin_start(18);
-    size_scale
-}
-
-fn build_view_toggles() -> (ToggleButton, ToggleButton) {
-    let list_toggle = ToggleButton::new();
-    list_toggle.set_icon_name("view-list-symbolic");
-    list_toggle.set_tooltip_text(Some("Track list"));
-    list_toggle.set_active(true);
-    let grid_toggle = ToggleButton::new();
-    grid_toggle.set_icon_name("view-grid-symbolic");
-    grid_toggle.set_tooltip_text(Some("Album grid"));
-    grid_toggle.set_group(Some(&list_toggle));
-    (list_toggle, grid_toggle)
-}
-
-fn build_scan_indicator() -> (Spinner, Label, GtkBox) {
-    let scan_spinner = Spinner::new();
-    scan_spinner.set_size_request(48, 48);
-    let scan_status = Label::new(None);
-    scan_status.add_css_class("title-4");
-    let scan_indicator = GtkBox::new(Orientation::Vertical, 12);
-    scan_indicator.add_css_class("osd");
-    scan_indicator.set_halign(gtk4::Align::Center);
-    scan_indicator.set_valign(gtk4::Align::Center);
-    scan_indicator.set_margin_top(24);
-    scan_indicator.set_margin_bottom(24);
-    scan_indicator.set_margin_start(24);
-    scan_indicator.set_margin_end(24);
-    scan_indicator.append(&scan_spinner);
-    scan_indicator.append(&scan_status);
-    scan_indicator.set_visible(false);
-    (scan_spinner, scan_status, scan_indicator)
-}
-
-fn build_left_sidebar_box(filter_sidebar: &Sidebar) -> GtkBox {
-    let sidebar = GtkBox::new(Orientation::Vertical, 0);
-    sidebar.set_width_request(220);
-    sidebar.append(&filter_sidebar.widget);
-    sidebar
-}
-
-fn build_right_sidebar_box(
-    queue_view: &QueueView,
-    folder_list: &ListBox,
-    status_label: &Label,
-) -> GtkBox {
-    let folders_scrolled = ScrolledWindow::new();
-    folders_scrolled.set_min_content_height(120);
-    folders_scrolled.set_child(Some(folder_list));
-    let folders_expander = Expander::new(Some("Watched Folders"));
-    folders_expander.set_margin_start(4);
-    folders_expander.set_child(Some(&folders_scrolled));
-
-    // The queue expands to fill leftover height, which pins watched folders
-    // and status to the bottom of the sidebar rather than right below it.
-    queue_view.widget.set_vexpand(true);
-
-    let sidebar = GtkBox::new(Orientation::Vertical, 0);
-    sidebar.set_width_request(220);
-    sidebar.set_vexpand(true);
-    sidebar.append(&queue_view.widget);
-    sidebar.append(&folders_expander);
-    sidebar.append(status_label);
-    sidebar
-}
-
-/// Links the left-sidebar toggle to `paned`'s divider and persists both the
-/// open state and, while open, the dragged width — so the sidebar reopens
-/// (this session or a future one) at the size it was last left at. A
-/// `Revealer` here would leave the paned's fixed `position` allocating full
-/// width to an empty child, so the divider itself is the collapse mechanism.
-fn wire_left_sidebar_toggle(toggle: &ToggleButton, paned: &Paned, db: Rc<Db>) {
-    let paned_for_toggle = paned.clone();
-    let db_for_toggle = Rc::clone(&db);
-    toggle.connect_toggled(move |btn| {
-        let settings = Settings::new(&db_for_toggle);
-        let open = btn.is_active();
-        settings.set_left_sidebar_open(open);
-        paned_for_toggle.set_position(if open {
-            settings.left_sidebar_width()
-        } else {
-            0
-        });
-    });
-
-    let toggle_for_drag = toggle.clone();
-    paned.connect_position_notify(move |paned| {
-        if toggle_for_drag.is_active() && paned.position() > 0 {
-            Settings::new(&db).set_left_sidebar_width(paned.position());
-        }
-    });
-}
-
-/// Links the right-sidebar toggle to `paned`'s divider and persists both the
-/// open state and, while open, the dragged width. The right sidebar is the
-/// *end* child, so its width is `paned`'s total allocated width minus the
-/// divider position — read at toggle/drag time, once the widget is realized
-/// and that width is accurate (see `estimated_content_width` at construction
-/// for the one case where it isn't yet).
-fn wire_right_sidebar_toggle(toggle: &ToggleButton, paned: &Paned, db: Rc<Db>) {
-    let paned_for_toggle = paned.clone();
-    let db_for_toggle = Rc::clone(&db);
-    toggle.connect_toggled(move |btn| {
-        let settings = Settings::new(&db_for_toggle);
-        let open = btn.is_active();
-        settings.set_right_sidebar_open(open);
-        let total_width = paned_for_toggle.width();
-        paned_for_toggle.set_position(if open {
-            (total_width - settings.right_sidebar_width()).max(0)
-        } else {
-            total_width
-        });
-    });
-
-    let toggle_for_drag = toggle.clone();
-    paned.connect_position_notify(move |paned| {
-        if !toggle_for_drag.is_active() {
-            return;
-        }
-        let width = paned.width() - paned.position();
-        if width > 0 {
-            Settings::new(&db).set_right_sidebar_width(width);
-        }
-    });
-}
-
 pub fn build(
     app: &Application,
     db: Rc<Db>,
@@ -1499,34 +887,4 @@ pub fn build(
     });
 
     window
-}
-
-fn install_styles() {
-    let provider = gtk4::CssProvider::new();
-    provider.load_from_string(APP_CSS);
-    if let Some(display) = gtk4::gdk::Display::default() {
-        gtk4::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
-}
-
-fn sort_field_index(field: AlbumSortField) -> u32 {
-    SORT_FIELDS.iter().position(|f| *f == field).unwrap_or(0) as u32
-}
-
-fn sort_field_at(index: u32) -> AlbumSortField {
-    SORT_FIELDS
-        .get(index as usize)
-        .copied()
-        .unwrap_or(AlbumSortField::AlbumArtist)
-}
-
-fn direction_icon(direction: SortDirection) -> &'static str {
-    match direction {
-        SortDirection::Ascending => "view-sort-ascending-symbolic",
-        SortDirection::Descending => "view-sort-descending-symbolic",
-    }
 }

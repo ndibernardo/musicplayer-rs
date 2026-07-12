@@ -4,6 +4,7 @@ use crate::library::album::SortDirection;
 use crate::library::column::ColumnConfig;
 use crate::library::column::ColumnPrefs;
 use crate::library::db::Db;
+use crate::library::filter::FilterField;
 use crate::library::format;
 use crate::library::format::FormatExpr;
 use crate::library::format::TrackField;
@@ -36,7 +37,40 @@ const LEFT_SIDEBAR_OPEN_KEY: &str = "left_sidebar_open";
 const LEFT_SIDEBAR_WIDTH_KEY: &str = "left_sidebar_width";
 const RIGHT_SIDEBAR_OPEN_KEY: &str = "right_sidebar_open";
 const RIGHT_SIDEBAR_WIDTH_KEY: &str = "right_sidebar_width";
+
+/// Which horizontal edge of the window a sidebar occupies. Keys the
+/// per-sidebar open/width settings, so the two sidebars share one accessor
+/// pair instead of mirrored `left_*`/`right_*` method sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarEdge {
+    /// The window's leading edge — the filters sidebar.
+    Start,
+    /// The window's trailing edge — the queue/folders/status sidebar.
+    End,
+}
+
+/// The persisted keys stay `left_*`/`right_*` so existing databases keep
+/// their saved layout across this rename.
+const fn sidebar_open_key(edge: SidebarEdge) -> &'static str {
+    match edge {
+        SidebarEdge::Start => LEFT_SIDEBAR_OPEN_KEY,
+        SidebarEdge::End => RIGHT_SIDEBAR_OPEN_KEY,
+    }
+}
+
+const fn sidebar_width_key(edge: SidebarEdge) -> &'static str {
+    match edge {
+        SidebarEdge::Start => LEFT_SIDEBAR_WIDTH_KEY,
+        SidebarEdge::End => RIGHT_SIDEBAR_WIDTH_KEY,
+    }
+}
 const DEFAULT_SIDEBAR_WIDTH: i32 = 220;
+
+const SIDEBAR_FIELDS_KEY: &str = "sidebar_fields";
+/// The two categories the sidebar has always shown, kept as the default so
+/// existing installs (and a fresh one) see the same browse options as before
+/// this setting existed.
+const DEFAULT_SIDEBAR_FIELDS: [FilterField; 2] = [FilterField::Genre, FilterField::Artist];
 
 /// The settings key holding `field`'s format string.
 fn column_format_key(field: TrackField) -> String {
@@ -249,48 +283,50 @@ impl<'a> Settings<'a> {
         );
     }
 
-    /// Persisted open/collapsed state of the left (filters) sidebar. Defaults
-    /// to open when unset.
-    pub fn left_sidebar_open(&self) -> bool {
-        self.get(LEFT_SIDEBAR_OPEN_KEY).as_deref() != Some("false")
+    /// Persisted open/collapsed state of `edge`'s sidebar. Defaults to open
+    /// when unset.
+    pub fn sidebar_open(&self, edge: SidebarEdge) -> bool {
+        self.get(sidebar_open_key(edge)).as_deref() != Some("false")
     }
 
-    pub fn set_left_sidebar_open(&self, open: bool) {
-        self.set(LEFT_SIDEBAR_OPEN_KEY, if open { "true" } else { "false" });
+    pub fn set_sidebar_open(&self, edge: SidebarEdge, open: bool) {
+        self.set(sidebar_open_key(edge), if open { "true" } else { "false" });
     }
 
-    /// Persisted width in pixels of the left sidebar while open. Defaults to
+    /// Persisted width in pixels of `edge`'s sidebar while open. Defaults to
     /// `DEFAULT_SIDEBAR_WIDTH` when unset or unparsable.
-    pub fn left_sidebar_width(&self) -> i32 {
-        self.get(LEFT_SIDEBAR_WIDTH_KEY)
+    pub fn sidebar_width(&self, edge: SidebarEdge) -> i32 {
+        self.get(sidebar_width_key(edge))
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(DEFAULT_SIDEBAR_WIDTH)
     }
 
-    pub fn set_left_sidebar_width(&self, width: i32) {
-        self.set(LEFT_SIDEBAR_WIDTH_KEY, &width.to_string());
+    pub fn set_sidebar_width(&self, edge: SidebarEdge, width: i32) {
+        self.set(sidebar_width_key(edge), &width.to_string());
     }
 
-    /// Persisted open/collapsed state of the right (queue/folders/status)
-    /// sidebar. Defaults to open when unset.
-    pub fn right_sidebar_open(&self) -> bool {
-        self.get(RIGHT_SIDEBAR_OPEN_KEY).as_deref() != Some("false")
+    /// Persisted set of browsable filter categories shown in the sidebar, in
+    /// their canonical section order. Falls back to `DEFAULT_SIDEBAR_FIELDS`
+    /// when unset or when every stored key is unrecognised.
+    pub fn sidebar_fields(&self) -> Vec<FilterField> {
+        let Some(raw) = self.get(SIDEBAR_FIELDS_KEY) else {
+            return DEFAULT_SIDEBAR_FIELDS.to_vec();
+        };
+        let fields: Vec<FilterField> = raw.split(',').filter_map(FilterField::from_key).collect();
+        if fields.is_empty() {
+            DEFAULT_SIDEBAR_FIELDS.to_vec()
+        } else {
+            fields
+        }
     }
 
-    pub fn set_right_sidebar_open(&self, open: bool) {
-        self.set(RIGHT_SIDEBAR_OPEN_KEY, if open { "true" } else { "false" });
-    }
-
-    /// Persisted width in pixels of the right sidebar while open. Defaults to
-    /// `DEFAULT_SIDEBAR_WIDTH` when unset or unparsable.
-    pub fn right_sidebar_width(&self) -> i32 {
-        self.get(RIGHT_SIDEBAR_WIDTH_KEY)
-            .and_then(|s| s.parse::<i32>().ok())
-            .unwrap_or(DEFAULT_SIDEBAR_WIDTH)
-    }
-
-    pub fn set_right_sidebar_width(&self, width: i32) {
-        self.set(RIGHT_SIDEBAR_WIDTH_KEY, &width.to_string());
+    pub fn set_sidebar_fields(&self, fields: &[FilterField]) {
+        let encoded = fields
+            .iter()
+            .map(|f| f.as_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.set(SIDEBAR_FIELDS_KEY, &encoded);
     }
 
     fn get(&self, key: &str) -> Option<String> {
@@ -557,61 +593,102 @@ mod tests {
     }
 
     #[test]
-    fn left_sidebar_open_defaults_to_true_when_unset() {
-        let db = fresh();
-        assert!(Settings::new(&db).left_sidebar_open());
-    }
-
-    #[test]
-    fn left_sidebar_open_round_trips_false() {
-        let db = fresh();
-        Settings::new(&db).set_left_sidebar_open(false);
-        assert!(!Settings::new(&db).left_sidebar_open());
-    }
-
-    #[test]
-    fn left_sidebar_width_defaults_when_unset() {
+    fn sidebar_fields_defaults_to_genre_and_artist_when_unset() {
         let db = fresh();
         assert_eq!(
-            Settings::new(&db).left_sidebar_width(),
+            Settings::new(&db).sidebar_fields(),
+            vec![FilterField::Genre, FilterField::Artist]
+        );
+    }
+
+    #[test]
+    fn sidebar_fields_round_trips() {
+        let db = fresh();
+        let fields = vec![FilterField::Composer, FilterField::Year, FilterField::Genre];
+        Settings::new(&db).set_sidebar_fields(&fields);
+        assert_eq!(Settings::new(&db).sidebar_fields(), fields);
+    }
+
+    #[test]
+    fn sidebar_fields_skips_unrecognised_stored_keys() {
+        let db = fresh();
+        db.set_setting(SIDEBAR_FIELDS_KEY, "genre,not_a_real_field,year")
+            .unwrap();
+        assert_eq!(
+            Settings::new(&db).sidebar_fields(),
+            vec![FilterField::Genre, FilterField::Year]
+        );
+    }
+
+    #[test]
+    fn sidebar_fields_falls_back_to_default_when_every_stored_key_is_unrecognised() {
+        let db = fresh();
+        db.set_setting(SIDEBAR_FIELDS_KEY, "not_a_real_field")
+            .unwrap();
+        assert_eq!(
+            Settings::new(&db).sidebar_fields(),
+            vec![FilterField::Genre, FilterField::Artist]
+        );
+    }
+
+    #[test]
+    fn sidebar_open_defaults_to_true_when_unset_for_each_edge() {
+        let db = fresh();
+        assert!(Settings::new(&db).sidebar_open(SidebarEdge::Start));
+        assert!(Settings::new(&db).sidebar_open(SidebarEdge::End));
+    }
+
+    #[test]
+    fn sidebar_open_round_trips_false_for_the_start_edge() {
+        let db = fresh();
+        Settings::new(&db).set_sidebar_open(SidebarEdge::Start, false);
+        assert!(!Settings::new(&db).sidebar_open(SidebarEdge::Start));
+    }
+
+    #[test]
+    fn sidebar_width_defaults_when_unset_for_each_edge() {
+        let db = fresh();
+        assert_eq!(
+            Settings::new(&db).sidebar_width(SidebarEdge::Start),
+            DEFAULT_SIDEBAR_WIDTH
+        );
+        assert_eq!(
+            Settings::new(&db).sidebar_width(SidebarEdge::End),
             DEFAULT_SIDEBAR_WIDTH
         );
     }
 
     #[test]
-    fn left_sidebar_width_round_trips() {
+    fn sidebar_width_round_trips_for_the_start_edge() {
         let db = fresh();
-        Settings::new(&db).set_left_sidebar_width(260);
-        assert_eq!(Settings::new(&db).left_sidebar_width(), 260);
+        Settings::new(&db).set_sidebar_width(SidebarEdge::Start, 260);
+        assert_eq!(Settings::new(&db).sidebar_width(SidebarEdge::Start), 260);
     }
 
     #[test]
-    fn right_sidebar_open_defaults_to_true_when_unset() {
+    fn sidebar_settings_keep_the_two_edges_independent() {
         let db = fresh();
-        assert!(Settings::new(&db).right_sidebar_open());
-    }
-
-    #[test]
-    fn right_sidebar_open_round_trips_false() {
-        let db = fresh();
-        Settings::new(&db).set_right_sidebar_open(false);
-        assert!(!Settings::new(&db).right_sidebar_open());
-    }
-
-    #[test]
-    fn right_sidebar_width_defaults_when_unset() {
-        let db = fresh();
+        Settings::new(&db).set_sidebar_open(SidebarEdge::End, false);
+        Settings::new(&db).set_sidebar_width(SidebarEdge::End, 300);
+        assert!(Settings::new(&db).sidebar_open(SidebarEdge::Start));
         assert_eq!(
-            Settings::new(&db).right_sidebar_width(),
+            Settings::new(&db).sidebar_width(SidebarEdge::Start),
             DEFAULT_SIDEBAR_WIDTH
         );
     }
 
     #[test]
-    fn right_sidebar_width_round_trips() {
+    fn sidebar_open_round_trips_false_for_the_end_edge() {
         let db = fresh();
-        Settings::new(&db).set_right_sidebar_width(300);
-        assert_eq!(Settings::new(&db).right_sidebar_width(), 300);
+        Settings::new(&db).set_sidebar_open(SidebarEdge::End, false);
+        assert!(!Settings::new(&db).sidebar_open(SidebarEdge::End));
+    }
+
+    #[test]
+    fn sidebar_width_round_trips_for_the_end_edge() {
+        let db = fresh();
+        Settings::new(&db).set_sidebar_width(SidebarEdge::End, 300);
+        assert_eq!(Settings::new(&db).sidebar_width(SidebarEdge::End), 300);
     }
 
     proptest::proptest! {

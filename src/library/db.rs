@@ -10,6 +10,7 @@ use crate::library::album::AlbumSort;
 use crate::library::album::AlbumSummary;
 use crate::library::album::ArtKey;
 use crate::library::album::CoverArt;
+use crate::library::filter::FilterField;
 use crate::library::filter::LibraryFilter;
 use crate::library::track::AlbumArtData;
 use crate::library::track::AlbumTitle;
@@ -654,6 +655,31 @@ impl Db {
         )
     }
 
+    /// Returns tracks whose effective album artist — `COALESCE(album_artist,
+    /// artist)`, matching the album grid's own grouping — equals `artist`.
+    pub(crate) fn tracks_by_album_artist(&self, artist: &Artist) -> Result<Vec<Track>, DbError> {
+        self.query_tracks(
+            "WHERE COALESCE(album_artist, artist) = ?1 ORDER BY album, track_number",
+            [artist.as_str()],
+        )
+    }
+
+    /// Returns tracks tagged with `composer`, ordered by artist, then album, then track number.
+    pub(crate) fn tracks_by_composer(&self, composer: &Composer) -> Result<Vec<Track>, DbError> {
+        self.query_tracks(
+            "WHERE composer = ?1 ORDER BY artist, album, track_number",
+            [composer.as_str()],
+        )
+    }
+
+    /// Returns tracks released in `year`, ordered by artist, then album, then track number.
+    pub(crate) fn tracks_by_year(&self, year: Year) -> Result<Vec<Track>, DbError> {
+        self.query_tracks(
+            "WHERE year = ?1 ORDER BY artist, album, track_number",
+            [year.value() as i64],
+        )
+    }
+
     /// Returns tracks on `album`, ordered by disc, then track number.
     pub(crate) fn tracks_by_album(&self, album: &AlbumTitle) -> Result<Vec<Track>, DbError> {
         self.query_tracks(
@@ -710,6 +736,76 @@ impl Db {
             .collect()
     }
 
+    /// Distinct effective album artists — `COALESCE(album_artist, artist)`,
+    /// matching the album grid's own grouping — alphabetically ordered.
+    pub fn distinct_album_artists(&self) -> Result<Vec<Artist>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT COALESCE(album_artist, artist) AS effective_artist FROM tracks
+             WHERE COALESCE(album_artist, artist) IS NOT NULL ORDER BY effective_artist",
+        )?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .map(|r| r.map_err(DbError::from).map(Artist::new))
+            .collect()
+    }
+
+    /// Distinct non-empty composers present in the library, alphabetically ordered.
+    pub fn distinct_composers(&self) -> Result<Vec<Composer>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT composer FROM tracks WHERE composer IS NOT NULL ORDER BY composer",
+        )?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .map(|r| r.map_err(DbError::from).map(Composer::new))
+            .collect()
+    }
+
+    /// Distinct known release years present in the library, ascending.
+    pub fn distinct_years(&self) -> Result<Vec<Year>, DbError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT year FROM tracks WHERE year IS NOT NULL ORDER BY year",
+        )?;
+        stmt.query_map([], |row| row.get::<_, i64>(0))?
+            .map(|r| {
+                let year = r.map_err(DbError::from)?;
+                u16::try_from(year)
+                    .map(Year::new)
+                    .map_err(|e| DbError::InvalidData(format!("year out of range: {e}")))
+            })
+            .collect()
+    }
+
+    /// Distinct values for `field`, rendered as display strings — the
+    /// generalised sidebar's single entry point, so it doesn't need to know
+    /// each field's underlying domain type.
+    pub fn distinct_values_for(&self, field: FilterField) -> Result<Vec<String>, DbError> {
+        match field {
+            FilterField::Genre => Ok(self
+                .distinct_genres()?
+                .iter()
+                .map(|g| g.as_str().to_owned())
+                .collect()),
+            FilterField::AlbumArtist => Ok(self
+                .distinct_album_artists()?
+                .iter()
+                .map(|a| a.as_str().to_owned())
+                .collect()),
+            FilterField::Artist => Ok(self
+                .distinct_artists()?
+                .iter()
+                .map(|a| a.as_str().to_owned())
+                .collect()),
+            FilterField::Year => Ok(self
+                .distinct_years()?
+                .iter()
+                .map(|y| y.value().to_string())
+                .collect()),
+            FilterField::Composer => Ok(self
+                .distinct_composers()?
+                .iter()
+                .map(|c| c.as_str().to_owned())
+                .collect()),
+        }
+    }
+
     /// Album summaries in `sort` order — one summary per (album, album
     /// artist) pair for the album grid. The album artist is
     /// `COALESCE(album_artist, artist)`, so a compilation credited to one album
@@ -743,6 +839,38 @@ impl Db {
         self.album_summaries_query("WHERE artist = ?1", [artist.as_str()], sort)
     }
 
+    /// Album summaries whose effective album artist — `COALESCE(album_artist,
+    /// artist)` — equals `artist`, in `sort` order.
+    pub(crate) fn album_summaries_by_album_artist_sorted(
+        &self,
+        artist: &Artist,
+        sort: &AlbumSort,
+    ) -> Result<Vec<AlbumSummary>, DbError> {
+        self.album_summaries_query(
+            "WHERE COALESCE(album_artist, artist) = ?1",
+            [artist.as_str()],
+            sort,
+        )
+    }
+
+    /// Album summaries with at least one track credited to `composer`, in `sort` order.
+    pub(crate) fn album_summaries_by_composer_sorted(
+        &self,
+        composer: &Composer,
+        sort: &AlbumSort,
+    ) -> Result<Vec<AlbumSummary>, DbError> {
+        self.album_summaries_query("WHERE composer = ?1", [composer.as_str()], sort)
+    }
+
+    /// Album summaries with at least one track released in `year`, in `sort` order.
+    pub(crate) fn album_summaries_by_year_sorted(
+        &self,
+        year: Year,
+        sort: &AlbumSort,
+    ) -> Result<Vec<AlbumSummary>, DbError> {
+        self.album_summaries_query("WHERE year = ?1", [year.value() as i64], sort)
+    }
+
     /// Album summaries whose album title equals `album`, in `sort` order.
     pub(crate) fn album_summaries_by_album_sorted(
         &self,
@@ -759,7 +887,10 @@ impl Db {
             LibraryFilter::All => self.list_tracks(),
             LibraryFilter::ByGenre(g) => self.tracks_by_genre(g),
             LibraryFilter::ByArtist(a) => self.tracks_by_artist(a),
+            LibraryFilter::ByAlbumArtist(a) => self.tracks_by_album_artist(a),
             LibraryFilter::ByAlbum(a) => self.tracks_by_album(a),
+            LibraryFilter::ByYear(y) => self.tracks_by_year(*y),
+            LibraryFilter::ByComposer(c) => self.tracks_by_composer(c),
         }
     }
 
@@ -774,7 +905,10 @@ impl Db {
             LibraryFilter::All => self.album_summaries_sorted(sort),
             LibraryFilter::ByGenre(g) => self.album_summaries_by_genre_sorted(g, sort),
             LibraryFilter::ByArtist(a) => self.album_summaries_by_artist_sorted(a, sort),
+            LibraryFilter::ByAlbumArtist(a) => self.album_summaries_by_album_artist_sorted(a, sort),
             LibraryFilter::ByAlbum(a) => self.album_summaries_by_album_sorted(a, sort),
+            LibraryFilter::ByYear(y) => self.album_summaries_by_year_sorted(*y, sort),
+            LibraryFilter::ByComposer(c) => self.album_summaries_by_composer_sorted(c, sort),
         }
     }
 
@@ -1352,6 +1486,83 @@ mod tests {
     }
 
     #[test]
+    fn tracks_by_album_artist_returns_only_that_credited_album_artist() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&compilation_track(
+            "/music/warp/track01.flac",
+            "Aphex Twin",
+            "Various Artists",
+        ))
+        .unwrap();
+        db.upsert_track(&track_tagged(
+            "/music/boc/roygbiv.flac",
+            "Boards of Canada",
+            "Music Has the Right to Children",
+            "Electronic",
+        ))
+        .unwrap();
+
+        let compilation = db
+            .tracks_by_album_artist(&Artist::new("Various Artists"))
+            .unwrap();
+        assert_eq!(compilation.len(), 1);
+        assert_eq!(compilation[0].artist.as_str(), "Aphex Twin");
+    }
+
+    #[test]
+    fn tracks_by_album_artist_falls_back_to_track_artist_when_absent() {
+        let db = Db::open_in_memory().unwrap();
+        let track = Track {
+            album_artist: Artist::new(""),
+            ..full_track("/music/boc/roygbiv.flac")
+        };
+        db.upsert_track(&track).unwrap();
+
+        let matches = db
+            .tracks_by_album_artist(&Artist::new("Boards of Canada"))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn tracks_by_composer_returns_only_matching_composer() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&Track {
+            composer: Composer::new("Erik Satie"),
+            ..full_track("/music/satie/gymnopedie.flac")
+        })
+        .unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+
+        let satie = db.tracks_by_composer(&Composer::new("Erik Satie")).unwrap();
+        assert_eq!(satie.len(), 1);
+        assert_eq!(
+            satie[0].path.as_path(),
+            Path::new("/music/satie/gymnopedie.flac")
+        );
+    }
+
+    #[test]
+    fn tracks_by_year_returns_only_matching_year() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&Track {
+            year: Year::new(2002),
+            ..full_track("/music/boc/geogaddi.flac")
+        })
+        .unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+
+        let from_2002 = db.tracks_by_year(Year::new(2002)).unwrap();
+        assert_eq!(from_2002.len(), 1);
+        assert_eq!(
+            from_2002[0].path.as_path(),
+            Path::new("/music/boc/geogaddi.flac")
+        );
+    }
+
+    #[test]
     fn distinct_genres_returns_sorted_unique_values() {
         let db = Db::open_in_memory().unwrap();
         db.upsert_track(&track_tagged(
@@ -1415,6 +1626,113 @@ mod tests {
 
         let albums = db.distinct_albums().unwrap();
         assert_eq!(albums, vec![AlbumTitle::new("Geogaddi")]);
+    }
+
+    #[test]
+    fn distinct_album_artists_returns_effective_artist_and_falls_back_when_absent() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&compilation_track(
+            "/music/warp/track01.flac",
+            "Aphex Twin",
+            "Various Artists",
+        ))
+        .unwrap();
+        // No album-artist tag: falls back to the track artist.
+        let track = Track {
+            album_artist: Artist::new(""),
+            ..full_track("/music/boc/roygbiv.flac")
+        };
+        db.upsert_track(&track).unwrap();
+
+        let album_artists = db.distinct_album_artists().unwrap();
+        assert_eq!(
+            album_artists,
+            vec![
+                Artist::new("Boards of Canada"),
+                Artist::new("Various Artists")
+            ]
+        );
+    }
+
+    #[test]
+    fn distinct_composers_excludes_absent_tag() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&Track {
+            composer: Composer::new("Erik Satie"),
+            ..full_track("/music/satie/gymnopedie.flac")
+        })
+        .unwrap();
+        db.upsert_track(&minimal_track("/music/unknown.mp3"))
+            .unwrap();
+
+        let composers = db.distinct_composers().unwrap();
+        assert_eq!(composers, vec![Composer::new("Erik Satie")]);
+    }
+
+    #[test]
+    fn distinct_years_returns_sorted_unique_values() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&Track {
+            year: Year::new(2002),
+            ..full_track("/music/boc/geogaddi.flac")
+        })
+        .unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        db.upsert_track(&minimal_track("/music/unknown.mp3"))
+            .unwrap();
+
+        let years = db.distinct_years().unwrap();
+        assert_eq!(years, vec![Year::new(1998), Year::new(2002)]);
+    }
+
+    #[test]
+    fn distinct_values_for_genre_matches_distinct_genres() {
+        let db = two_artist_library();
+        assert_eq!(
+            db.distinct_values_for(FilterField::Genre).unwrap(),
+            vec!["Ambient".to_owned(), "Electronic".to_owned()]
+        );
+    }
+
+    #[test]
+    fn distinct_values_for_album_artist_matches_distinct_album_artists() {
+        let db = two_artist_library();
+        assert_eq!(
+            db.distinct_values_for(FilterField::AlbumArtist).unwrap(),
+            vec!["Aphex Twin".to_owned(), "Boards of Canada".to_owned()]
+        );
+    }
+
+    #[test]
+    fn distinct_values_for_artist_matches_distinct_artists() {
+        let db = two_artist_library();
+        assert_eq!(
+            db.distinct_values_for(FilterField::Artist).unwrap(),
+            vec!["Aphex Twin".to_owned(), "Boards of Canada".to_owned()]
+        );
+    }
+
+    #[test]
+    fn distinct_values_for_year_matches_distinct_years() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        assert_eq!(
+            db.distinct_values_for(FilterField::Year).unwrap(),
+            vec!["1998".to_owned()]
+        );
+    }
+
+    #[test]
+    fn distinct_values_for_composer_matches_distinct_composers() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+        assert_eq!(
+            db.distinct_values_for(FilterField::Composer).unwrap(),
+            vec!["Boards of Canada".to_owned()]
+        );
     }
 
     #[test]
@@ -2112,6 +2430,60 @@ mod tests {
     }
 
     #[test]
+    fn tracks_for_by_album_artist_returns_only_that_album_artist() {
+        let db = two_artist_library();
+        let tracks = db
+            .tracks_for(&LibraryFilter::ByAlbumArtist(Artist::new(
+                "Boards of Canada",
+            )))
+            .unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].album.as_str(), "Music Has the Right to Children");
+    }
+
+    #[test]
+    fn tracks_for_by_year_returns_only_that_year() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&Track {
+            year: Year::new(2002),
+            ..full_track("/music/boc/geogaddi.flac")
+        })
+        .unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+
+        let tracks = db
+            .tracks_for(&LibraryFilter::ByYear(Year::new(2002)))
+            .unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0].path.as_path(),
+            Path::new("/music/boc/geogaddi.flac")
+        );
+    }
+
+    #[test]
+    fn tracks_for_by_composer_returns_only_that_composer() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&Track {
+            composer: Composer::new("Erik Satie"),
+            ..full_track("/music/satie/gymnopedie.flac")
+        })
+        .unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+
+        let tracks = db
+            .tracks_for(&LibraryFilter::ByComposer(Composer::new("Erik Satie")))
+            .unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0].path.as_path(),
+            Path::new("/music/satie/gymnopedie.flac")
+        );
+    }
+
+    #[test]
     fn album_summaries_for_all_returns_every_album() {
         let db = two_artist_library();
         assert_eq!(
@@ -2159,5 +2531,58 @@ mod tests {
             .unwrap();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].genre.as_str(), "Ambient");
+    }
+
+    #[test]
+    fn album_summaries_for_by_album_artist_returns_only_that_album_artist() {
+        let db = two_artist_library();
+        let albums = db
+            .album_summaries_for(
+                &LibraryFilter::ByAlbumArtist(Artist::new("Boards of Canada")),
+                &AlbumSort::default(),
+            )
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].album.as_str(), "Music Has the Right to Children");
+    }
+
+    #[test]
+    fn album_summaries_for_by_year_returns_only_that_year() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&Track {
+            year: Year::new(2002),
+            ..full_track("/music/boc/geogaddi.flac")
+        })
+        .unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+
+        let albums = db
+            .album_summaries_for(
+                &LibraryFilter::ByYear(Year::new(2002)),
+                &AlbumSort::default(),
+            )
+            .unwrap();
+        assert_eq!(albums.len(), 1);
+    }
+
+    #[test]
+    fn album_summaries_for_by_composer_returns_only_that_composer() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_track(&Track {
+            composer: Composer::new("Erik Satie"),
+            ..full_track("/music/satie/gymnopedie.flac")
+        })
+        .unwrap();
+        db.upsert_track(&full_track("/music/boc/roygbiv.flac"))
+            .unwrap();
+
+        let albums = db
+            .album_summaries_for(
+                &LibraryFilter::ByComposer(Composer::new("Erik Satie")),
+                &AlbumSort::default(),
+            )
+            .unwrap();
+        assert_eq!(albums.len(), 1);
     }
 }
