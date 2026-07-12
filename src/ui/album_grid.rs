@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::cell::OnceCell;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -51,6 +52,13 @@ const DEFAULT_COLUMNS: usize = 4;
 /// Per-cover horizontal budget beyond the cover itself (cell padding + inter-
 /// cover spacing) — used to estimate how many covers fit a given width.
 const COVER_SLOT_EXTRA: i32 = 34;
+
+/// Per-row vertical budget beyond the cover itself (album/artist/year labels
+/// plus inter-row spacing) — used only to estimate how many rows the
+/// viewport can show, for `AlbumGrid::visible_rows`. An overestimate just
+/// means a handful of extra cells build eagerly instead of on the next idle
+/// tick; nothing here depends on it being exact.
+const ROW_SLOT_EXTRA: i32 = 76;
 
 /// Combined left+right margin of the grid container (px).
 const GRID_MARGIN_TOTAL: i32 = 12;
@@ -135,6 +143,11 @@ pub struct AlbumGrid {
 struct AlbumGridInner {
     grid_box: GtkBox,
     state: RefCell<GridState>,
+    // Bumped by every `set_albums` call. The chunked build it starts checks
+    // this each idle tick and stops as soon as it no longer matches, so a
+    // rapid filter/sort change doesn't leave a stale build still appending
+    // rows behind the current one's back.
+    build_generation: Cell<u64>,
     // Sends (key, bytes) to the background decode thread; see `spawn_art_decoder`.
     art_request_tx: async_channel::Sender<(ArtKey, AlbumArtData)>,
     art_provider: OnceCell<ArtProvider>,
@@ -167,6 +180,7 @@ impl AlbumGrid {
 
         let inner = Rc::new(AlbumGridInner {
             grid_box,
+            build_generation: Cell::new(0),
             state: RefCell::new(GridState {
                 cells: Vec::new(),
                 row_boxes: Vec::new(),
@@ -226,45 +240,139 @@ impl AlbumGrid {
             .connect_page_size_notify(move |_| this.reflow());
     }
 
-    /// Rebuilds the cover grid and closes any open drawer.
+    /// Rebuilds the cover grid and closes any open drawer. Enough rows to
+    /// fill the visible viewport are built synchronously, immediately, so
+    /// there's something on screen the instant this returns; the rest build
+    /// off the critical path — see `build_cells_in_chunks`.
     pub fn set_albums(&self, albums: Vec<AlbumSummary>) {
         remove_all_children(&self.inner.grid_box);
-
-        let cells: Vec<AlbumCell> = albums
-            .into_iter()
-            .enumerate()
-            .map(|(index, summary)| self.build_cell(index, summary))
-            .collect();
         let columns = self.columns_for_current_width();
         {
             let mut state = self.inner.state.borrow_mut();
             state.drawer = DrawerState::Closed;
             state.multi_selected.clear();
             state.selection_anchor = None;
-            state.cells = cells;
+            state.cells = Vec::new();
+            state.row_boxes = Vec::new();
+            state.columns = columns;
         }
-        self.lay_out(columns);
+
+        let generation = self.inner.build_generation.get().wrapping_add(1);
+        self.inner.build_generation.set(generation);
+
+        let mut albums = albums.into_iter().enumerate();
+        let eager_count = (self.visible_rows() * columns).min(albums.len());
+        let mut eager: Vec<AlbumCell> = Vec::with_capacity(eager_count);
+        for (index, summary) in albums.by_ref().take(eager_count) {
+            eager.push(self.build_cell(index, summary));
+            if eager.len() == columns {
+                self.flush_pending_row(&mut eager);
+            }
+        }
+        self.flush_pending_row(&mut eager);
+
+        self.build_cells_in_chunks(albums, generation);
     }
 
-    /// Arranges the existing cover cells into rows of `columns`.
+    /// Rows tall enough to cover the current viewport, at least one — used to
+    /// size the eager, synchronous part of `set_albums`. Falls back to a
+    /// small fixed guess when the widget hasn't been allocated a real height
+    /// yet (its first-ever population, right after the window presents,
+    /// which is also where GTK pays its one-time font/CSS/type-system
+    /// cold-start cost — exactly when this matters most).
+    fn visible_rows(&self) -> usize {
+        let page_size = self.widget.vadjustment().page_size() as i32;
+        if page_size <= 0 {
+            return 3;
+        }
+        let cover_size = self.inner.state.borrow().cover_size;
+        let row_height = cover_size + ROW_SLOT_EXTRA;
+        ((page_size / row_height) as usize).max(1) + 1
+    }
+
+    /// Builds `AlbumCell`s a chunk at a time on the GTK idle queue instead of
+    /// all at once. `build_cell` allocates an `Image`, up to three `Label`s,
+    /// and two `GestureClick` controllers per album — for a library with
+    /// thousands of albums, doing that in one synchronous loop is what used
+    /// to freeze the switch to Grid view (and, before the startup fix, the
+    /// whole window). `generation` is re-checked every tick: a later
+    /// `set_albums` call (a filter or sort change while this one is still
+    /// running) bumps it, which makes this one stop rather than race it.
+    fn build_cells_in_chunks(
+        &self,
+        mut albums: impl Iterator<Item = (usize, AlbumSummary)> + 'static,
+        generation: u64,
+    ) {
+        const CHUNK: usize = 40;
+
+        let grid = self.clone();
+        let mut pending: Vec<AlbumCell> = Vec::new();
+        glib::idle_add_local(move || {
+            if grid.inner.build_generation.get() != generation {
+                return glib::ControlFlow::Break;
+            }
+            let columns = grid.inner.state.borrow().columns.max(1);
+            for _ in 0..CHUNK {
+                match albums.next() {
+                    Some((index, summary)) => {
+                        pending.push(grid.build_cell(index, summary));
+                        if pending.len() == columns {
+                            grid.flush_pending_row(&mut pending);
+                        }
+                    }
+                    None => {
+                        grid.flush_pending_row(&mut pending);
+                        return glib::ControlFlow::Break;
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Parents `pending`'s cells into one new row and moves them into
+    /// `state`, leaving `pending` empty — a no-op if it already is (the
+    /// end-of-build call when the last row divided evenly). Cells only ever
+    /// enter `state.cells` already parented into a row, so a `reflow` that
+    /// runs mid-build (the window resized while a big library is still
+    /// loading) only ever re-lays out cells that are actually placed, never
+    /// one `build_cells_in_chunks` is still holding onto for the row in
+    /// progress.
+    fn flush_pending_row(&self, pending: &mut Vec<AlbumCell>) {
+        if pending.is_empty() {
+            return;
+        }
+        let widgets: Vec<GtkBox> = pending.iter().map(|c| c.cell.clone()).collect();
+        let row_box = self.append_row(&widgets);
+        let mut state = self.inner.state.borrow_mut();
+        state.cells.append(pending);
+        state.row_boxes.push(row_box);
+    }
+
+    /// Appends one row of `cells` to `grid_box` and returns its container,
+    /// left-aligned so even a partial row starts at the same edge as every
+    /// other row instead of floating to the middle.
+    fn append_row(&self, cells: &[GtkBox]) -> GtkBox {
+        let row_box = GtkBox::new(Orientation::Horizontal, 16);
+        row_box.set_halign(Align::Start);
+        for cell in cells {
+            row_box.append(cell);
+        }
+        self.inner.grid_box.append(&row_box);
+        row_box
+    }
+
+    /// Arranges the existing cover cells into rows of `columns`. Used by
+    /// `reflow`, where every cell already exists and just needs re-grouping.
     fn lay_out(&self, columns: usize) {
         let cell_widgets: Vec<GtkBox> = {
             let state = self.inner.state.borrow();
             state.cells.iter().map(|c| c.cell.clone()).collect()
         };
-        let mut row_boxes = Vec::new();
-        for chunk in cell_widgets.chunks(columns) {
-            let row_box = GtkBox::new(Orientation::Horizontal, 16);
-            // Left-align every row, including a partial last row, so covers
-            // always start at the same edge instead of the last row floating
-            // to the middle.
-            row_box.set_halign(Align::Start);
-            for cell in chunk {
-                row_box.append(cell);
-            }
-            self.inner.grid_box.append(&row_box);
-            row_boxes.push(row_box);
-        }
+        let row_boxes: Vec<GtkBox> = cell_widgets
+            .chunks(columns)
+            .map(|chunk| self.append_row(chunk))
+            .collect();
         let mut state = self.inner.state.borrow_mut();
         state.columns = columns;
         state.row_boxes = row_boxes;

@@ -915,9 +915,10 @@ impl Db {
     /// Runs the album-summary aggregate with the given `WHERE` clause. Albums are
     /// grouped by their album artist, `COALESCE(album_artist, artist)`, so a
     /// compilation collapses to one entry and a missing album-artist tag falls
-    /// back to the track artist. `MAX` on genre/year skips NULLs. `has_art` is an
-    /// `EXISTS` check rather than a data fetch — the grid only needs to know
-    /// whether a cover exists, and fetches the bytes separately on demand.
+    /// back to the track artist. `MAX` on genre/year skips NULLs. `has_art` asks
+    /// whether the album has a cover at all — never filtered by `where_clause`,
+    /// so it stays true even when the art-bearing track itself isn't part of
+    /// the current view (e.g. a genre filter that excludes it).
     fn album_summaries_query(
         &self,
         where_clause: &str,
@@ -925,21 +926,32 @@ impl Db {
         sort: &AlbumSort,
     ) -> Result<Vec<AlbumSummary>, DbError> {
         let order_by = sort.order_by_clause();
-        // Correlated EXISTS avoids a JOIN that would make `album` and
-        // `album_artist` ambiguous in GROUP BY and ORDER BY (both tables share
-        // those column names). `SELECT 1` never reads the art_blobs BLOB —
-        // the join only needs to know a matching track_art row exists.
+        // `art` is computed once, over every track, as its own GROUP BY pass
+        // (indexed track_id join) and then joined to the outer query by key —
+        // not a correlated `EXISTS` re-scanning tracks per album group, which
+        // is what this used to be. The `COALESCE` in the correlated version's
+        // join condition couldn't use an index, so it degraded to a re-scan
+        // per album; with thousands of albums that dwarfed every other query
+        // this view runs. `a2_`-prefixed aliases keep the derived table's
+        // columns from colliding with `tracks`', so `where_clause`'s bare
+        // column names stay unambiguous.
         let sql = format!(
-            "SELECT album,
-                    COALESCE(album_artist, artist) AS album_artist,
-                    MAX(genre) AS album_genre,
-                    MAX(year)  AS album_year,
-                    EXISTS(SELECT 1 FROM tracks t2
-                           JOIN track_art ta ON ta.track_id = t2.track_id
-                           WHERE t2.album = tracks.album
-                             AND COALESCE(t2.album_artist, t2.artist)
-                                 = COALESCE(tracks.album_artist, tracks.artist)) AS has_art
+            "SELECT tracks.album AS album,
+                    COALESCE(tracks.album_artist, tracks.artist) AS album_artist,
+                    MAX(tracks.genre) AS album_genre,
+                    MAX(tracks.year)  AS album_year,
+                    COALESCE(art.has_art, 0) AS has_art
              FROM tracks
+             LEFT JOIN (
+                 SELECT t2.album AS a2_album,
+                        COALESCE(t2.album_artist, t2.artist) AS a2_album_artist,
+                        MAX(ta.track_id IS NOT NULL) AS has_art
+                 FROM tracks t2
+                 LEFT JOIN track_art ta ON ta.track_id = t2.track_id
+                 GROUP BY a2_album, a2_album_artist
+             ) art
+               ON art.a2_album = tracks.album
+              AND art.a2_album_artist = COALESCE(tracks.album_artist, tracks.artist)
              {where_clause}
              GROUP BY album, album_artist
              {order_by}"

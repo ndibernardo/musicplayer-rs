@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use gtk4::Expander;
+use gtk4::Label;
 use gtk4::ListBoxRow;
 use gtk4::ScrolledWindow;
 use gtk4::prelude::*;
@@ -8,19 +8,25 @@ use gtk4::prelude::*;
 use crate::library::track::Track;
 use crate::library::track::TrackId;
 use crate::ui::format::display_title;
+use crate::ui::style;
+use crate::ui::style::StyleClass;
 use crate::ui::widgets::Callback;
-use crate::ui::widgets::CollapsibleSection;
 use crate::ui::widgets::ValueList;
 use crate::ui::widgets::two_line_row;
 
-/// The play queue as a selectable list. The currently playing track is
-/// highlighted; activating a row jumps playback to it. Wrapped in its own
-/// [`CollapsibleSection`], which auto-collapses whenever the queue empties
-/// out, matching the sidebar's genre/artist sections.
+/// The play queue as a selectable list, under a plain "Queue" section title —
+/// always visible, unlike the sidebar's other sections, so an empty queue
+/// still reads as "nothing queued" rather than disappearing.
+///
+/// Exposes its title and its scrollable list separately, so the caller can
+/// place the title in a `SidebarPanel`'s header slot — the same slot
+/// `Sidebar`'s "Library" title uses — instead of stacking it inside the
+/// content area, where it would pick up the panel's own top inset and end up
+/// looking indented differently from "Library".
 #[derive(Clone)]
 pub struct QueueView {
-    pub widget: Expander,
-    section: CollapsibleSection,
+    header: Label,
+    content: ScrolledWindow,
     list: ValueList<Track>,
     on_select: Rc<Callback<usize>>,
 }
@@ -31,17 +37,15 @@ impl QueueView {
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_min_content_height(140);
-        // Fills all the way to the bottom of the section's allocated space
-        // while open, instead of stopping at its minimum content height and
-        // leaving a gap above the sections below it.
+        // Fills all the way to the bottom of the sidebar's leftover height,
+        // pinning whatever sits below it (watched folders, status) to the
+        // bottom — its own layout preference, not the panel's.
         scrolled.set_vexpand(true);
         scrolled.set_child(Some(list.widget()));
 
-        let section = CollapsibleSection::new("Queue", &scrolled);
-        // The queue expands to fill its sidebar's leftover height, pinning
-        // whatever sits below it (watched folders, status) to the bottom —
-        // its own layout preference, not the panel's.
-        section.widget().set_vexpand(true);
+        let title = Label::new(Some("Queue"));
+        title.set_xalign(0.0);
+        style::add_class(&title, StyleClass::SectionName);
 
         let on_select: Rc<Callback<usize>> = Rc::new(Callback::new());
         {
@@ -50,18 +54,27 @@ impl QueueView {
         }
 
         Self {
-            widget: section.widget().clone(),
-            section,
+            header: title,
+            content: scrolled,
             list,
             on_select,
         }
     }
 
-    /// Replaces the visible queue with `tracks`, collapsing the section when
-    /// the queue empties out.
+    /// The "Queue" title label — the panel's header slot.
+    pub fn header(&self) -> &Label {
+        &self.header
+    }
+
+    /// The scrollable queue list — stacked into the panel's content slot
+    /// above the watched-folders tree.
+    pub fn content(&self) -> &ScrolledWindow {
+        &self.content
+    }
+
+    /// Replaces the visible queue with `tracks`.
     pub fn set_tracks(&self, tracks: Vec<Track>) {
-        let empty = self.list.set_items(tracks);
-        self.section.set_empty(empty);
+        self.list.set_items(tracks);
     }
 
     /// Highlights the row whose track matches `current`, or clears the highlight

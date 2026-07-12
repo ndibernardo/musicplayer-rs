@@ -16,6 +16,15 @@ list.app-section-list row {
     background: none;
     box-shadow: none;
 }
+/* Inset is padding, not margin: margin would leave a gap to the row's own
+   left edge that :hover/:selected can't paint over, so the highlight reads
+   as cut off from the sidebar's edge. Padding keeps the highlight flush
+   edge-to-edge. Only the queue uses this list now — its rows sit under a
+   plain "Queue" label, not a collapsible section's arrow, so there's no
+   nesting to indent for; left inset matches the label's own. */
+list.app-section-list row {
+    padding: 4px 8px;
+}
 list.app-section-list row:hover {
     background-color: alpha(currentColor, 0.07);
 }
@@ -27,21 +36,39 @@ list.app-section-list row:selected label {
     color: @theme_selected_fg_color;
 }
 
-/* Collapsible section title — bold, so it reads apart from its rows. */
+/* A sidebar section's title — bold, so it reads apart from its rows below,
+   with a small inset off the sidebar's own left edge. Shared by both panels'
+   section titles ("Library", "Queue") so they read as the same kind of
+   heading. */
 .app-section-name {
     font-weight: bold;
-}
-
-/* Sidebar panel title — a size step above the section names under it. */
-.app-sidebar-title {
-    font-weight: bold;
-    font-size: 1.15em;
+    padding-left: 6px;
 }
 
 /* Sidebar panels get a whisper of tint so they read as panels against the
    content area — currentColor-based, so it adapts to light and dark themes. */
 .app-sidebar {
     background-color: alpha(currentColor, 0.04);
+}
+
+/* The GtkTreeView backing a sidebar's nav tree — same flat treatment as
+   .app-section-list, so it reads as part of the tinted sidebar rather than a
+   themed card floating inside it. Indentation under each category is the
+   tree's own native expander rendering, so no manual padding-left is needed
+   the way .app-section-list row needed one.
+   Unlike GtkListBox, GtkTreeView has no per-row `row`/`cell` CSS nodes — it
+   has exactly one node (`treeview.view`). GTK pushes the `:selected` state
+   onto that node only while painting a selected row's own rect, so scoping a
+   background to it here works per row; `:hover` is the widget's real,
+   whole-bounds hover state instead, so a background rule on it would paint
+   the entire tree on any hover, not just the row under the pointer — left
+   unstyled rather than doing that. */
+treeview.app-sidebar-tree {
+    background: none;
+}
+treeview.app-sidebar-tree:selected {
+    background-color: @theme_selected_bg_color;
+    color: @theme_selected_fg_color;
 }
 
 .player-bar {

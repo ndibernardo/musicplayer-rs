@@ -12,12 +12,12 @@ const STYLE_SHEET: &str = include_str!("style.css");
 pub enum StyleClass {
     /// Flat selectable list inside an indented sidebar section.
     SectionList,
-    /// Bold title of a collapsible sidebar section.
+    /// Bold title of a sidebar section.
     SectionName,
-    /// Bold, slightly larger sidebar panel title.
-    SidebarTitle,
     /// A sidebar panel's root container — tinted apart from the content area.
     Sidebar,
+    /// The `GtkTreeView` backing a sidebar's nav tree.
+    SidebarTree,
     /// The bottom transport bar.
     PlayerBar,
     /// The player bar's knobless seek scale.
@@ -38,8 +38,8 @@ impl StyleClass {
         match self {
             StyleClass::SectionList => "app-section-list",
             StyleClass::SectionName => "app-section-name",
-            StyleClass::SidebarTitle => "app-sidebar-title",
             StyleClass::Sidebar => "app-sidebar",
+            StyleClass::SidebarTree => "app-sidebar-tree",
             StyleClass::PlayerBar => "player-bar",
             StyleClass::Seek => "seek",
             StyleClass::AlbumCell => "album-cell",
@@ -79,20 +79,16 @@ pub fn install() {
 /// The app's spacing scale (px). Every margin is one of these steps, so
 /// spacing decisions read as named sizes instead of a number lottery.
 pub mod spacing {
-    /// Hairline: row inner padding.
-    pub const XS: i32 = 2;
     /// Small: section edge insets, control gaps.
     pub const S: i32 = 4;
     /// Medium: row insets, section vertical rhythm.
     pub const M: i32 = 8;
-    /// Large: section indentation.
-    pub const L: i32 = 12;
     /// Extra large: dialog and grid outer padding.
     pub const XL: i32 = 16;
 }
 
 /// A widget's four margins, built by chaining from a base constructor:
-/// `Margins::none().start(spacing::S).top(spacing::M)`.
+/// `Margins::none().top(spacing::M).bottom(spacing::S)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Margins {
     start: i32,
@@ -132,24 +128,6 @@ impl Margins {
         }
     }
 
-    /// Top and bottom margins `px`, start and end zero.
-    pub const fn vertical(px: i32) -> Self {
-        Self {
-            start: 0,
-            end: 0,
-            top: px,
-            bottom: px,
-        }
-    }
-
-    pub const fn start(self, px: i32) -> Self {
-        Self { start: px, ..self }
-    }
-
-    pub const fn end(self, px: i32) -> Self {
-        Self { end: px, ..self }
-    }
-
     pub const fn top(self, px: i32) -> Self {
         Self { top: px, ..self }
     }
@@ -176,8 +154,8 @@ mod tests {
     const ALL_CLASSES: [StyleClass; 10] = [
         StyleClass::SectionList,
         StyleClass::SectionName,
-        StyleClass::SidebarTitle,
         StyleClass::Sidebar,
+        StyleClass::SidebarTree,
         StyleClass::PlayerBar,
         StyleClass::Seek,
         StyleClass::AlbumCell,
@@ -215,24 +193,27 @@ mod tests {
         let margins = Margins::all(spacing::M);
         assert_eq!(
             margins,
-            Margins::none()
-                .start(spacing::M)
-                .end(spacing::M)
-                .top(spacing::M)
-                .bottom(spacing::M)
+            Margins {
+                start: spacing::M,
+                end: spacing::M,
+                top: spacing::M,
+                bottom: spacing::M,
+            }
         );
     }
 
     #[test]
     fn margins_horizontal_leaves_vertical_zero() {
-        let margins = Margins::horizontal(spacing::L);
-        assert_eq!(margins, Margins::none().start(spacing::L).end(spacing::L));
-    }
-
-    #[test]
-    fn margins_vertical_leaves_horizontal_zero() {
-        let margins = Margins::vertical(spacing::S);
-        assert_eq!(margins, Margins::none().top(spacing::S).bottom(spacing::S));
+        let margins = Margins::horizontal(spacing::XL);
+        assert_eq!(
+            margins,
+            Margins {
+                start: spacing::XL,
+                end: spacing::XL,
+                top: 0,
+                bottom: 0,
+            }
+        );
     }
 
     #[test]
@@ -240,11 +221,12 @@ mod tests {
         let margins = Margins::all(spacing::M).top(spacing::XL);
         assert_eq!(
             margins,
-            Margins::none()
-                .start(spacing::M)
-                .end(spacing::M)
-                .top(spacing::XL)
-                .bottom(spacing::M)
+            Margins {
+                start: spacing::M,
+                end: spacing::M,
+                top: spacing::XL,
+                bottom: spacing::M,
+            }
         );
     }
 }

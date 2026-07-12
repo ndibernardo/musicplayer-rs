@@ -28,6 +28,9 @@ use gtk4::prelude::*;
 
 use crate::library::album::AlbumSort;
 use crate::library::album::ArtKey;
+use crate::library::bootstrap::BootstrapError;
+use crate::library::bootstrap::LibraryBootstrap;
+use crate::library::bootstrap::spawn_bootstrap;
 use crate::library::column::ColumnPrefs;
 use crate::library::db::Db;
 use crate::library::filter::FilterField;
@@ -129,6 +132,13 @@ struct Context {
     // `apply` takes `&mut self` and nothing else ever touches `Context`.
     last_shown: Option<TrackId>,
     last_saved_secs: Option<u64>,
+    // The view mode currently on screen, and whether the album grid's
+    // contents are stale for it — kept as plain fields for the same reason
+    // as `last_shown` above. Rebuilding the grid is skipped whenever it
+    // isn't the visible view (e.g. at startup, which defaults to List) and
+    // caught up lazily the next time `ViewModeChanged` switches to Grid.
+    view_mode: ViewMode,
+    grid_dirty: bool,
 }
 
 impl Context {
@@ -368,6 +378,10 @@ impl Context {
             tx,
             last_shown: None,
             last_saved_secs: None,
+            view_mode: initial.view_mode,
+            // Not yet known to be stale or fresh — the first bootstrap
+            // arrival or view switch settles it either way.
+            grid_dirty: true,
         };
 
         (ctx, watch_rx)
@@ -392,16 +406,20 @@ impl Context {
                     Ok(tracks) => self.library_view.set_tracks(tracks),
                     Err(e) => tracing::error!("Filter query failed: {e}"),
                 }
-                self.refresh_album_grid_with(&state.filter, state.sort);
+                self.refresh_album_grid_or_mark_dirty(&state.filter, state.sort);
             }
             WindowMessage::SortFieldChanged(_) | WindowMessage::SortDirectionChanged(_) => {
                 self.settings().set_album_sort(state.sort);
-                self.refresh_album_grid_with(&state.filter, state.sort);
+                self.refresh_album_grid_or_mark_dirty(&state.filter, state.sort);
             }
             WindowMessage::ViewModeChanged(mode) => {
                 self.content.set_visible_child_name(mode.child_name());
                 self.settings().set_view_mode(*mode);
                 (self.toggle_grid_controls)(*mode);
+                self.view_mode = *mode;
+                if self.grid_dirty {
+                    self.refresh_album_grid_or_mark_dirty(&state.filter, state.sort);
+                }
             }
             WindowMessage::CoverSizeChanged(size) => {
                 self.album_grid.set_cover_size(*size);
@@ -491,6 +509,9 @@ impl Context {
                     }
                 }
             }
+            WindowMessage::LibraryBootstrapped(result) => {
+                self.apply_bootstrap(result, watcher);
+            }
         }
     }
 
@@ -557,13 +578,45 @@ impl Context {
 
     /// Reloads the tracks/sidebar/grid after the library changes, keeping the
     /// active filter applied.
-    fn refresh_views(&self, state: &WindowState) {
+    fn refresh_views(&mut self, state: &WindowState) {
         match self.db.tracks_for(&state.filter) {
             Ok(tracks) => self.library_view.set_tracks(tracks),
             Err(e) => tracing::error!("Reload after library change failed: {e}"),
         }
         self.refresh_sidebar();
-        self.refresh_album_grid_with(&state.filter, state.sort);
+        self.refresh_album_grid_or_mark_dirty(&state.filter, state.sort);
+    }
+
+    /// Applies the startup snapshot loaded off the main thread by
+    /// `bootstrap::spawn_bootstrap`: folder list, track list, sidebar
+    /// values, and — only if Grid is the view actually on screen — the
+    /// album grid. Also arms the folder watcher, since that needs the
+    /// folder list this snapshot carries.
+    fn apply_bootstrap(
+        &mut self,
+        result: &Result<LibraryBootstrap, BootstrapError>,
+        watcher: &mut Option<FolderWatcher>,
+    ) {
+        let bootstrap = match result {
+            Ok(bootstrap) => bootstrap,
+            Err(e) => {
+                self.status_label.set_text(&format!("Error: {e}"));
+                tracing::error!("Library bootstrap failed: {e}");
+                return;
+            }
+        };
+        self.folder_list.set_folders(bootstrap.folders.clone());
+        self.library_view.set_tracks(bootstrap.tracks.clone());
+        for (field, values) in &bootstrap.sidebar_values {
+            self.filter_sidebar.populate(*field, values.clone());
+        }
+        if self.view_mode == ViewMode::Grid {
+            self.album_grid.set_albums(bootstrap.albums.clone());
+            self.grid_dirty = false;
+        } else {
+            self.grid_dirty = true;
+        }
+        self.rewatch(watcher);
     }
 
     fn refresh_sidebar(&self) {
@@ -579,6 +632,21 @@ impl Context {
         match self.db.album_summaries_for(filter, &sort) {
             Ok(albums) => self.album_grid.set_albums(albums),
             Err(e) => self.status_label.set_text(&format!("Error: {e}")),
+        }
+    }
+
+    /// Rebuilds the album grid only when it's the view actually on screen;
+    /// otherwise just marks it stale. `ViewModeChanged` checks the flag and
+    /// catches up the next time the user switches to Grid. Building every
+    /// `AlbumCell` (image + two labels, all eager, no virtualization) for a
+    /// library the user is looking at as a list is startup cost paid for
+    /// nothing.
+    fn refresh_album_grid_or_mark_dirty(&mut self, filter: &LibraryFilter, sort: AlbumSort) {
+        if self.view_mode == ViewMode::Grid {
+            self.refresh_album_grid_with(filter, sort);
+            self.grid_dirty = false;
+        } else {
+            self.grid_dirty = true;
         }
     }
 
@@ -683,7 +751,7 @@ impl Context {
         });
     }
 
-    fn apply_scan_event(&self, state: &WindowState, event: &ScanEvent) {
+    fn apply_scan_event(&mut self, state: &WindowState, event: &ScanEvent) {
         match event {
             ScanEvent::Progress(n) => {
                 let msg = format!("Scanning… {n} files");
@@ -853,12 +921,19 @@ pub fn build(
 ) -> ApplicationWindow {
     let initial = InitialSettings::read(&db);
     let (tx, rx) = async_channel::unbounded::<WindowMessage>();
-    let (mut ctx, watch_rx) = Context::new(app, db, db_path, player, &initial, tx.clone());
+    let (mut ctx, watch_rx) = Context::new(app, db, db_path.clone(), player, &initial, tx.clone());
     let window = ctx.window.clone();
+    // Presented before a single folder/track/album is loaded — the whole
+    // point of `spawn_bootstrap` below. A library in the tens of thousands
+    // of tracks otherwise blocks the window from appearing at all: the old
+    // code ran every one of those queries, plus an `AlbumCell` widget build
+    // per album and a `ListStore::append` per track, synchronously on the
+    // main thread before `present()` was ever reached.
+    window.present();
 
     spawn_forward(state_rx, tx.clone(), WindowMessage::PlayerStateChanged);
     spawn_forward(queue_rx, tx.clone(), WindowMessage::PlayerQueueChanged);
-    wire_debounced_watcher(watch_rx, tx);
+    wire_debounced_watcher(watch_rx, tx.clone());
 
     let mut state = WindowState {
         filter: LibraryFilter::All,
@@ -867,17 +942,29 @@ pub fn build(
     };
     let mut watcher: Option<FolderWatcher> = None;
 
-    // First population, plus restoring the previous session's queue — direct
-    // calls, not dispatched `WindowMessage`s, since this runs once before the dispatch
-    // loop below takes ownership of `state`.
-    ctx.refresh_folder_list();
-    ctx.refresh_sidebar();
-    ctx.refresh_album_grid_with(&state.filter, state.sort);
-    ctx.rewatch(&mut watcher);
-    if let Ok(tracks) = ctx.db.tracks_for(&LibraryFilter::All) {
-        ctx.library_view.set_tracks(tracks);
-    }
+    // Restoring the previous session's queue is cheap — bounded by queue
+    // size, not library size — so it stays a direct call, not a dispatched
+    // `WindowMessage`, same as before.
     ctx.restore_queue(&initial, &mut state);
+
+    // Folders, tracks, album summaries, and sidebar values load on a
+    // background thread through their own `Db` connection (see
+    // `library::bootstrap`) and arrive as one `WindowMessage`, same path as
+    // every other update.
+    let bootstrap_rx = spawn_bootstrap(
+        db_path,
+        state.filter.clone(),
+        state.sort,
+        initial.sidebar_fields.clone(),
+    );
+    let bootstrap_tx = tx.clone();
+    glib::spawn_future_local(async move {
+        if let Ok(result) = bootstrap_rx.recv().await {
+            let _ = bootstrap_tx
+                .send(WindowMessage::LibraryBootstrapped(result))
+                .await;
+        }
+    });
 
     glib::spawn_future_local(async move {
         while let Ok(msg) = rx.recv().await {

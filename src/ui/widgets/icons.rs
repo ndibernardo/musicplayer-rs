@@ -3,7 +3,6 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppIcon {
     ListAdd,
-    ListRemove,
     ListDragHandle,
     EditClear,
     SidebarShow,
@@ -28,7 +27,6 @@ impl AppIcon {
     pub const fn name(self) -> &'static str {
         match self {
             AppIcon::ListAdd => "list-add-symbolic",
-            AppIcon::ListRemove => "list-remove-symbolic",
             AppIcon::ListDragHandle => "list-drag-handle-symbolic",
             AppIcon::EditClear => "edit-clear-symbolic",
             AppIcon::SidebarShow => "sidebar-show-symbolic",
@@ -54,9 +52,8 @@ impl AppIcon {
 mod tests {
     use super::*;
 
-    const ALL_ICONS: [AppIcon; 19] = [
+    const ALL_ICONS: [AppIcon; 18] = [
         AppIcon::ListAdd,
-        AppIcon::ListRemove,
         AppIcon::ListDragHandle,
         AppIcon::EditClear,
         AppIcon::SidebarShow,

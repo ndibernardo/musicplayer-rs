@@ -64,17 +64,16 @@ impl SidebarPanelBuilder {
         root.set_vexpand(true);
 
         if let Some(header) = &self.header {
+            style::set_margins(header, Margins::none().top(spacing::S));
             root.append(header);
         }
 
-        // Sections indent under the header and supply their own bottom
-        // rhythm; the panel supplies the top inset once, so stacked sections
-        // keep a single-`M` gap.
+        // No left margin: a selected row's highlight must reach the panel's
+        // own left edge, not stop short of it. Sections supply their own
+        // bottom rhythm and text inset (CSS padding); the panel supplies
+        // only the top inset, so stacked sections keep a single-`M` gap.
         self.content.set_vexpand(true);
-        style::set_margins(
-            &self.content,
-            Margins::none().start(spacing::L).top(spacing::M),
-        );
+        style::set_margins(&self.content, Margins::none().top(spacing::M));
         root.append(&self.content);
 
         if let Some(footer) = &self.footer {

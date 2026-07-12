@@ -56,13 +56,14 @@ impl<T: Clone + 'static> ValueList<T> {
     }
 
     /// Replaces the visible items, rebuilding every row. Returns `true` when
-    /// the list is now empty, so the caller can collapse its section.
+    /// the list is now empty, so the caller can react (e.g. clear a
+    /// highlight).
     pub fn set_items(&self, new_items: Vec<T>) -> bool {
         remove_all_rows(&self.list);
+        let empty = new_items.is_empty();
         for item in &new_items {
             self.list.append(&(self.render)(item));
         }
-        let empty = new_items.is_empty();
         *self.items.borrow_mut() = new_items;
         empty
     }

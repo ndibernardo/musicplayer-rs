@@ -1,15 +1,15 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gtk4::Align;
 use gtk4::Box as GtkBox;
 use gtk4::Button;
 use gtk4::CheckButton;
 use gtk4::Label;
-use gtk4::ListBoxRow;
 use gtk4::Orientation;
 use gtk4::Popover;
 use gtk4::ScrolledWindow;
+use gtk4::SelectionMode;
+use gtk4::pango;
 use gtk4::prelude::*;
 
 use crate::library::filter::FilterField;
@@ -20,90 +20,30 @@ use crate::ui::style::StyleClass;
 use crate::ui::style::spacing;
 use crate::ui::widgets::AppIcon;
 use crate::ui::widgets::Callback;
-use crate::ui::widgets::CollapsibleSection;
-use crate::ui::widgets::ValueList;
-use crate::ui::widgets::body_label;
+use crate::ui::widgets::NavTree;
 use crate::ui::widgets::flat_icon_button;
 use crate::ui::widgets::flat_menu_button;
 use crate::ui::widgets::remove_all_children;
 
-/// One browsable filter category: a collapsible list of `field`'s distinct
-/// values.
-struct Section {
-    field: FilterField,
-    list: ValueList<String>,
-    section: CollapsibleSection,
-}
-
-impl Section {
-    fn new(field: FilterField) -> Self {
-        let list = ValueList::new(gtk4::SelectionMode::Single, |value: &String| {
-            value_row(value)
-        });
-        let section = CollapsibleSection::new(field.label(), list.widget());
-        // Hidden until the user enables this field in the filter picker.
-        section.set_visible(false);
-        Self {
-            field,
-            list,
-            section,
-        }
-    }
-
-    /// Replaces this section's rows with `values`, collapsing the section
-    /// when it empties out.
-    fn fill(&self, values: Vec<String>) {
-        let empty = self.list.set_items(values);
-        self.section.set_empty(empty);
-    }
-}
-
-fn value_row(value: &str) -> ListBoxRow {
-    let label = body_label(value);
-    label.set_margin_start(spacing::M);
-    let row = ListBoxRow::new();
-    row.set_child(Some(&label));
-    row
-}
-
-/// One [`Section`] per [`FilterField`], stored in [`FilterField::all`] order
-/// and routed by [`FilterField::index`] — so adding a variant is caught by
-/// that method's exhaustive match, in `library/filter.rs`, instead of four
-/// separate spots in this file.
-struct SectionMap([Rc<Section>; FilterField::COUNT]);
-
-impl SectionMap {
-    fn new() -> Self {
-        Self(FilterField::all().map(|field| Rc::new(Section::new(field))))
-    }
-
-    fn get(&self, field: FilterField) -> &Rc<Section> {
-        &self.0[field.index()]
-    }
-
-    fn iter(&self) -> impl Iterator<Item = &Rc<Section>> {
-        self.0.iter()
-    }
-}
-
-/// Genre / album artist / artist / year / composer browser, generalised over
-/// every [`FilterField`] the user has enabled via the filter picker. Emits a
-/// `LibraryFilter` when the user selects an entry, and the new active field
+/// Genre / album artist / artist / year / composer browser: a single nav
+/// tree with one top-level row per [`FilterField`] the user has enabled via
+/// the filter picker, and one leaf row per distinct value under it. Emits a
+/// `LibraryFilter` when the user selects a leaf, and the new active field
 /// list whenever the picker's selection changes.
 ///
-/// Exposes its three parts — title button, scrollable filter stack, actions
-/// strip — separately, so the caller can assemble them into the shared
-/// `SidebarPanel` skeleton alongside the right sidebar's parts.
+/// Exposes its three parts — title label, scrollable tree, actions strip —
+/// separately, so the caller can assemble them into the shared `SidebarPanel`
+/// skeleton alongside the right sidebar's parts.
 #[derive(Clone)]
 pub struct Sidebar {
-    header: Button,
+    header: Label,
     content: ScrolledWindow,
     footer: GtkBox,
     inner: Rc<SidebarInner>,
 }
 
 struct SidebarInner {
-    sections: SectionMap,
+    tree: NavTree<String>,
     picker_list: GtkBox,
     /// The field/value pair behind the currently selected row, if any —
     /// tracked separately from GTK's own selection state so a second click on
@@ -114,52 +54,49 @@ struct SidebarInner {
 }
 
 impl SidebarInner {
-    fn section(&self, field: FilterField) -> &Rc<Section> {
-        self.sections.get(field)
-    }
-
     fn active_fields(&self) -> Vec<FilterField> {
         FilterField::all()
             .into_iter()
-            .filter(|f| self.section(*f).section.is_visible())
+            .filter(|f| self.tree.is_category_visible(f.index()))
             .collect()
     }
 }
 
 impl Sidebar {
     pub fn new(active_fields: &[FilterField]) -> Self {
-        let all_btn = build_library_button();
+        let title = build_library_label();
         let (picker_btn, picker_list) = build_filter_picker();
         let clear_btn = flat_icon_button(AppIcon::EditClear, "Clear filter");
         let actions_row = build_actions_row(&picker_btn, &clear_btn);
 
+        let render: Rc<dyn Fn(&String) -> String> = Rc::new(String::clone);
+        let categories = FilterField::all()
+            .map(|field| (field.label(), Rc::clone(&render)))
+            .to_vec();
+        let tree = NavTree::new(SelectionMode::Single, pango::EllipsizeMode::End, categories);
+        for field in active_fields {
+            tree.set_category_visible(field.index(), true);
+        }
+
         let inner = Rc::new(SidebarInner {
-            sections: SectionMap::new(),
+            tree,
             picker_list,
             current_selection: RefCell::new(None),
             on_select: Callback::new(),
             on_fields_changed: Callback::new(),
         });
 
-        for field in active_fields {
-            inner.section(*field).section.set_visible(true);
-        }
-
-        {
-            let inner = Rc::clone(&inner);
-            all_btn.connect_clicked(move |_| clear_filter(&inner));
-        }
         {
             let inner = Rc::clone(&inner);
             clear_btn.connect_clicked(move |_| clear_filter(&inner));
         }
-        wire_section_activation(&inner);
+        wire_tree_activation(&inner);
 
-        let filters_scrolled = build_filters_scroller(&inner.sections);
+        let content = build_tree_scroller(&inner.tree);
 
         let sidebar = Self {
-            header: all_btn,
-            content: filters_scrolled,
+            header: title,
+            content,
             footer: actions_row,
             inner,
         };
@@ -167,12 +104,12 @@ impl Sidebar {
         sidebar
     }
 
-    /// The "Library" title button — the panel's header slot.
-    pub fn header(&self) -> &Button {
+    /// The "Library" title label — the panel's header slot.
+    pub fn header(&self) -> &Label {
         &self.header
     }
 
-    /// The scrollable filter-section stack — the panel's content slot.
+    /// The scrollable nav tree — the panel's content slot.
     pub fn content(&self) -> &ScrolledWindow {
         &self.content
     }
@@ -193,9 +130,9 @@ impl Sidebar {
         self.inner.on_fields_changed.set(f);
     }
 
-    /// Replaces `field`'s section entries with the given distinct values.
+    /// Replaces `field`'s tree rows with the given distinct values.
     pub fn populate(&self, field: FilterField, values: Vec<String>) {
-        self.inner.section(field).fill(values);
+        self.inner.tree.set_items(field.index(), values);
     }
 
     fn rebuild_picker_rows(&self, active_fields: &[FilterField]) {
@@ -209,14 +146,13 @@ impl Sidebar {
         }
     }
 
-    /// Shows or hides `field`'s section and notifies the change. Hiding also
-    /// clears its selection, since a filter the user can no longer see
-    /// shouldn't stay silently active in the background.
+    /// Shows or hides `field`'s tree row and notifies the change. Hiding
+    /// removes the row (and, with it, any GTK-level selection inside it), so
+    /// a filter the user can no longer see doesn't stay silently active in
+    /// the background.
     fn set_field_active(&self, field: FilterField, active: bool) {
-        let section = self.inner.section(field);
-        section.section.set_visible(active);
+        self.inner.tree.set_category_visible(field.index(), active);
         if !active {
-            section.list.clear_selection();
             let mut current = self.inner.current_selection.borrow_mut();
             if current.as_ref().is_some_and(|(f, _)| *f == field) {
                 *current = None;
@@ -228,19 +164,13 @@ impl Sidebar {
     }
 }
 
-/// The "Library" title button: clears the filter, and doubles as the
-/// sidebar's title via `StyleClass::SidebarTitle`.
-fn build_library_button() -> Button {
-    let all_label = Label::new(Some("Library"));
-    all_label.set_xalign(0.0);
-    style::add_class(&all_label, StyleClass::SidebarTitle);
-    let all_btn = Button::new();
-    all_btn.set_child(Some(&all_label));
-    all_btn.add_css_class("flat");
-    all_btn.set_hexpand(true);
-    all_btn.set_halign(Align::Start);
-    style::set_margins(&all_btn, Margins::none().start(spacing::S).top(spacing::S));
-    all_btn
+/// The "Library" title label — clearing the filter is the footer's
+/// "Clear filter" button's job now, not the title's.
+fn build_library_label() -> Label {
+    let title = Label::new(Some("Library"));
+    title.set_xalign(0.0);
+    style::add_class(&title, StyleClass::SectionName);
+    title
 }
 
 /// The filter-picker menu button and the (initially empty) row container its
@@ -257,8 +187,8 @@ fn build_filter_picker() -> (gtk4::MenuButton, GtkBox) {
     (picker_btn, picker_list)
 }
 
-/// The actions strip at the bottom of the sidebar, below the filter list,
-/// set off by a separator above it.
+/// The actions strip at the bottom of the sidebar, below the nav tree, set
+/// off by a separator above it.
 fn build_actions_row(picker_btn: &gtk4::MenuButton, clear_btn: &Button) -> GtkBox {
     let actions_row = GtkBox::new(Orientation::Horizontal, 4);
     style::set_margins(&actions_row, Margins::all(spacing::S));
@@ -267,68 +197,44 @@ fn build_actions_row(picker_btn: &gtk4::MenuButton, clear_btn: &Button) -> GtkBo
     actions_row
 }
 
-/// Routes a row activation in any section to the filter logic: re-activating
-/// the current selection clears it; anything else becomes the new filter.
-fn wire_section_activation(inner: &Rc<SidebarInner>) {
-    for field in FilterField::all() {
-        let inner_for_row = Rc::clone(inner);
-        inner
-            .section(field)
-            .list
-            .connect_activated(move |_, value| {
-                let reselected_same_value = inner_for_row
-                    .current_selection
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|(f, v)| *f == field && *v == value);
-                if reselected_same_value {
-                    clear_filter(&inner_for_row);
-                } else {
-                    clear_other_selections(&inner_for_row, field);
-                    *inner_for_row.current_selection.borrow_mut() = Some((field, value.clone()));
-                    emit_filter(&inner_for_row, field.to_filter(&value));
-                }
-            });
-    }
+/// Routes a leaf activation to the filter logic: re-activating the current
+/// selection clears it; anything else becomes the new filter. Selecting a
+/// different leaf anywhere in the tree already deselects the previous one —
+/// `GtkTreeSelection`'s native single-selection mode spans every category.
+fn wire_tree_activation(inner: &Rc<SidebarInner>) {
+    let inner_for_row = Rc::clone(inner);
+    inner.tree.connect_activated(move |category_id, value| {
+        let Some(field) = FilterField::all().get(category_id).copied() else {
+            return;
+        };
+        let reselected_same_value = inner_for_row
+            .current_selection
+            .borrow()
+            .as_ref()
+            .is_some_and(|(f, v)| *f == field && *v == value);
+        if reselected_same_value {
+            clear_filter(&inner_for_row);
+        } else {
+            *inner_for_row.current_selection.borrow_mut() = Some((field, value.clone()));
+            emit_filter(&inner_for_row, field.to_filter(&value));
+        }
+    });
 }
 
-/// The scrollable filter-section stack. Indentation under the title and the
-/// top inset are the surrounding `SidebarPanel`'s job; each `Section`'s own
-/// bottom margin sets them off from each other.
-fn build_filters_scroller(sections: &SectionMap) -> ScrolledWindow {
-    let filters_box = GtkBox::new(Orientation::Vertical, 0);
-    for section in sections.iter() {
-        filters_box.append(section.section.widget());
-    }
+/// The scrollable nav tree — indentation under the title and the top inset
+/// are the surrounding `SidebarPanel`'s job.
+fn build_tree_scroller(tree: &NavTree<String>) -> ScrolledWindow {
     let scrolled = ScrolledWindow::new();
     scrolled.set_vexpand(true);
-    scrolled.set_child(Some(&filters_box));
+    scrolled.set_child(Some(tree.widget()));
     scrolled
 }
 
-/// Deselects every section's list — keeps at most one selected across the
-/// whole sidebar.
-fn clear_all_selections(inner: &SidebarInner) {
-    for section in inner.sections.iter() {
-        section.list.clear_selection();
-    }
-}
-
-/// Deselects every section's list except `except`'s own — a newly activated
-/// row's list handles its own single-selection semantics natively.
-fn clear_other_selections(inner: &SidebarInner, except: FilterField) {
-    for section in inner.sections.iter() {
-        if section.field != except {
-            section.list.clear_selection();
-        }
-    }
-}
-
-/// Deselects every section, forgets the tracked selection, and shows the
-/// whole library — shared by the Library button, the clear-filter button,
-/// and re-clicking an already-selected row.
+/// Deselects the tree, forgets the tracked selection, and shows the whole
+/// library — shared by the clear-filter button and re-clicking an
+/// already-selected row.
 fn clear_filter(inner: &SidebarInner) {
-    clear_all_selections(inner);
+    inner.tree.clear_selection();
     *inner.current_selection.borrow_mut() = None;
     emit_filter(inner, LibraryFilter::All);
 }

@@ -1,4 +1,5 @@
 pub mod album;
+pub mod bootstrap;
 pub mod column;
 pub mod db;
 pub mod filter;

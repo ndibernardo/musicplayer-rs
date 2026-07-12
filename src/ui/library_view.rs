@@ -131,11 +131,13 @@ impl LibraryView {
         }
     }
 
+    /// Replaces every row in one `splice` call rather than an `append` loop —
+    /// one `items-changed` emission instead of one per track, which matters
+    /// once the library runs into the tens of thousands.
     pub fn set_tracks(&self, tracks: Vec<Track>) {
-        self.store.remove_all();
-        for track in tracks {
-            self.store.append(&BoxedAnyObject::new(track));
-        }
+        let removed = self.store.n_items();
+        let added: Vec<BoxedAnyObject> = tracks.into_iter().map(BoxedAnyObject::new).collect();
+        self.store.splice(0, removed, &added);
     }
 
     /// Clears the current selection. Call when the user clicks elsewhere in

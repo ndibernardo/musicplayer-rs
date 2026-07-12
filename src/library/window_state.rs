@@ -1,6 +1,8 @@
 use crate::library::album::AlbumSort;
 use crate::library::album::AlbumSortField;
 use crate::library::album::SortDirection;
+use crate::library::bootstrap::BootstrapError;
+use crate::library::bootstrap::LibraryBootstrap;
 use crate::library::column::ColumnPrefs;
 use crate::library::db::LibraryFolder;
 use crate::library::filter::FilterField;
@@ -64,6 +66,11 @@ pub enum WindowMessage {
         affects_art: bool,
         outcome: EditOutcome,
     },
+    /// The background load kicked off at startup finished — folders, tracks,
+    /// album summaries, and sidebar values, all fetched off the main thread
+    /// so the window can present before any of it exists. See
+    /// `library::bootstrap`.
+    LibraryBootstrapped(Result<LibraryBootstrap, BootstrapError>),
 }
 
 /// The pure state transition for `msg`: no I/O, no GTK — fully unit-testable.
@@ -112,7 +119,8 @@ pub fn reduce(state: WindowState, msg: &WindowMessage) -> WindowState {
         | WindowMessage::RescanRequested
         | WindowMessage::FolderAdded(_)
         | WindowMessage::FolderRemoved(_)
-        | WindowMessage::EditSaved { .. } => state,
+        | WindowMessage::EditSaved { .. }
+        | WindowMessage::LibraryBootstrapped(_) => state,
     }
 }
 

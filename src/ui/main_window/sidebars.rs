@@ -5,6 +5,7 @@ use gtk4::Box as GtkBox;
 use gtk4::Label;
 use gtk4::Orientation;
 use gtk4::Paned;
+use gtk4::Separator;
 use gtk4::ToggleButton;
 use gtk4::prelude::*;
 
@@ -18,9 +19,11 @@ use crate::ui::sidebar::Sidebar;
 use crate::ui::widgets::SidebarPanel;
 
 /// Assembles the two app sidebars as `SidebarPanel` instances, so they cannot
-/// drift apart visually: the left panel gets the filter sidebar's own
-/// header/content/footer, the right panel stacks the queue above the folder
-/// list with the status line as its footer.
+/// drift apart visually: each panel's title ("Library", "Queue") sits in the
+/// shared header slot — flush with the panel top, no extra inset — and its
+/// scrollable area(s) sit in the content slot below. The right panel stacks
+/// the queue list above the folder tree, set off by a separator, with the
+/// status line as its footer.
 pub(super) fn build_sidebar_panels(
     filter_sidebar: &Sidebar,
     queue_view: &QueueView,
@@ -33,9 +36,11 @@ pub(super) fn build_sidebar_panels(
         .build();
 
     let right_stack = GtkBox::new(Orientation::Vertical, 0);
-    right_stack.append(&queue_view.widget);
+    right_stack.append(queue_view.content());
+    right_stack.append(&Separator::new(Orientation::Horizontal));
     right_stack.append(folder_list.widget());
     let right = SidebarPanel::builder(&right_stack)
+        .header(queue_view.header())
         .footer(status_label)
         .build();
 
