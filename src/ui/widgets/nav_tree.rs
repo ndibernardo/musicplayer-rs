@@ -258,6 +258,17 @@ fn wire_activation<T: Clone + 'static>(
         let Some(iter) = model.iter(path) else {
             return;
         };
+        let is_category: bool = model.get(&iter, COL_IS_CATEGORY as i32);
+        if is_category {
+            // Native expander hit target is the small triangle only. Widen
+            // it to the whole row so a click anywhere toggles the section.
+            if view.row_expanded(path) {
+                view.collapse_row(path);
+            } else {
+                view.expand_row(path, false);
+            }
+            return;
+        }
         if let Some((category_id, item)) = leaf_at(&model, &iter, &categories) {
             on_activate.emit((category_id, item));
         }
